@@ -99,7 +99,7 @@ Those five are the demo. Everything else is scaffolding around them, and Sol bui
 
 ```
 Python 3.12
-Node 20
+Node 22 or newer (current dependency graph: ^22 || ^24 || >=26)
 PostgreSQL 16 (docker)
 ```
 

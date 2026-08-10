@@ -14,7 +14,7 @@ Trellis is a technical interview artifact: an LLM operates a todo application th
 
 ## Environment and commands
 
-- Required runtimes: Python 3.12, Node 20, PostgreSQL 16 in Docker.
+- Required runtimes: Python 3.12, Node 22 or newer, PostgreSQL 16 in Docker. Use a Node release supported by the locked dependency graph; the current graph supports `^22 || ^24 || >=26`.
 - T00 isolated setup on PowerShell:
 
 ```powershell

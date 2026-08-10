@@ -14,11 +14,11 @@ Delete this directory before T12A. It is evidence, not a product foundation.
 - `frontend/components/approval-card.tsx`: reactive AG-UI interrupt display with approve and deny continuation payloads.
 - `frontend/components/protocol-workbench.tsx`: four-stage message, stream, interrupt, and resume evidence plus server execution and request counts.
 - `frontend/app/globals.css`: responsive protocol-workbench presentation with reduced-motion handling.
-- `frontend/package-lock.json`: exact Node dependency graph used by the Node 20 build.
+- `frontend/package-lock.json`: exact frontend dependency graph, with Node 22 or newer as the supported runtime floor.
 
 ## Run it
 
-Use Python 3.12 and Node 20.
+Use Python 3.12 and Node 22 or newer. The current locked graph accepts supported Node releases matching `^22 || ^24 || >=26`.
 
 ```powershell
 python -m venv .venv-spike
@@ -46,6 +46,6 @@ Open `http://127.0.0.1:3000`.
 
 The exact initial request, interrupt event, continuation request, and observed automated proof are recorded in `docs/DECISIONS.md`.
 
-## Known dependency warning
+## Runtime decision
 
-`@assistant-ui/react-ag-ui` currently brings in `nanoid` 6.0.1, whose package metadata declares Node 22 or newer. npm therefore prints an engine warning on Node 20. The exact locked graph installs, builds, and completes the browser proof on Node 20.20.2. This disposable spike records the warning and does not add an unverified override.
+`@assistant-ui/react-ag-ui` currently brings in `nanoid` 6.0.1, whose package metadata requires `^22 || ^24 || >=26`. Node 22 or newer is therefore the project runtime floor, using a release supported by that range. The exact locked graph also installed, built, and completed the original browser proof on Node 20.20.2, but npm emitted an unsupported-engine warning. That result is retained as historical compatibility evidence and does not override the dependency's supported engine contract.

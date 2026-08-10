@@ -134,7 +134,7 @@ function WorkbenchContent() {
         </div>
         <div className="build-meta">
           <span>Disposable spike</span>
-          <code>T00A · Node 20 · Python 3.12</code>
+          <code>T00A · Node 22+ · Python 3.12</code>
         </div>
       </header>
       <section className="intro-band">
