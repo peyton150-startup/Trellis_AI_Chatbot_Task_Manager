@@ -13,7 +13,7 @@ The todo list is the domain. The subject is agent infrastructure: an LLM operati
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The frozen architecture, trust boundary, data model, cut order, and demo script | You want to know what this is and why |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | Scope statement, WBS, delivery spine, risk log, quality plan, control loop, closure | You want to know how it gets built in seven days |
 | [docs/BUILD_SPEC.md](docs/BUILD_SPEC.md) | Implementation-grade spec: schema, kernel pseudocode, wire contract, 27 tasks with verifications | You are writing the code |
-| docs/DECISIONS.md | Decisions made and their rationale, plus API facts confirmed at T00 | You are about to reopen a settled question |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Decisions made and their rationale, plus API facts confirmed at T00 | You are about to reopen a settled question |
 
 ## Status
 
@@ -35,4 +35,4 @@ Next.js and TypeScript with assistant-ui over the AG-UI protocol, FastAPI, Pydan
 
 No durable execution engine, no auth beyond a hardcoded actor, no multi-tenancy, no deployment, no vector store or retrieval, no cross-session memory, no multi-agent orchestration, no billing, no mobile, no self-hosted observability stack, no runtime model failover.
 
-Reasons for each are in ARCHITECTURE.md. The list is part of the deliverable.
+Reasons for each are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The list is part of the deliverable.
