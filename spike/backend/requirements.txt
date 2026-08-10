@@ -1,0 +1,6 @@
+pydantic-ai==2.27.0
+pydantic-ai-slim[ag-ui]==2.27.0
+ag-ui-protocol==0.1.19
+fastapi==0.141.1
+httpx==0.28.1
+uvicorn==0.52.1
