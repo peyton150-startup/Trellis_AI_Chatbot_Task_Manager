@@ -41,3 +41,40 @@ jobs:
 
       - name: Run T00 API probe
         run: python -B backend/scripts/api_probe.py
+
+  t00a-spike-build:
+    name: T00A spike build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install T00A backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r spike/backend/requirements.txt
+
+      - name: Verify T00A backend protocol
+        working-directory: spike/backend
+        run: python -B verify.py
+
+      - name: Set up Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: spike/frontend/package-lock.json
+
+      - name: Install locked T00A frontend dependencies
+        working-directory: spike/frontend
+        run: npm ci
+
+      - name: Build T00A frontend
+        working-directory: spike/frontend
+        run: npm run build

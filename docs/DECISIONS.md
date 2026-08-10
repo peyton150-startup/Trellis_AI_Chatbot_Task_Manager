@@ -26,6 +26,8 @@ Append only. A decision recorded here is closed. Reopening one requires implemen
 
 On 2026-08-10, the user authorized Terra to perform blind, read-only reviews of the T00 and T00A PRs while Opus usage is unavailable. Terra receives only the task specification, commit diff, and verification evidence. It may report evidence-backed findings but may not edit, generate, or commit repository content. This does not replace the required later Opus review and does not authorize Terra for implementation.
 
+Terra completed the T00A blind review of implementation commit `5d3ab47` on 2026-08-10 and reported no findings. Opus review remains required when credits are available.
+
 ---
 
 ## API facts confirmed at T00
@@ -46,13 +48,72 @@ Confirmed on 2026-08-10 using Python 3.12.13, `pydantic-ai` 2.27.0,
 
 ## Gate A: AG-UI interrupt path (T00A, Day 1)
 
-**Result:** PENDING
+**Result:** GATE A: PASS
 
-**HTTP method and path for the AG-UI transport:**
+**Frontend runtime floor:** Node 22 or newer on a release supported by the locked graph, currently `^22 || ^24 || >=26`. The selected assistant-ui packages transitively install `nanoid` 6.0.1 with that engine contract. The T00A graph happened to install, build, and pass its original browser proof on Node 20.20.2 while emitting an unsupported-engine warning. That observation is retained as compatibility evidence, but production setup, package metadata, and CI use the supported Node 22+ floor.
 
-**Interrupt payload shape:**
+**Browser verification readiness:** The T00A workbench polls `/spike-state` every 400 ms to expose tool execution and request evidence. A browser can therefore never satisfy Playwright's `networkidle` condition by design. Automated verification waits for DOM readiness, then asserts explicit visible controls, streamed content, interrupt fields, continuation content, request bodies, and server execution state.
 
-**Symptom, if FAIL:**
+**HTTP method and path for the AG-UI transport:** The assistant-ui `HttpAgent` sends `POST /ag-ui` in the disposable spike. The production path remains `/api/agui` as declared by the wire contract. The JSON body is an AG-UI `RunAgentInput` with:
+
+```json
+{
+  "threadId": "<conversation id>",
+  "runId": "<new invocation id>",
+  "tools": [],
+  "context": [],
+  "forwardedProps": {},
+  "state": null,
+  "messages": [
+    { "id": "<message id>", "role": "user", "content": "<prompt>" }
+  ]
+}
+```
+
+The continuation is a new POST with the same `threadId`, a new `runId`, the assistant-ui message transcript, and:
+
+```json
+{
+  "resume": [
+    {
+      "interruptId": "int-delete-spike-item-42",
+      "status": "resolved",
+      "payload": { "approved": true }
+    }
+  ]
+}
+```
+
+Denial uses the same shape with `"approved": false`.
+
+**Interrupt payload shape:** The adapter emits `RUN_FINISHED` with this outcome after the `TOOL_CALL_START`, `TOOL_CALL_ARGS`, and `TOOL_CALL_END` events:
+
+```json
+{
+  "type": "interrupt",
+  "interrupts": [
+    {
+      "id": "int-delete-spike-item-42",
+      "reason": "tool_call",
+      "message": "Approve delete_demo_item({\"item_id\": \"demo-task-7\"})?",
+      "toolCallId": "delete-spike-item-42",
+      "responseSchema": {
+        "properties": {
+          "approved": { "type": "boolean" },
+          "editedArgs": { "type": "object" },
+          "reason": { "type": "string" }
+        },
+        "required": ["approved"],
+        "type": "object"
+      }
+    }
+  ]
+}
+```
+
+**Observed proof:** A normal response rendered from three streamed `TEXT_MESSAGE_CONTENT` events. Before either decision the tool execution count was 0. Approval continued the original `delete-spike-item-42` call and produced exactly one tool-body execution. After reset, denial continued the same identifier shape and left the execution count at 0. The browser rendered all four protocol stages as PASS.
+
+**Symptom, if FAIL:** Not applicable. The native interrupt path passed.
 
 **Consequence if FAIL:** chat continues to stream over AG-UI; approvals move to `GET /api/runs/{id}` plus `POST /api/runs/{id}/approvals/{tool_call_id}`, with the approval card rendered from run state. T12B's seven proofs apply to the fallback unchanged.
 

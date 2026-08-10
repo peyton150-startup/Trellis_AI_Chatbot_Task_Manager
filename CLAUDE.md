@@ -14,7 +14,7 @@ Trellis is a technical interview artifact: an LLM operates a todo application th
 
 ## Environment and commands
 
-- Required runtimes: Python 3.12, Node 20, PostgreSQL 16 in Docker.
+- Required runtimes: Python 3.12, Node 22 or newer, PostgreSQL 16 in Docker. Use a Node release supported by the locked dependency graph; the current graph supports `^22 || ^24 || >=26`.
 - T00 isolated setup on PowerShell:
 
 ```powershell
@@ -38,7 +38,7 @@ The version command must print Python 3.12.x. Outside Codex, replace `$python312
 gh pr checks <pr-number> --watch
 ```
 
-The required T00 check is named `T00 API probe`. Keep check names stable after branch protection references them.
+The required checks are named `T00 API probe` and `T00A spike build`. Keep check names stable after branch protection references them.
 
 - Full CI commands, once the application scaffold exists, run in this order:
 
@@ -57,6 +57,7 @@ npm run build
 - One task, one commit, with message `T##: <task name>`.
 - Open a separate PR after T00 and after T00A. Pause after the T00A PR for user review.
 - Never merge, squash and merge, rebase and merge, close, or otherwise finalize a PR. Only the user may merge PRs.
+- Write implementation-specific PR descriptions. List files and components added or changed, exact interfaces and data flow, observed verification evidence, limitations, reviewer findings and dispositions, and follow-up ownership. Do not substitute only an architectural summary. Link to durable documentation where it contains the full detail, then summarize the relevant facts in the PR.
 - Do not use em dashes in files, comments, or commit messages.
 - Do not touch files outside the current task's file list unless the user explicitly expands the task.
 - Follow the model-routing table in `docs/BUILD_SPEC.md`. If the user explicitly authorizes a temporary routing exception, mark the PR for review by the required model.
@@ -106,3 +107,4 @@ Do not mark a major task complete if its implementation note explains only the c
 - Do not add frameworks, tables, columns, endpoints, status values, or speculative features outside `docs/BUILD_SPEC.md`.
 - Do not reuse disposable `spike/` code in the production integration. Delete it before T12A.
 - Do not treat client-supplied AG-UI message history or approval payloads as authoritative.
+- For an interface that intentionally polls, browser verification waits for DOM readiness and explicit visible controls or state. Do not wait for `networkidle`, because recurring requests make network idleness impossible by design.

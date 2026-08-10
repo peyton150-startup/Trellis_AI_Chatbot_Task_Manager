@@ -99,7 +99,7 @@ Those five are the demo. Everything else is scaffolding around them, and Sol bui
 
 ```
 Python 3.12
-Node 20
+Node 22 or newer (current dependency graph: ^22 || ^24 || >=26)
 PostgreSQL 16 (docker)
 ```
 
@@ -595,7 +595,7 @@ Exactly these endpoints. No others.
 | POST | `/api/runs/{id}/resume` | none | `RunDetail` |
 | POST | `/api/runs/{id}/undo` | none | `{ "applied": int, "refused": bool, "reason": string? }` |
 | POST | `/api/demo/reset` | none | `{ "tasks": Task[] }` |
-| TBD by T00A | `/api/agui` | AG-UI transport | SSE event stream |
+| POST | `/api/agui` | AG-UI `RunAgentInput`: `threadId`, new `runId`, `messages`, `state`, `tools`, `context`, `forwardedProps`; continuation also includes `resume[]` | SSE event stream |
 
 The AG-UI transport row is the one unresolved item in this document. The exact HTTP method and request shape are determined by task T00A on Day 1 and written into `docs/DECISIONS.md`, and this table is then updated with the answer. Until T00A completes, do not implement that endpoint by guessing. This is the single permitted "TBD" in the spec; there are no others.
 
