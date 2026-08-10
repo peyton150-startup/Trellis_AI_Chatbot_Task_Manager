@@ -51,6 +51,8 @@ npm run build
 - Do not use em dashes in files, comments, or commit messages.
 - Do not touch files outside the current task's file list unless the user explicitly expands the task.
 - Follow the model-routing table in `BUILD_SPEC.md`. If the user explicitly authorizes a temporary routing exception, mark the PR for review by the required model.
+- Review neutrally. Give a blind reviewer only the task specification, commit diff, and verification evidence. Do not imply that defects exist. Require evidence-backed findings and allow an explicit no-findings result.
+- Terra is authorized only as a read-only blind reviewer for T00 and T00A under the user's 2026-08-10 exception. Terra must not edit, generate, or commit repository content. Record its findings and their disposition in the PR. Opus review remains required when available.
 - Kernel files are transcription-only. Preserve the specified check order and transaction boundaries.
 - Put all SQL statements in `backend/app/sql.py` as uppercase constants.
 - Use typed Pydantic request, response, domain, and tool argument models. Reject extra request keys.
