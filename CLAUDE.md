@@ -38,7 +38,7 @@ The version command must print Python 3.12.x. Outside Codex, replace `$python312
 gh pr checks <pr-number> --watch
 ```
 
-The required T00 check is named `T00 API probe`. Keep check names stable after branch protection references them.
+The required checks are named `T00 API probe` and `T00A spike build`. Keep check names stable after branch protection references them.
 
 - Full CI commands, once the application scaffold exists, run in this order:
 
