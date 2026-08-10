@@ -32,6 +32,14 @@ The version command must print Python 3.12.x. Outside Codex, replace `$python312
 .\.venv\Scripts\python.exe backend\scripts\api_probe.py
 ```
 
+- Watch the GitHub CI gate for a PR:
+
+```powershell
+gh pr checks <pr-number> --watch
+```
+
+The required T00 check is named `T00 API probe`. Keep check names stable after branch protection references them.
+
 - Full CI commands, once the application scaffold exists, run in this order:
 
 ```text
@@ -41,6 +49,7 @@ npm run build
 ```
 
 - Run behavioral evals only on demand. They are excluded from CI.
+- Keep GitHub Actions permissions at least privilege and pin third-party actions to immutable commit SHAs.
 - Use the task-specific verification command in `docs/BUILD_SPEC.md` before starting the next task.
 
 ## Code and workflow conventions
