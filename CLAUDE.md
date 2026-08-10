@@ -6,10 +6,10 @@ Trellis is a technical interview artifact: an LLM operates a todo application th
 
 ## Sources of truth
 
-- Read `BUILD_SPEC.md` before implementation. Execute its tasks in order and do not invent missing contracts.
-- Read `ARCHITECTURE.md` for the trust boundary, data model, and demo rationale.
-- Read `DECISIONS.md` for closed API and architecture decisions.
-- Record genuinely missing or contradictory requirements in `OPEN_QUESTIONS.md` and stop.
+- Read `docs/BUILD_SPEC.md` before implementation. Execute its tasks in order and do not invent missing contracts.
+- Read `docs/ARCHITECTURE.md` for the trust boundary, data model, and demo rationale.
+- Read `docs/DECISIONS.md` for closed API and architecture decisions.
+- Record genuinely missing or contradictory requirements in `docs/OPEN_QUESTIONS.md` and stop.
 - Record how major implementations fit locally and system-wide in `IMPLEMENTATION_NOTES.md`.
 
 ## Environment and commands
@@ -41,7 +41,7 @@ npm run build
 ```
 
 - Run behavioral evals only on demand. They are excluded from CI.
-- Use the task-specific verification command in `BUILD_SPEC.md` before starting the next task.
+- Use the task-specific verification command in `docs/BUILD_SPEC.md` before starting the next task.
 
 ## Code and workflow conventions
 
@@ -50,7 +50,7 @@ npm run build
 - Never merge, squash and merge, rebase and merge, close, or otherwise finalize a PR. Only the user may merge PRs.
 - Do not use em dashes in files, comments, or commit messages.
 - Do not touch files outside the current task's file list unless the user explicitly expands the task.
-- Follow the model-routing table in `BUILD_SPEC.md`. If the user explicitly authorizes a temporary routing exception, mark the PR for review by the required model.
+- Follow the model-routing table in `docs/BUILD_SPEC.md`. If the user explicitly authorizes a temporary routing exception, mark the PR for review by the required model.
 - Review neutrally. Give a blind reviewer only the task specification, commit diff, and verification evidence. Do not imply that defects exist. Require evidence-backed findings and allow an explicit no-findings result.
 - Terra is authorized only as a read-only blind reviewer for T00 and T00A under the user's 2026-08-10 exception. Terra must not edit, generate, or commit repository content. Record its findings and their disposition in the PR. Opus review remains required when available.
 - Kernel files are transcription-only. Preserve the specified check order and transaction boundaries.
@@ -94,6 +94,6 @@ Do not mark a major task complete if its implementation note explains only the c
 ## Be careful with
 
 - `policy.py`, `idempotency.py`, `undo.py`, and the wire contract in `main.py` are correctness-kernel files.
-- Do not add frameworks, tables, columns, endpoints, status values, or speculative features outside `BUILD_SPEC.md`.
+- Do not add frameworks, tables, columns, endpoints, status values, or speculative features outside `docs/BUILD_SPEC.md`.
 - Do not reuse disposable `spike/` code in the production integration. Delete it before T12A.
 - Do not treat client-supplied AG-UI message history or approval payloads as authoritative.

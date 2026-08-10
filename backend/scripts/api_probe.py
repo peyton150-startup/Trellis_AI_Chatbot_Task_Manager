@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import sys
@@ -7,7 +8,12 @@ from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Any
 
-from ag_ui.core import ResumeEntry
+from ag_ui.core import (
+    ResumeEntry,
+    RunFinishedEvent,
+    ToolCallResultEvent,
+    ToolCallStartEvent,
+)
 from pydantic_ai import (
     Agent,
     ApprovalRequired,
@@ -27,7 +33,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.ui.ag_ui import AGUIAdapter
 
 
@@ -65,12 +71,39 @@ def make_model_response(task_ids: list[str]):
     return model_response
 
 
+def make_stream_model_response(task_ids: list[str]):
+    async def stream_model_response(
+        messages: list[ModelMessage], _info: AgentInfo
+    ):
+        if any(
+            isinstance(part, ToolReturnPart)
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        ):
+            yield "tool completed"
+            return
+        yield {
+            0: DeltaToolCall(
+                name="bulk_update_tasks",
+                json_args=json.dumps({"task_ids": task_ids}),
+                tool_call_id=CALL_ID,
+            )
+        }
+
+    return stream_model_response
+
+
 def make_conditional_agent(
     executions: list[tuple[str, tuple[str, ...]]],
     task_ids: list[str],
 ) -> Agent[None, str | DeferredToolRequests]:
     agent = Agent(
-        FunctionModel(make_model_response(task_ids), model_name="trellis-api-probe"),
+        FunctionModel(
+            make_model_response(task_ids),
+            stream_function=make_stream_model_response(task_ids),
+            model_name="trellis-api-probe",
+        ),
         output_type=[str, DeferredToolRequests],
     )
 
@@ -108,11 +141,13 @@ def probe_static_approval_parameter() -> ProbeResult:
     parameter = inspect.signature(Agent.tool_plain).parameters.get("requires_approval")
     assert parameter is not None
     assert parameter.default is False
+    assert parameter.annotation in {bool, "bool"}
 
     executions: list[str] = []
     agent = Agent(
         FunctionModel(
             make_model_response(["a", "b", "c", "d"]),
+            stream_function=make_stream_model_response(["a", "b", "c", "d"]),
             model_name="trellis-static-approval-probe",
         ),
         output_type=[str, DeferredToolRequests],
@@ -152,6 +187,32 @@ def probe_message_history_round_trip() -> ProbeResult:
 
 
 def probe_conditional_approval() -> tuple[ProbeResult, Agent[Any, Any], list[ModelMessage]]:
+    callable_checks: list[list[str]] = []
+
+    def callable_requirement(task_ids: list[str]) -> bool:
+        callable_checks.append(task_ids)
+        return len(task_ids) > 3
+
+    callable_agent = Agent(
+        FunctionModel(
+            make_model_response(["a", "b", "c"]),
+            stream_function=make_stream_model_response(["a", "b", "c"]),
+            model_name="trellis-callable-approval-probe",
+        ),
+        output_type=[str, DeferredToolRequests],
+    )
+
+    @callable_agent.tool_plain(
+        name="bulk_update_tasks",
+        requires_approval=callable_requirement,  # type: ignore[arg-type]
+    )
+    def callable_bulk_update(task_ids: list[str]) -> str:
+        return f"updated {len(task_ids)} tasks"
+
+    callable_result = callable_agent.run_sync("update three tasks")
+    assert isinstance(callable_result.output, DeferredToolRequests)
+    assert callable_checks == []
+
     below_threshold_executions: list[tuple[str, tuple[str, ...]]] = []
     below_threshold_agent = make_conditional_agent(
         below_threshold_executions, ["a", "b", "c"]
@@ -181,7 +242,7 @@ def probe_conditional_approval() -> tuple[ProbeResult, Agent[Any, Any], list[Mod
         ProbeResult(
             4,
             "conditional approval",
-            "requires_approval is bool-only; raise ApprovalRequired in the tool and check ctx.tool_call_approved",
+            "a callable is treated as a truthy static gate and is never invoked; raise ApprovalRequired in the tool",
         ),
         agent,
         history,
@@ -189,68 +250,145 @@ def probe_conditional_approval() -> tuple[ProbeResult, Agent[Any, Any], list[Mod
 
 
 def build_ag_ui_adapter(
-    agent: Agent[Any, Any], *, approved: bool
+    agent: Agent[Any, Any],
+    *,
+    run_id: str,
+    messages: list[dict[str, Any]],
+    approved: bool | None = None,
 ) -> AGUIAdapter[Any, Any, Any, Any, Any]:
     payload = {
         "threadId": "probe-thread",
-        "runId": "probe-continuation",
+        "runId": run_id,
         "state": {},
-        "messages": [],
+        "messages": messages,
         "tools": [],
         "context": [],
         "forwardedProps": {},
-        "resume": [
+    }
+    if approved is not None:
+        payload["resume"] = [
             {
                 "interruptId": f"int-{CALL_ID}",
                 "status": "resolved",
                 "payload": {"approved": approved},
             }
-        ],
-    }
+        ]
     run_input = AGUIAdapter.build_run_input(json.dumps(payload).encode())
-    assert isinstance(run_input.resume, list)
-    assert isinstance(run_input.resume[0], ResumeEntry)
+    if approved is not None:
+        assert isinstance(run_input.resume, list)
+        assert isinstance(run_input.resume[0], ResumeEntry)
     return AGUIAdapter(agent=agent, run_input=run_input)
 
 
-def probe_ag_ui_resume_shape(agent: Agent[Any, Any]) -> ProbeResult:
-    approved_adapter = build_ag_ui_adapter(agent, approved=True)
-    approved_results = approved_adapter.deferred_tool_results
-    assert approved_results is not None
-    assert isinstance(approved_results.approvals[CALL_ID], ToolApproved)
+async def collect_adapter_events(
+    adapter: AGUIAdapter[Any, Any, Any, Any, Any],
+    *,
+    message_history: list[ModelMessage] | None = None,
+) -> tuple[list[Any], list[ModelMessage]]:
+    captured_history: list[list[ModelMessage]] = []
 
-    denied_adapter = build_ag_ui_adapter(agent, approved=False)
-    denied_results = denied_adapter.deferred_tool_results
-    assert denied_results is not None
-    assert isinstance(denied_results.approvals[CALL_ID], ToolDenied)
-    return ProbeResult(
-        5,
-        "AG-UI resume shape",
-        "POST RunAgentInput uses resume=[{interruptId, status='resolved', payload={approved: bool}}]",
+    async def capture_history(result: Any) -> None:
+        captured_history.append(result.all_messages())
+
+    events = [
+        event
+        async for event in adapter.run_stream(
+            message_history=message_history,
+            on_complete=capture_history,
+        )
+    ]
+    assert len(captured_history) == 1
+    return events, captured_history[0]
+
+
+async def run_ag_ui_approval_flow(
+    *, approved: bool
+) -> tuple[list[Any], list[Any], list[tuple[str, tuple[str, ...]]]]:
+    executions: list[tuple[str, tuple[str, ...]]] = []
+    agent = make_conditional_agent(executions, ["a", "b", "c", "d"])
+    first_adapter = build_ag_ui_adapter(
+        agent,
+        run_id="probe-initial",
+        messages=[
+            {
+                "id": "probe-user-message",
+                "role": "user",
+                "content": "update four tasks",
+            }
+        ],
+    )
+    first_events, history = await collect_adapter_events(first_adapter)
+    assert executions == []
+
+    continuation_adapter = build_ag_ui_adapter(
+        agent,
+        run_id="probe-continuation",
+        messages=[],
+        approved=approved,
+    )
+    continuation_events, _ = await collect_adapter_events(
+        continuation_adapter,
+        message_history=history,
+    )
+    return first_events, continuation_events, executions
+
+
+def probe_ag_ui_interrupt_and_continuation() -> tuple[ProbeResult, ProbeResult]:
+    approved_first, approved_continuation, approved_executions = asyncio.run(
+        run_ag_ui_approval_flow(approved=True)
+    )
+    denied_first, denied_continuation, denied_executions = asyncio.run(
+        run_ag_ui_approval_flow(approved=False)
     )
 
+    for first_events in (approved_first, denied_first):
+        initial_finish = next(
+            event for event in first_events if isinstance(event, RunFinishedEvent)
+        )
+        assert initial_finish.outcome is not None
+        assert initial_finish.outcome.type == "interrupt"
+        assert len(initial_finish.outcome.interrupts) == 1
+        interrupt = initial_finish.outcome.interrupts[0]
+        assert interrupt.id == f"int-{CALL_ID}"
+        assert interrupt.tool_call_id == CALL_ID
+        assert any(
+            isinstance(event, ToolCallStartEvent)
+            and event.tool_call_id == CALL_ID
+            for event in first_events
+        )
 
-def probe_tool_call_identity(
-    agent: Agent[Any, Any], history: list[ModelMessage]
-) -> ProbeResult:
-    call_ids = [
-        part.tool_call_id
-        for message in history
-        if isinstance(message, ModelResponse)
-        for part in message.parts
-        if isinstance(part, ToolCallPart)
-    ]
-    assert call_ids == [CALL_ID]
+    for continuation_events in (approved_continuation, denied_continuation):
+        continuation_finish = next(
+            event
+            for event in continuation_events
+            if isinstance(event, RunFinishedEvent)
+        )
+        assert continuation_finish.outcome is not None
+        assert continuation_finish.outcome.type == "success"
+        assert any(
+            isinstance(event, ToolCallResultEvent)
+            and event.tool_call_id == CALL_ID
+            for event in continuation_events
+        )
+        assert not any(
+            isinstance(event, ToolCallStartEvent)
+            and event.tool_call_id == CALL_ID
+            for event in continuation_events
+        )
 
-    adapter = build_ag_ui_adapter(agent, approved=True)
-    deferred_results = adapter.deferred_tool_results
-    assert deferred_results is not None
-    assert list(deferred_results.approvals) == [CALL_ID]
-    assert f"int-{CALL_ID}" != CALL_ID
-    return ProbeResult(
-        6,
-        "tool call identity",
-        f"interrupt id int-{CALL_ID} maps back to original tool_call_id {CALL_ID} on continuation",
+    assert approved_executions == [(CALL_ID, ("a", "b", "c", "d"))]
+    assert denied_executions == []
+    return (
+        ProbeResult(
+            5,
+            "AG-UI resume shape",
+            "a real interrupt resumes via resume=[{interruptId, status='resolved', payload={approved: bool}}]",
+        ),
+        ProbeResult(
+            6,
+            "tool call identity",
+            f"the adapter emits int-{CALL_ID}, resumes the original {CALL_ID}, and emits only its result",
+        ),
     )
 
 
@@ -260,10 +398,11 @@ def run_probe() -> list[ProbeResult]:
         probe_static_approval_parameter(),
         probe_message_history_round_trip(),
     ]
-    conditional_result, agent, history = probe_conditional_approval()
+    conditional_result, _, _ = probe_conditional_approval()
     results.append(conditional_result)
-    results.append(probe_ag_ui_resume_shape(agent))
-    results.append(probe_tool_call_identity(agent, history))
+    ag_ui_result, identity_result = probe_ag_ui_interrupt_and_continuation()
+    results.append(ag_ui_result)
+    results.append(identity_result)
     return results
 
 
