@@ -1,0 +1,294 @@
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
+from typing import Annotated
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+
+
+class TrellisModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class TaskStatus(str, Enum):
+    OPEN = "open"
+    DONE = "done"
+
+
+class TaskPriority(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+Priority = TaskPriority
+
+
+class RunStatus(str, Enum):
+    RUNNING = "running"
+    AWAITING_APPROVAL = "awaiting_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class EventOperation(str, Enum):
+    CREATED = "created"
+    UPDATED = "updated"
+    DELETED = "deleted"
+    RESTORED = "restored"
+
+
+class LeaseStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ApprovalState(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+
+
+class ApprovalDecision(str, Enum):
+    APPROVED = "approved"
+    DENIED = "denied"
+
+
+class ApprovalReason(str, Enum):
+    DESTRUCTIVE = "destructive"
+    BLAST_RADIUS = "blast_radius"
+
+
+class ToolName(str, Enum):
+    LIST_TASKS = "list_tasks"
+    CREATE_TASK = "create_task"
+    UPDATE_TASK = "update_task"
+    BULK_UPDATE_TASKS = "bulk_update_tasks"
+    DELETE_TASKS = "delete_tasks"
+    PROPOSE_PLAN = "propose_plan"
+
+
+class ToolStepStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DEDUPLICATED = "deduplicated"
+
+
+class LeaseAction(str, Enum):
+    EXECUTE = "EXECUTE"
+    REPLAY = "REPLAY"
+
+
+class UndoReason(str, Enum):
+    ROW_DISAPPEARED = "ROW_DISAPPEARED"
+    VERSION_CONFLICT = "VERSION_CONFLICT"
+    ROW_RECREATED = "ROW_RECREATED"
+
+
+TaskTitle = Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class Task(TrellisModel):
+    id: UUID
+    owner_id: UUID
+    title: TaskTitle
+    notes: str = ""
+    due_date: date | None = None
+    priority: TaskPriority = TaskPriority.MEDIUM
+    status: TaskStatus = TaskStatus.OPEN
+    blocked_by: UUID | None = None
+    version: int = 1
+    created_at: datetime
+    updated_at: datetime
+
+
+class TaskEvent(TrellisModel):
+    id: int
+    task_id: UUID
+    run_id: UUID | None = None
+    actor_id: UUID
+    operation: EventOperation
+    before: JsonValue | None = None
+    after: JsonValue | None = None
+    created_at: datetime
+
+
+class AgentRun(TrellisModel):
+    id: UUID
+    actor_id: UUID
+    prompt: str
+    status: RunStatus = RunStatus.RUNNING
+    message_history: list[JsonValue] = Field(default_factory=list)
+    model: str
+    model_calls: int = 0
+    tool_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_cents: Decimal = Decimal("0")
+    error: str | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+
+
+class ToolInvocation(TrellisModel):
+    run_id: UUID
+    tool_call_id: str
+    tool_name: ToolName
+    arguments_hash: str
+    status: LeaseStatus = LeaseStatus.PENDING
+    attempt: int = 1
+    lease_expires_at: datetime
+    result: JsonValue | None = None
+    error: str | None = None
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class ApprovalPreview(TrellisModel):
+    creates: list[JsonValue] = Field(default_factory=list)
+    updates: list[JsonValue] = Field(default_factory=list)
+    deletes: list[JsonValue] = Field(default_factory=list)
+
+
+class Approval(TrellisModel):
+    run_id: UUID
+    tool_call_id: str
+    tool_name: ToolName
+    arguments: dict[str, JsonValue]
+    arguments_hash: str
+    required_reason: ApprovalReason
+    preview: ApprovalPreview
+    decision: ApprovalState = ApprovalState.PENDING
+    expires_at: datetime
+    decided_at: datetime | None = None
+
+
+class CreateRunRequest(TrellisModel):
+    user_message: str
+
+
+RunRequest = CreateRunRequest
+
+
+class ApprovalDecisionRequest(TrellisModel):
+    decision: ApprovalDecision
+
+
+ApprovalRequest = ApprovalDecisionRequest
+
+
+class TasksResponse(TrellisModel):
+    tasks: list[Task]
+
+
+class RunCreatedResponse(TrellisModel):
+    run_id: UUID
+
+
+CreateRunResponse = RunCreatedResponse
+
+
+class PendingApproval(TrellisModel):
+    tool_call_id: str
+    tool_name: ToolName
+    required_reason: ApprovalReason
+    preview: ApprovalPreview
+    expires_at: datetime
+
+
+class RunStep(TrellisModel):
+    tool_call_id: str
+    tool_name: ToolName
+    attempt: int
+    status: ToolStepStatus
+    duration_ms: int
+    error: str | None = None
+
+
+class RunUsage(TrellisModel):
+    model_calls: int
+    tool_calls: int
+    input_tokens: int
+    output_tokens: int
+    cost_cents: float
+
+
+class RunDetail(TrellisModel):
+    id: UUID
+    status: RunStatus
+    prompt: str
+    pending_approval: PendingApproval | None = None
+    steps: list[RunStep]
+    usage: RunUsage
+    can_undo: bool
+    error: str | None = None
+
+
+class ApprovalRequirement(TrellisModel):
+    required: bool
+    reason: ApprovalReason
+
+
+class PolicyDecision(TrellisModel):
+    allow: bool
+    approval_required: bool
+    reason: ApprovalReason | None = None
+
+
+class LeaseOutcome(TrellisModel):
+    action: LeaseAction
+    result: JsonValue | None = None
+
+
+class UndoResult(TrellisModel):
+    applied: int
+    refused: bool
+    reason: UndoReason | None = None
+
+
+class ListTasksArgs(TrellisModel):
+    status: TaskStatus | None = None
+    due_before: date | None = None
+    due_after: date | None = None
+    priority: TaskPriority | None = None
+    limit: int = Field(default=50, le=50)
+
+
+class CreateTaskArgs(TrellisModel):
+    title: TaskTitle
+    notes: str = ""
+    due_date: date | None = None
+    priority: TaskPriority = TaskPriority.MEDIUM
+    blocked_by: UUID | None = None
+
+
+class MutableTaskFields(TrellisModel):
+    title: TaskTitle | None = None
+    notes: str | None = None
+    due_date: date | None = None
+    priority: TaskPriority | None = None
+    status: TaskStatus | None = None
+    blocked_by: UUID | None = None
+
+
+class UpdateTaskArgs(MutableTaskFields):
+    task_id: UUID
+    expected_version: int
+
+
+class BulkUpdateTasksArgs(MutableTaskFields):
+    task_ids: list[UUID]
+
+
+class DeleteTasksArgs(TrellisModel):
+    task_ids: list[UUID]
+
+
+class ProposePlanArgs(TrellisModel):
+    summary: str
+    steps: list[str]
