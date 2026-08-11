@@ -73,7 +73,9 @@ npm run build
 - Do not touch files outside the current task's file list unless the user explicitly expands the task.
 - Follow the model-routing table in `docs/BUILD_SPEC.md`. If the user explicitly authorizes a temporary routing exception, mark the PR for review by the required model.
 - Review neutrally. Give a blind reviewer only the task specification, commit diff, and verification evidence. Do not imply that defects exist. Require evidence-backed findings and allow an explicit no-findings result.
-- Terra is authorized only as a read-only blind reviewer for T00 and T00A under the user's 2026-08-10 exception. Terra must not edit, generate, or commit repository content. Record its findings and their disposition in the PR. Opus review remains required when available.
+- Use Terra as the default neutral, blind, read-only reviewer for Codex- or Sol-produced PRs under the user's 2026-08-11 instruction. Give Terra only the task specification, commit diff, and verification evidence. Terra must not edit, generate, stage, or commit repository content. Record its findings and their disposition in the PR.
+- Use Claude Sonnet as the default neutral, blind, read-only reviewer for Claude-produced PRs whose implementation model is Opus. Give Sonnet only the task specification, commit diff, and verification evidence. Sonnet must not edit, generate, stage, or commit repository content. Record its findings and their disposition in the PR.
+- Terra review does not replace Opus when the routing table says `SOL WRITES, OPUS REVIEWS` or otherwise requires Opus review.
 - Kernel files are transcription-only. Preserve the specified check order and transaction boundaries.
 - Put all SQL statements in `backend/app/sql.py` as uppercase constants.
 - Use typed Pydantic request, response, domain, and tool argument models. Reject extra request keys.
