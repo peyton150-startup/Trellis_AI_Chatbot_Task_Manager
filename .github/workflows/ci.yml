@@ -78,3 +78,41 @@ jobs:
       - name: Build T00A frontend
         working-directory: spike/frontend
         run: npm run build
+
+  t01-database-schema:
+    name: T01 database schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      - name: Verify T01 database schema
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tables="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
+            "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public';"; } | tr -d '\r')"
+          test "$tables" = "agent_runs,approvals,task_events,tasks,tool_invocations"
+
+          counts="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
+            "SELECT
+              (SELECT count(*) FROM pg_tables WHERE schemaname = 'public'),
+              (SELECT count(*) FROM pg_type WHERE typname IN ('task_status','task_priority','run_status','event_op','lease_status','approval_state')),
+              (SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('tasks_owner_idx','agent_runs_status_idx','task_events_run_idx','task_events_task_idx')),
+              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_blocked_by_fkey','task_events_run_id_fkey','tool_invocations_run_id_fkey','approvals_run_id_fkey')),
+              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_title_check','approvals_required_reason_check'));"; } | tr -d '\r')"
+          test "$counts" = "5|6|4|4|2"
+
+          echo "PASS T01: five tables, six enums, four indexes, four foreign keys, and two checks"
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v

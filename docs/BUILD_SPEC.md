@@ -133,7 +133,7 @@ tailwindcss
 Environment variables, `.env.example`:
 
 ```
-DATABASE_URL=postgresql://trellis:trellis@localhost:5432/trellis
+DATABASE_URL=postgresql://trellis:trellis@localhost:55432/trellis
 MODEL_ID=<set from the Day 4 bakeoff; provisional default on Day 1>
 ANTHROPIC_API_KEY=
 ACTOR_ID=00000000-0000-0000-0000-000000000001

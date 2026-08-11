@@ -38,7 +38,18 @@ The version command must print Python 3.12.x. Outside Codex, replace `$python312
 gh pr checks <pr-number> --watch
 ```
 
-The required checks are named `T00 API probe` and `T00A spike build`. Keep check names stable after branch protection references them.
+The required checks are named `T00 API probe`, `T00A spike build`, and `T01 database schema`. Keep check names stable after branch protection references them.
+
+### Per-task CI gate protocol
+
+- Every task PR must add or update a stable task-specific CI job that directly runs that task's verification. An earlier task's checks are regressions, not a substitute for the new task's gate.
+- CI gates are cumulative. Every pull request runs every established task check from T00 through the current task, regardless of which files changed, so later work cannot silently break earlier proofs.
+- Do not add path filters, changed-file shortcuts, conditional skips, or workflow splits that prevent an established gate from running on every pull request unless the user explicitly approves the exception.
+- Name each new check `T## <short verification name>` and keep that name stable after it is referenced by branch protection.
+- Treat `.github/workflows/ci.yml` and `IMPLEMENTATION_NOTES.md` as required companion files for each task, even when the task table lists only implementation files. Do not use this exception for unrelated changes.
+- Open the PR as a draft. Run the verification locally, push the branch, and wait until the new task check and all existing required checks pass.
+- After the new check has reported successfully at least once, add its exact name to the `master` branch's required status checks. Preserve strict up-to-date checks, admin enforcement, conversation resolution, and all existing required contexts.
+- Mark the PR ready only after local verification, all GitHub checks, and branch protection are confirmed. Never merge, squash, rebase, close, or otherwise finalize the PR; only the user may do that.
 
 - Full CI commands, once the application scaffold exists, run in this order:
 

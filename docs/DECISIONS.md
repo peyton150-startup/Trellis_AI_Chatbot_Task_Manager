@@ -30,6 +30,12 @@ Terra completed the T00A blind review of implementation commit `5d3ab47` on 2026
 
 ---
 
+## Local environment decisions
+
+On 2026-08-11, the user selected host port `55432` for Trellis PostgreSQL to avoid conflicts with an unrelated local PostgreSQL container that publishes `5432`. PostgreSQL still listens on `5432` inside the Compose network. Host application processes use `DATABASE_URL=postgresql://trellis:trellis@localhost:55432/trellis`.
+
+---
+
 ## API facts confirmed at T00
 
 Confirmed on 2026-08-10 using Python 3.12.13, `pydantic-ai` 2.27.0,
