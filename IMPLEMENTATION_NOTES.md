@@ -123,3 +123,89 @@ This document records how major implementations fit into Trellis both as isolate
 The whole mutation table was then reproduced independently inside a disposable Vercel Sandbox microVM running PostgreSQL 16.14, against the VM's own clone of pushed commit `406e735` rather than any local file. It observed the same two baseline digests, `9 passed` before and after, all twelve mutations killed, both files restored by digest, and the gate green. This converts the mutation evidence from self-reported, which is what it was at T04, to independently reproducible: the transcript names the SHA, and anyone with the public repository can rerun it. A thirteenth mutation was added after the review, replacing `_poll`'s `return None` on a failed row with a direct `return LeaseOutcome(action=LeaseAction.EXECUTE)`, the literal reading of section 7's poll block. The D-22 gate reported `attempt is 1, expected 2` and `status is failed, expected pending`, and `idempotency.py` was restored to its baseline digest. All thirteen are detected.
 
 **Limitations and review status:** Two coverage limitations are structural rather than oversights. Section 11 names three tests for T05 and none constructs a failed lease, so the reacquire branch and `fail` are exercised by the CI gate alone and by no named test. And the two guards are concurrency controls while all three tests are sequential, so no test can construct the race they defend against, namely a caller whose SELECT observed one state while a competitor changed the row before its UPDATE ran. What the gate proves instead is that each predicate sits inside its UPDATE rather than in a preceding SELECT, by running the statement against a row it must refuse and a row it must take. Both follow T04's precedent of covering in the gate what the named tests cannot construct. Do not read the three tests as proving the guards. A third gate check, added under D-22, covers the poll branch that observes a lease becoming failed, which is likewise unreachable from three sequential tests; it is the only check in the suite that uses a second thread, and it exists because a blind execution review showed that the literal reading of section 7's poll block lets two concurrent callers both execute one tool call. The reacquire preserves `completed_at` and `result` from the previous attempt, because section 7's SET list does not clear them; that is transcription rather than a judgment that stale values are wanted, and `complete` overwrites both on the next success. The steal guard is `lease_expires_at < now()` alone, exactly as section 7 prints it, so a completed row whose expiry had passed would satisfy it; that path is unreachable while `LEASE_TTL_SECONDS` exceeds `TOOL_TIMEOUT_SECONDS`, which section 7 requires and the defaults of 120 against 20 satisfy with margin, and adding a status predicate was rejected as an unrequested improvement to a transcription-only file. `RESOLVE_ATTEMPTS` bounds the re-SELECT loop that section 7 describes without bounding it, and exhausting it raises `LEASE_IN_FLIGHT`. T05 adds no domain mutation, no undo, no routes, and no tools, so the transaction in the tests' `_commit_work` helper is a stand-in for T06's `domain.py`. `backend/app/__init__.py` remains absent as Q-04 records. The T05 questions that D-18 and D-19 answer are not recorded in `docs/OPEN_QUESTIONS.md` as Q-01 through Q-03 were, because that file is outside T05's authorized list. Claude Opus 5 implemented T05 under the user's explicit authorizations of 2026-08-12 covering the `complete` signature, the `sql.py` scope expansion, and the test-authorship exception. Claude Sonnet performed the required neutral, blind, read-only review against a throwaway clone, with an execution pass in a disposable microVM, receiving no question list and no area guidance. It returned one finding, and the finding was accepted: commit `406e735` resolved section 7's poll-block contradiction correctly but recorded the resolution only in an inline comment, in the same commit that documented four other corrections as decisions. The reviewer demonstrated the stakes rather than asserting them, building the race in the microVM and observing one EXECUTE against the shipped code and two against a build patched to the literal spec text. D-22 and a gate check are the disposition, and the gate is itself proven by the thirteenth mutation. The review also confirmed the digests, the nine passing tests, both guards, and D-18's transaction boundary independently, and correctly reported that it sampled three of the twelve mutations rather than reproducing all twelve, leaving the other nine unverified by it; those twelve are separately covered by the full microVM reproduction recorded above. This finding is the first time in T04 or T05 that a blind review found something the author had not, and it is direct evidence for D-21's judgment that an execution pass is worth more than the static review it replaced.
+
+## T06: Domain services and events
+
+**Local role:** `backend/app/domain.py` is the only application writer of
+`tasks` and `task_events`. It exports `list_tasks`, `create_task`,
+`update_task`, `bulk_update_tasks`, `delete_tasks`, `write_events`, and
+`read_events`. Every public function takes `conn` as a required keyword-only
+argument. No function imports the pool, opens another connection, commits, or
+rolls back. Mutators return a `MutationResult` containing typed task rows and
+`PendingTaskEvent` values; the caller writes those events with `write_events`
+before committing. Single updates use the caller's `expected_version`. Bulk
+updates lock complete rows and use each locked current version in the guarded
+statement. Missing, foreign, stale, or concurrently removed targets fail closed
+with `VERSION_CONFLICT` rather than producing a partial result.
+
+**Whole-system role:** T06 supplies the transaction seam required by BUILD_SPEC
+sections 7 and 10. A T10 tool can now execute its domain mutation, append every
+audit event, and call `idempotency.complete(..., conn=conn)` inside one
+caller-owned transaction. A rollback leaves all three absent, while a commit
+lands all three together, which makes a pending lease honest evidence that no
+domain work committed. Complete JSON-safe task snapshots give T07 the original
+id and fields needed to restore a deletion and the after version needed to
+refuse stale undo. The delete path also turns the schema's implicit
+`ON DELETE SET NULL` writes into explicit updated events, preserving the claim
+that the audit log explains every owned domain mutation.
+
+**Inputs and dependencies:** T06 consumes the T01 task and event schema; T02's
+dictionary-row psycopg connections and centralized SQL catalog; T03's task,
+event, and tool-argument models; T05's caller-owned completion contract from
+D-18; and D-02, D-10, D-17, and D-19. Runtime behavior depends on PostgreSQL 16
+for guarded updates, foreign-key actions, and row locks. D-23 adds
+`SELECT_TASKS_BY_IDS_FOR_UPDATE` for complete canonical-order target snapshots
+and `SELECT_TASKS_BLOCKED_BY_IDS` for complete pre-cascade snapshots. No SQL
+string lives in `domain.py`.
+
+**Outputs and consumers:** T10 consumes the five domain operations and
+`write_events` inside its identical tool transaction. T07 consumes complete
+`created`, `updated`, and `deleted` event snapshots and relies on the cascade
+event order: pointer-clearing updates receive lower event ids than deletions,
+so reverse-order undo restores deleted blockers before restoring references.
+`MutationResult.tasks` contains created or updated post-mutation rows, or the
+deleted rows for a deletion; cascade-affected survivors are events but are not
+part of the delete tool's result. Reads are bounded through the existing SQL
+limits and also join an explicit caller connection for one consistent API.
+
+**Verification:** Test-first evidence is preserved. Before `domain.py` existed,
+the complete T06 gate failed with `ImportError: cannot import name 'domain' from
+'app' (unknown location)`. The green gate runs against live PostgreSQL and
+prints `PASS T06: rollback and commit boundaries on every mutating path,
+complete snapshots, guarded update, bulk update, delete, audited delete
+cascade, canonical lock order, and event reads`. It explicitly rolls back
+create, single update, bulk update, and delete; commits a mutation, its event,
+and lease completion together; checks every snapshot key; verifies explicit
+null updates, stale-version rejection, duplicate-id behavior, event order, and
+the foreign-key cascade; proves both request orders produce the same lock
+sequence; and runs a two-thread concurrent smoke case. The pre-change and
+post-change cumulative suite reports 36 tests. The required Opus execution pass
+also ran all six public functions with pool access replaced by a raising object,
+reproduced the old request-order deadlock, observed no deadlock over 200 rounds
+with canonical ordering, and reproduced the gate and 36 tests in a clean-room
+Ubuntu 26.04 environment with PostgreSQL 16.14 and Python 3.12.13. Sol then
+applied three defects one at a time to the reviewed result. Restoring request
+order in the locking query failed with `lock order follows the request`;
+dropping the cascade events failed with `the delete cascade was not audited`;
+and adding an internal commit to `update_task` failed with `update_task
+committed internally`. Both production files were restored to their baseline
+SHA-256 digests after the mutations.
+
+**Limitations and review status:** `model_fields_set` is the only signal that
+distinguishes an omitted nullable field from an explicit null. T10 must pass the
+argument object validated from the real payload; rebuilding it from a full
+`model_dump()` marks every field as present and can clear `due_date` or
+`blocked_by`. T07 cannot pass a complete event snapshot directly to
+`UpdateTaskArgs`, whose extra-field rejection requires undo to project only the
+mutable fields. A foreign actor's row may point at a deleted task because the
+schema has no ownership constraint on `blocked_by`; PostgreSQL clears that
+pointer, but T06 deliberately neither audits nor undoes a cross-actor write.
+Direct targets and referencing rows are locked in two statements, leaving a
+narrow concurrent-delete interleaving. Section 12's required Opus review found
+the transaction boundary correct, then found the request-order deadlock, the
+unaudited delete cascade, and the one-path-only rollback proof by executing the
+code. All three findings are accepted and covered by the expanded gate. At the
+user's direction Opus applied the fixes to the uncommitted worktree; D-23 records
+that T06-only routing exception. Sol reviewed the code and reproduced the gate
+before accepting ownership. No T07 code, endpoint, tool, or invariant-test count
+changes in T06.
