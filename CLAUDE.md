@@ -21,7 +21,7 @@ Trellis is a technical interview artifact: an LLM operates a todo application th
 $python312 = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 & $python312 --version
 & $python312 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install pydantic-ai==2.27.0 "pydantic-ai-slim[ag-ui]==2.27.0" fastapi==0.141.1 uvicorn==0.52.1 httpx==0.28.1
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
 ```
 
 The version command must print Python 3.12.x. Outside Codex, replace `$python312` with the exact path to a Python 3.12 interpreter.
@@ -38,7 +38,7 @@ The version command must print Python 3.12.x. Outside Codex, replace `$python312
 gh pr checks <pr-number> --watch
 ```
 
-The required checks are named `T00 API probe`, `T00A spike build`, and `T01 database schema`. Keep check names stable after branch protection references them.
+The required checks are named `T00 API probe`, `T00A spike build`, `T00R probe hardening`, `T01 database schema`, `T02 database connection`, and `T03 models`. Keep check names stable after branch protection references them.
 
 ### Per-task CI gate protocol
 

@@ -1,0 +1,23 @@
+# Trellis backend dependencies, fully pinned.
+#
+# This file is the single pin source for local development and for every backend
+# job in .github/workflows/ci.yml. Bumping a version here changes what the T00 API
+# probe proves, which is the intent: the probe must always run against the exact
+# versions the application uses, or docs/DECISIONS.md can record confirmed API
+# facts for versions nothing else installs.
+#
+# spike/backend/requirements.txt deliberately keeps its own pins. That tree is
+# disposable and is deleted before T12A, so coupling it to production pins would
+# only create something to unwind. See docs/DECISIONS.md.
+
+ag-ui-protocol==0.1.19
+fastapi==0.141.1
+httpx==0.28.1
+psycopg[binary,pool]==3.3.4
+pydantic==2.13.4
+pydantic-ai==2.27.0
+pydantic-ai-slim[ag-ui]==2.27.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+python-dotenv==1.2.2
+uvicorn[standard]==0.52.1
