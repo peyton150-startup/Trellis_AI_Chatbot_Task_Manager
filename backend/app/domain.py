@@ -1,0 +1,399 @@
+"""Task domain services and append-only event preparation.
+
+This module is the only writer of ``tasks`` and ``task_events``. Every public
+function takes the database connection explicitly as a required keyword-only
+argument. Mutations, their event rows, and ``idempotency.complete`` therefore
+run on the same caller-owned transaction. Nothing here commits or rolls back.
+
+Task rows are authoritative current state. Event snapshots are JSON-safe,
+complete task rows so T07 can compare ``after["version"]`` and restore a
+deleted task with ``before["id"]`` and every other original field.
+
+One mutation in this schema does not originate here. ``tasks.blocked_by`` is a
+self reference declared ``ON DELETE SET NULL``, so deleting a task rewrites
+every surviving row that pointed at it, without passing through any function
+below. ``delete_tasks`` snapshots those rows before the delete and events the
+cascade as ordinary updates, so the audit log stays a complete account of how
+current state was reached and undo has something to reverse.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Iterable, Sequence
+from uuid import UUID
+
+from psycopg import Connection
+from psycopg.types.json import Json
+from pydantic import JsonValue
+
+from . import sql
+from .errors import VersionConflictError
+from .models import (
+    BulkUpdateTasksArgs,
+    CreateTaskArgs,
+    DeleteTasksArgs,
+    EventOperation,
+    ListTasksArgs,
+    Task,
+    TaskEvent,
+    UpdateTaskArgs,
+)
+
+
+TaskSnapshot = dict[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class PendingTaskEvent:
+    """An event payload prepared beside its mutation but not yet persisted."""
+
+    task_id: UUID
+    operation: EventOperation
+    before: TaskSnapshot | None
+    after: TaskSnapshot | None
+
+
+@dataclass(frozen=True, slots=True)
+class MutationResult:
+    """Rows returned by a mutation and the events the caller must write.
+
+    ``tasks`` contains the post-mutation shape for creates and updates, and the
+    deleted shape for deletes. ``events`` is passed unchanged to
+    :func:`write_events` before the caller commits the transaction.
+    """
+
+    tasks: tuple[Task, ...]
+    events: tuple[PendingTaskEvent, ...]
+
+
+def list_tasks(
+    owner_id: UUID,
+    arguments: ListTasksArgs,
+    *,
+    conn: Connection,
+) -> list[Task]:
+    """Read one owner's tasks with the closed, bounded SQL filters."""
+    rows = conn.execute(
+        sql.SELECT_TASKS_FOR_OWNER,
+        {
+            "owner_id": owner_id,
+            "status": _enum_value(arguments.status),
+            "due_before": arguments.due_before,
+            "due_after": arguments.due_after,
+            "priority": _enum_value(arguments.priority),
+            "limit": arguments.limit,
+        },
+    ).fetchall()
+    return [_task(row) for row in rows]
+
+
+def create_task(
+    owner_id: UUID,
+    arguments: CreateTaskArgs,
+    *,
+    conn: Connection,
+) -> MutationResult:
+    """Insert one task and prepare its complete ``created`` event."""
+    row = conn.execute(
+        sql.INSERT_TASK,
+        {
+            "owner_id": owner_id,
+            "title": arguments.title,
+            "notes": arguments.notes,
+            "due_date": arguments.due_date,
+            "priority": arguments.priority.value,
+            "blocked_by": arguments.blocked_by,
+        },
+    ).fetchone()
+    task = _task(row)
+    event = PendingTaskEvent(
+        task_id=task.id,
+        operation=EventOperation.CREATED,
+        before=None,
+        after=_snapshot(task),
+    )
+    return MutationResult(tasks=(task,), events=(event,))
+
+
+def update_task(
+    owner_id: UUID,
+    arguments: UpdateTaskArgs,
+    *,
+    conn: Connection,
+) -> MutationResult:
+    """Guard one update by its expected version and capture both full rows."""
+    locked = _locked_tasks(owner_id, (arguments.task_id,), conn=conn)
+    before = locked.get(arguments.task_id)
+
+    row = conn.execute(
+        sql.UPDATE_TASK_GUARDED,
+        _update_parameters(
+            owner_id,
+            arguments.task_id,
+            arguments.expected_version,
+            arguments,
+        ),
+    ).fetchone()
+    if row is None or before is None:
+        raise VersionConflictError()
+
+    after = _task(row)
+    event = _updated_event(before, after)
+    return MutationResult(tasks=(after,), events=(event,))
+
+
+def bulk_update_tasks(
+    owner_id: UUID,
+    arguments: BulkUpdateTasksArgs,
+    *,
+    conn: Connection,
+) -> MutationResult:
+    """Lock and update each distinct target once in the caller's transaction.
+
+    ``BulkUpdateTasksArgs`` has no expected-version field. The locked current
+    version becomes each guarded UPDATE's expected version. Duplicate ids still
+    count at the policy layer under D-17, while SQL ``ANY`` semantics mutate one
+    physical row once.
+    """
+    task_ids = _unique_ids(arguments.task_ids)
+    if not task_ids:
+        return MutationResult(tasks=(), events=())
+
+    locked = _locked_tasks(owner_id, task_ids, conn=conn)
+    _require_all_targets(task_ids, locked)
+
+    updated: list[Task] = []
+    events: list[PendingTaskEvent] = []
+    for task_id in task_ids:
+        before = locked[task_id]
+        row = conn.execute(
+            sql.UPDATE_TASK_GUARDED,
+            _update_parameters(owner_id, task_id, before.version, arguments),
+        ).fetchone()
+        if row is None:
+            raise VersionConflictError()
+        after = _task(row)
+        updated.append(after)
+        events.append(_updated_event(before, after))
+
+    return MutationResult(tasks=tuple(updated), events=tuple(events))
+
+
+def delete_tasks(
+    owner_id: UUID,
+    arguments: DeleteTasksArgs,
+    *,
+    conn: Connection,
+) -> MutationResult:
+    """Delete every distinct target or fail before allowing a partial result.
+
+    ``tasks`` carries the deleted rows only. A delete can also clear
+    ``blocked_by`` on rows that were never targets, through the schema's
+    ``ON DELETE SET NULL``. Those rows are not part of the tool's result, but
+    they do get their own ``updated`` events, because an unrecorded mutation is
+    one the audit log cannot explain and undo cannot reverse.
+    """
+    task_ids = _unique_ids(arguments.task_ids)
+    if not task_ids:
+        return MutationResult(tasks=(), events=())
+
+    locked = _locked_tasks(owner_id, task_ids, conn=conn)
+    _require_all_targets(task_ids, locked)
+
+    # Snapshot the rows the cascade is about to rewrite, while they still point
+    # at their blocker and while this transaction holds their locks.
+    blocked_before = _tasks_blocked_by(owner_id, task_ids, conn=conn)
+
+    rows = conn.execute(
+        sql.DELETE_TASKS_BY_IDS,
+        {"owner_id": owner_id, "task_ids": list(task_ids)},
+    ).fetchall()
+    deleted_tasks = tuple(_task(row) for row in rows)
+    deleted_by_id = {task.id: task for task in deleted_tasks}
+    _require_all_targets(task_ids, deleted_by_id)
+
+    deleted = tuple(deleted_by_id[task_id] for task_id in task_ids)
+    deleted_events = tuple(
+        PendingTaskEvent(
+            task_id=task.id,
+            operation=EventOperation.DELETED,
+            before=_snapshot(task),
+            after=None,
+        )
+        for task in deleted
+    )
+    cascade_events = _cascade_events(owner_id, blocked_before, conn=conn)
+
+    # Cleared-pointer events first, deleted events last, so their ids ascend in
+    # that order. Section 8 applies undo in reverse id order, so the deleted
+    # events are undone first and every blocker is back in the table before any
+    # pointer to it is restored. The opposite order would write a foreign key
+    # reference to a row that does not exist yet.
+    return MutationResult(tasks=deleted, events=cascade_events + deleted_events)
+
+
+def write_events(
+    run_id: UUID,
+    actor_id: UUID,
+    events: Iterable[PendingTaskEvent],
+    *,
+    conn: Connection,
+) -> list[TaskEvent]:
+    """Persist prepared events without ending the caller's transaction."""
+    written: list[TaskEvent] = []
+    for event in events:
+        row = conn.execute(
+            sql.INSERT_TASK_EVENT,
+            {
+                "task_id": event.task_id,
+                "run_id": run_id,
+                "actor_id": actor_id,
+                "operation": event.operation.value,
+                "before": Json(event.before) if event.before is not None else None,
+                "after": Json(event.after) if event.after is not None else None,
+            },
+        ).fetchone()
+        written.append(TaskEvent.model_validate(row))
+    return written
+
+
+def read_events(
+    run_id: UUID,
+    *,
+    limit: int,
+    conn: Connection,
+) -> list[TaskEvent]:
+    """Read one bounded page of a run's events, newest first."""
+    rows = conn.execute(
+        sql.SELECT_EVENTS_FOR_RUN,
+        {"run_id": run_id, "limit": limit},
+    ).fetchall()
+    return [TaskEvent.model_validate(row) for row in rows]
+
+
+def _locked_tasks(
+    owner_id: UUID,
+    task_ids: Sequence[UUID],
+    *,
+    conn: Connection,
+) -> dict[UUID, Task]:
+    if not task_ids:
+        return {}
+    rows = conn.execute(
+        sql.SELECT_TASKS_BY_IDS_FOR_UPDATE,
+        {"owner_id": owner_id, "task_ids": list(task_ids)},
+    ).fetchall()
+    tasks = (_task(row) for row in rows)
+    return {task.id: task for task in tasks}
+
+
+def _tasks_blocked_by(
+    owner_id: UUID,
+    task_ids: Sequence[UUID],
+    *,
+    conn: Connection,
+) -> tuple[Task, ...]:
+    """Lock and return the rows whose blocked_by points into ``task_ids``."""
+    rows = conn.execute(
+        sql.SELECT_TASKS_BLOCKED_BY_IDS,
+        {"owner_id": owner_id, "task_ids": list(task_ids)},
+    ).fetchall()
+    return tuple(_task(row) for row in rows)
+
+
+def _cascade_events(
+    owner_id: UUID,
+    before_rows: Sequence[Task],
+    *,
+    conn: Connection,
+) -> tuple[PendingTaskEvent, ...]:
+    """Turn the delete cascade into ordinary updated events.
+
+    Called after the delete, once the database has applied ON DELETE SET NULL.
+    The rows are re-read rather than reconstructed, so the after snapshot is the
+    committed shape rather than this module's guess at it. ``version`` is
+    unchanged, because a foreign key action does not run the guarded update, and
+    that is what undo compares against.
+    """
+    if not before_rows:
+        return ()
+
+    after_by_id = _locked_tasks(owner_id, [task.id for task in before_rows], conn=conn)
+    events: list[PendingTaskEvent] = []
+    for before in before_rows:
+        after = after_by_id.get(before.id)
+        if after is None:
+            # The row vanished between the snapshot and here despite the lock,
+            # which is not reachable inside one transaction. Fail closed.
+            raise VersionConflictError()
+        if after.blocked_by == before.blocked_by:
+            continue
+        events.append(_updated_event(before, after))
+    return tuple(events)
+
+
+def _require_all_targets(
+    task_ids: Sequence[UUID], tasks_by_id: dict[UUID, Task]
+) -> None:
+    if len(tasks_by_id) != len(task_ids):
+        # policy.check normally catches missing and foreign rows before this
+        # layer. A row disappearing between that check and this transaction is
+        # a concurrent-state change, so fail closed with the existing conflict.
+        raise VersionConflictError()
+
+
+def _update_parameters(
+    owner_id: UUID,
+    task_id: UUID,
+    expected_version: int,
+    arguments: UpdateTaskArgs | BulkUpdateTasksArgs,
+) -> dict[str, object]:
+    # due_date and blocked_by are the two fields whose null is a value rather
+    # than an absence, so UPDATE_TASK_GUARDED gates them on a set flag instead of
+    # COALESCE. The flag can only come from model_fields_set, and that carries a
+    # caller contract: pass arguments validated from the payload the caller
+    # actually received. Revalidating a full model_dump marks every field as set,
+    # after which an update that never mentioned due_date clears it. Undo is the
+    # one caller that legitimately sets every field, because restoring a complete
+    # before snapshot is exactly what section 8 asks it to do.
+    fields = arguments.model_fields_set
+    return {
+        "id": task_id,
+        "owner_id": owner_id,
+        "expected_version": expected_version,
+        "title": arguments.title if "title" in fields else None,
+        "notes": arguments.notes if "notes" in fields else None,
+        "due_date": arguments.due_date,
+        "set_due_date": "due_date" in fields,
+        "priority": _enum_value(arguments.priority) if "priority" in fields else None,
+        "status": _enum_value(arguments.status) if "status" in fields else None,
+        "blocked_by": arguments.blocked_by,
+        "set_blocked_by": "blocked_by" in fields,
+    }
+
+
+def _updated_event(before: Task, after: Task) -> PendingTaskEvent:
+    return PendingTaskEvent(
+        task_id=after.id,
+        operation=EventOperation.UPDATED,
+        before=_snapshot(before),
+        after=_snapshot(after),
+    )
+
+
+def _unique_ids(task_ids: Sequence[UUID]) -> tuple[UUID, ...]:
+    return tuple(dict.fromkeys(task_ids))
+
+
+def _task(row) -> Task:
+    if row is None:
+        raise RuntimeError("task statement returned no row")
+    return Task.model_validate(row)
+
+
+def _snapshot(task: Task) -> TaskSnapshot:
+    return task.model_dump(mode="json")
+
+
+def _enum_value(value: Enum | None) -> str | None:
+    return value.value if value is not None else None

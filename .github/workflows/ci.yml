@@ -614,3 +614,537 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  t06-domain-services:
+    name: T06 domain services
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # T06 owns the only writer of tasks and task_events. A round trip alone
+      # cannot prove its transaction boundary, because a version that commits
+      # each statement separately also round-trips. This gate first rolls back
+      # a task mutation, its event, and idempotency.complete on one connection,
+      # then proves none of the three committed. It repeats the same shape with
+      # a commit and verifies all three landed together. The remainder covers
+      # complete snapshots, guarded updates, bulk updates, deletes, and reads.
+      - name: Verify T06 domain services and transaction boundary
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import threading
+          from collections import Counter
+          from uuid import UUID
+
+          from app import domain, idempotency, sql
+          from app.db import pool
+          from app.errors import VersionConflictError
+          from app.models import (
+              BulkUpdateTasksArgs,
+              CreateTaskArgs,
+              DeleteTasksArgs,
+              EventOperation,
+              LeaseAction,
+              ListTasksArgs,
+              TaskPriority,
+              TaskStatus,
+              UpdateTaskArgs,
+          )
+
+          ACTOR = UUID("00000000-0000-0000-0000-000000000001")
+          SNAPSHOT_KEYS = {
+              "id",
+              "owner_id",
+              "title",
+              "notes",
+              "due_date",
+              "priority",
+              "status",
+              "blocked_by",
+              "version",
+              "created_at",
+              "updated_at",
+          }
+
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+
+          def reset_and_create_run(label):
+              with pool.connection() as conn:
+                  conn.execute(sql.TRUNCATE_ALL_STATE)
+                  row = conn.execute(
+                      sql.INSERT_RUN,
+                      {"actor_id": ACTOR, "prompt": label, "model": "t06-gate"},
+                  ).fetchone()
+                  conn.commit()
+                  return row["id"]
+
+
+          def read_state(run_id):
+              with pool.connection() as conn:
+                  tasks = domain.list_tasks(
+                      ACTOR, ListTasksArgs(limit=50), conn=conn
+                  )
+                  events = domain.read_events(run_id, limit=50, conn=conn)
+                  conn.commit()
+                  return tasks, events
+
+
+          def only_task(mutation):
+              require(len(mutation.tasks) == 1, "mutation did not return one task")
+              return mutation.tasks[0]
+
+
+          # Rollback proof. acquire commits the pending lease first. The domain
+          # mutation, event write, and completion then share a second connection
+          # and are explicitly rolled back. Any internal commit breaks this.
+          run_id = reset_and_create_run("T06 rollback proof")
+          outcome = idempotency.acquire(
+              run_id, "rollback-call", "create_task", "a" * 64
+          )
+          require(outcome.action is LeaseAction.EXECUTE, "rollback lease not acquired")
+
+          with pool.connection() as conn:
+              rolled_back = domain.create_task(
+                  ACTOR,
+                  CreateTaskArgs(title="Rolled back task", notes="must disappear"),
+                  conn=conn,
+              )
+              domain.write_events(run_id, ACTOR, rolled_back.events, conn=conn)
+              idempotency.complete(
+                  run_id,
+                  "rollback-call",
+                  only_task(rolled_back).model_dump(mode="json"),
+                  conn=conn,
+              )
+              conn.rollback()
+
+          tasks, events = read_state(run_id)
+          require(tasks == [], "rolled-back task committed")
+          require(events == [], "rolled-back event committed")
+          with pool.connection() as conn:
+              lease = conn.execute(
+                  sql.SELECT_LEASE,
+                  {"run_id": run_id, "tool_call_id": "rollback-call"},
+              ).fetchone()
+              conn.commit()
+          require(lease["status"] == "pending", "rolled-back lease completed")
+          require(lease["result"] is None, "rolled-back lease stored a result")
+
+          # Commit proof. The same three writes now commit together.
+          run_id = reset_and_create_run("T06 commit proof")
+          outcome = idempotency.acquire(
+              run_id, "commit-call", "create_task", "b" * 64
+          )
+          require(outcome.action is LeaseAction.EXECUTE, "commit lease not acquired")
+
+          with pool.connection() as conn:
+              created_mutation = domain.create_task(
+                  ACTOR,
+                  CreateTaskArgs(
+                      title="Task A",
+                      notes="original",
+                      due_date="2026-08-17",
+                      priority=TaskPriority.CRITICAL,
+                  ),
+                  conn=conn,
+              )
+              created = only_task(created_mutation)
+              written = domain.write_events(
+                  run_id, ACTOR, created_mutation.events, conn=conn
+              )
+              idempotency.complete(
+                  run_id,
+                  "commit-call",
+                  created.model_dump(mode="json"),
+                  conn=conn,
+              )
+              conn.commit()
+
+          require(len(written) == 1, "creation did not write one event")
+          tasks, events = read_state(run_id)
+          require(len(tasks) == 1, "committed task missing")
+          require(len(events) == 1, "committed event missing")
+          created_event = events[0]
+          require(created_event.operation is EventOperation.CREATED, "wrong create op")
+          require(created_event.before is None, "creation before snapshot is not null")
+          require(
+              created_event.after == created.model_dump(mode="json"),
+              "create snapshot is not the complete committed row",
+          )
+          require(
+              set(created_event.after) == SNAPSHOT_KEYS,
+              "create snapshot is partial",
+          )
+          with pool.connection() as conn:
+              lease = conn.execute(
+                  sql.SELECT_LEASE,
+                  {"run_id": run_id, "tool_call_id": "commit-call"},
+              ).fetchone()
+              conn.commit()
+          require(lease["status"] == "completed", "committed lease is not completed")
+          require(lease["result"]["id"] == str(created.id), "lease stored wrong result")
+
+          # A guarded update captures both complete rows and preserves explicit
+          # null for due_date. Reusing version 1 after version 2 must fail and
+          # must not create an event.
+          with pool.connection() as conn:
+              updated_mutation = domain.update_task(
+                  ACTOR,
+                  UpdateTaskArgs(
+                      task_id=created.id,
+                      expected_version=1,
+                      title="Task A updated",
+                      due_date=None,
+                      status=TaskStatus.DONE,
+                  ),
+                  conn=conn,
+              )
+              updated = only_task(updated_mutation)
+              domain.write_events(run_id, ACTOR, updated_mutation.events, conn=conn)
+              conn.commit()
+
+          update_event = updated_mutation.events[0]
+          require(
+              update_event.before == created.model_dump(mode="json"),
+              "update before snapshot is not the complete original row",
+          )
+          require(
+              update_event.after == updated.model_dump(mode="json"),
+              "update after snapshot is not the complete new row",
+          )
+          require(updated.version == 2, "guarded update did not increment version")
+          require(updated.due_date is None, "explicit null due_date was not applied")
+
+          with pool.connection() as conn:
+              try:
+                  domain.update_task(
+                      ACTOR,
+                      UpdateTaskArgs(
+                          task_id=created.id,
+                          expected_version=1,
+                          notes="stale write",
+                      ),
+                      conn=conn,
+                  )
+              except VersionConflictError:
+                  conn.rollback()
+              else:
+                  raise RuntimeError("stale update did not raise VERSION_CONFLICT")
+
+          # Create a second row, then bulk-update duplicate input ids. The
+          # policy counts duplicate ids for blast radius under D-17, while the
+          # SQL ANY semantics mutate each physical row exactly once.
+          with pool.connection() as conn:
+              second_mutation = domain.create_task(
+                  ACTOR, CreateTaskArgs(title="Task B"), conn=conn
+              )
+              second = only_task(second_mutation)
+              domain.write_events(run_id, ACTOR, second_mutation.events, conn=conn)
+              conn.commit()
+
+          with pool.connection() as conn:
+              bulk_mutation = domain.bulk_update_tasks(
+                  ACTOR,
+                  BulkUpdateTasksArgs(
+                      task_ids=[created.id, second.id, created.id],
+                      notes="bulk",
+                      priority=TaskPriority.HIGH,
+                  ),
+                  conn=conn,
+              )
+              domain.write_events(run_id, ACTOR, bulk_mutation.events, conn=conn)
+              conn.commit()
+
+          require(len(bulk_mutation.tasks) == 2, "duplicate id mutated a row twice")
+          require(
+              len(bulk_mutation.events) == 2,
+              "bulk update did not write one event per row",
+          )
+          versions = {task.id: task.version for task in bulk_mutation.tasks}
+          require(versions[created.id] == 3, "first bulk version is not 3")
+          require(versions[second.id] == 2, "second bulk version is not 2")
+
+          with pool.connection() as conn:
+              deleted_mutation = domain.delete_tasks(
+                  ACTOR,
+                  DeleteTasksArgs(task_ids=[second.id, created.id, second.id]),
+                  conn=conn,
+              )
+              domain.write_events(run_id, ACTOR, deleted_mutation.events, conn=conn)
+              conn.commit()
+
+          require(len(deleted_mutation.tasks) == 2, "delete did not return two rows")
+          require(
+              len(deleted_mutation.events) == 2,
+              "delete did not produce two events",
+          )
+
+          tasks, events = read_state(run_id)
+          require(tasks == [], "deleted tasks remain visible")
+          require(len(events) == 7, f"expected 7 events, got {len(events)}")
+          counts = Counter(event.operation for event in events)
+          require(counts[EventOperation.CREATED] == 2, "wrong created event count")
+          require(counts[EventOperation.UPDATED] == 3, "wrong updated event count")
+          require(counts[EventOperation.DELETED] == 2, "wrong deleted event count")
+
+          for event in events:
+              if event.before is not None:
+                  require(
+                      set(event.before) == SNAPSHOT_KEYS,
+                      f"event {event.id} has partial before snapshot",
+                  )
+              if event.after is not None:
+                  require(
+                      set(event.after) == SNAPSHOT_KEYS,
+                      f"event {event.id} has partial after snapshot",
+                  )
+              if event.operation is EventOperation.DELETED:
+                  require(
+                      event.after is None,
+                      f"deleted event {event.id} has an after snapshot",
+                  )
+                  require(
+                      event.before["id"] == str(event.task_id),
+                      f"deleted event {event.id} cannot restore its original id",
+                  )
+              if event.operation in (EventOperation.CREATED, EventOperation.UPDATED):
+                  require(
+                      event.after["version"] >= 1,
+                      f"event {event.id} lacks the version T07 needs",
+                  )
+
+          # The rollback proof above covers create_task only. A mutating
+          # function that commits internally is invisible to any proof whose
+          # transaction ends in commit, so the other three paths need the same
+          # treatment rather than an argument from symmetry.
+          run_id = reset_and_create_run("T06 rollback proof, remaining paths")
+          with pool.connection() as conn:
+              keep_a = only_task(
+                  domain.create_task(ACTOR, CreateTaskArgs(title="Keep A"), conn=conn)
+              )
+              keep_b = only_task(
+                  domain.create_task(ACTOR, CreateTaskArgs(title="Keep B"), conn=conn)
+              )
+              conn.commit()
+
+          def committed_titles():
+              tasks, events = read_state(run_id)
+              require(events == [], "a rolled-back path committed an event")
+              return {task.title: task for task in tasks}
+
+          with pool.connection() as conn:
+              rolled = domain.update_task(
+                  ACTOR,
+                  UpdateTaskArgs(
+                      task_id=keep_a.id, expected_version=1, title="Never committed"
+                  ),
+                  conn=conn,
+              )
+              domain.write_events(run_id, ACTOR, rolled.events, conn=conn)
+              conn.rollback()
+          current = committed_titles()
+          require("Never committed" not in current, "update_task committed internally")
+          require(current["Keep A"].version == 1, "rolled-back update moved the version")
+
+          with pool.connection() as conn:
+              rolled = domain.bulk_update_tasks(
+                  ACTOR,
+                  BulkUpdateTasksArgs(
+                      task_ids=[keep_a.id, keep_b.id], notes="never committed"
+                  ),
+                  conn=conn,
+              )
+              domain.write_events(run_id, ACTOR, rolled.events, conn=conn)
+              conn.rollback()
+          current = committed_titles()
+          require(
+              all(task.notes == "" for task in current.values()),
+              "bulk_update_tasks committed internally",
+          )
+
+          with pool.connection() as conn:
+              rolled = domain.delete_tasks(
+                  ACTOR, DeleteTasksArgs(task_ids=[keep_a.id, keep_b.id]), conn=conn
+              )
+              domain.write_events(run_id, ACTOR, rolled.events, conn=conn)
+              conn.rollback()
+          current = committed_titles()
+          require(len(current) == 2, "delete_tasks committed internally")
+
+          # tasks.blocked_by is ON DELETE SET NULL, so a delete rewrites rows
+          # that were never targets. That write bypasses every function here, so
+          # the delete has to account for it or the audit log is incomplete and
+          # undo silently restores a task nothing points at any more.
+          run_id = reset_and_create_run("T06 delete cascade audit")
+          with pool.connection() as conn:
+              blocker = only_task(
+                  domain.create_task(ACTOR, CreateTaskArgs(title="Blocker"), conn=conn)
+              )
+              conn.commit()
+          with pool.connection() as conn:
+              blocked = only_task(
+                  domain.create_task(
+                      ACTOR,
+                      CreateTaskArgs(title="Blocked", blocked_by=blocker.id),
+                      conn=conn,
+                  )
+              )
+              conn.commit()
+          require(blocked.blocked_by == blocker.id, "blocked task was not linked")
+
+          with pool.connection() as conn:
+              cascade = domain.delete_tasks(
+                  ACTOR, DeleteTasksArgs(task_ids=[blocker.id]), conn=conn
+              )
+              domain.write_events(run_id, ACTOR, cascade.events, conn=conn)
+              conn.commit()
+
+          require(len(cascade.tasks) == 1, "cascade delete returned extra result rows")
+          require(len(cascade.events) == 2, "the delete cascade was not audited")
+          cleared, removed = cascade.events
+          require(
+              cleared.operation is EventOperation.UPDATED
+              and removed.operation is EventOperation.DELETED,
+              "cascade event order would make undo restore a dangling reference",
+          )
+          require(cleared.task_id == blocked.id, "cascade event names the wrong task")
+          require(
+              cleared.before["blocked_by"] == str(blocker.id),
+              "cascade before snapshot lost the original blocker",
+          )
+          require(
+              cleared.after["blocked_by"] is None,
+              "cascade after snapshot does not show the cleared pointer",
+          )
+          require(
+              cleared.after["version"] == cleared.before["version"],
+              "cascade moved the version undo precheck compares",
+          )
+
+          # Persisted ids must ascend in the same order, because section 8 walks
+          # them descending and has to reinsert the blocker before repointing.
+          with pool.connection() as conn:
+              persisted = domain.read_events(run_id, limit=50, conn=conn)
+              conn.commit()
+          require(len(persisted) == 2, "cascade wrote the wrong number of events")
+          require(
+              persisted[0].operation is EventOperation.DELETED
+              and persisted[1].operation is EventOperation.UPDATED,
+              "reverse-order undo would restore the pointer before the blocker",
+          )
+
+          # Lock order. FOR UPDATE locks in the order the sort produces, so a
+          # request-ordered sort lets two callers passing the same ids reversed
+          # acquire them in opposite orders and deadlock.
+          run_id = reset_and_create_run("T06 lock order")
+          with pool.connection() as conn:
+              first = only_task(
+                  domain.create_task(ACTOR, CreateTaskArgs(title="Race A"), conn=conn)
+              )
+              second = only_task(
+                  domain.create_task(ACTOR, CreateTaskArgs(title="Race B"), conn=conn)
+              )
+              conn.commit()
+
+          # Asserted as a property rather than by trying to provoke a deadlock,
+          # because the deadlock is timing dependent and its absence in one run
+          # proves nothing. What rules the cycle out is that both request orders
+          # lock the same rows in the same sequence.
+          forward = [first.id, second.id]
+          reverse = [second.id, first.id]
+          with pool.connection() as conn:
+              forward_locked = [
+                  row["id"]
+                  for row in conn.execute(
+                      sql.SELECT_TASKS_BY_IDS_FOR_UPDATE,
+                      {"owner_id": ACTOR, "task_ids": forward},
+                  ).fetchall()
+              ]
+              reverse_locked = [
+                  row["id"]
+                  for row in conn.execute(
+                      sql.SELECT_TASKS_BY_IDS_FOR_UPDATE,
+                      {"owner_id": ACTOR, "task_ids": reverse},
+                  ).fetchall()
+              ]
+              conn.commit()
+          require(
+              forward_locked == reverse_locked,
+              "lock order follows the request, so opposite orders can deadlock",
+          )
+          require(
+              forward_locked == sorted(forward_locked),
+              "lock order is not canonical",
+          )
+          require(
+              set(forward_locked) == set(forward),
+              "the lock statement did not return both rows",
+          )
+
+          # And the same two calls really do run concurrently without error.
+          race_errors = []
+          gate = threading.Barrier(2, timeout=15)
+
+          def race(ordered_ids):
+              try:
+                  with pool.connection() as conn:
+                      gate.wait()
+                      domain.bulk_update_tasks(
+                          ACTOR,
+                          BulkUpdateTasksArgs(task_ids=ordered_ids, notes="race"),
+                          conn=conn,
+                      )
+                      conn.commit()
+              except Exception as exc:
+                  race_errors.append(f"{type(exc).__name__}: {exc}".split("\n")[0])
+
+          threads = [
+              threading.Thread(target=race, args=(forward,)),
+              threading.Thread(target=race, args=(reverse,)),
+          ]
+          for thread in threads:
+              thread.start()
+          for thread in threads:
+              thread.join(60)
+          require(
+              not race_errors,
+              f"concurrent bulk updates in opposite id order failed: {race_errors}",
+          )
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_STATE)
+              conn.commit()
+
+          print(
+              "PASS T06: rollback and commit boundaries on every mutating path, "
+              "complete snapshots, guarded update, bulk update, delete, "
+              "audited delete cascade, canonical lock order, and event reads"
+          )
+          PY
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v

@@ -22,6 +22,47 @@ SELECT id, owner_id
  WHERE id = ANY(%(task_ids)s::uuid[]);
 """
 
+# T06 needs the complete pre-mutation rows for task_events snapshots. Loading
+# them under FOR UPDATE on the caller's connection keeps the snapshot and the
+# following guarded mutation in one transaction.
+#
+# ORDER BY id, not the caller's array order. FOR UPDATE locks rows in the order
+# the sort produces, so ordering by the request would let one caller lock A then
+# B while a concurrent caller passing the same ids reversed locks B then A. That
+# is a lock cycle and PostgreSQL resolves it by aborting one side with
+# DeadlockDetected. A canonical order every caller shares cannot cycle. Nothing
+# downstream reads this row order: domain keys the result by id and replays the
+# request order itself.
+SELECT_TASKS_BY_IDS_FOR_UPDATE = """
+SELECT *
+  FROM tasks
+ WHERE owner_id = %(owner_id)s
+   AND id = ANY(%(task_ids)s::uuid[])
+ ORDER BY id
+ FOR UPDATE;
+"""
+
+# tasks.blocked_by is a self reference declared ON DELETE SET NULL, so deleting
+# a task silently rewrites every surviving row that pointed at it. That write
+# never passes through domain, so without this statement it produces no
+# task_events row, and an unaudited mutation is one undo cannot reverse and the
+# audit log cannot explain. This loads and locks those rows before the delete so
+# their pre-cascade state can be snapshotted.
+#
+# Rows already inside the delete set are excluded: they get their own deleted
+# event carrying the same information. The owner filter is deliberate and its
+# residue is recorded as a limitation, because blocked_by is not owner scoped
+# and narrowing it would require a schema change section 4 forbids.
+SELECT_TASKS_BLOCKED_BY_IDS = """
+SELECT *
+  FROM tasks
+ WHERE owner_id = %(owner_id)s
+   AND blocked_by = ANY(%(task_ids)s::uuid[])
+   AND NOT (id = ANY(%(task_ids)s::uuid[]))
+ ORDER BY id
+ FOR UPDATE;
+"""
+
 INSERT_TASK = """
 INSERT INTO tasks (owner_id, title, notes, due_date, priority, blocked_by)
 VALUES (

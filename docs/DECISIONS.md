@@ -699,3 +699,77 @@ the poll leaves `attempt` at 1 and the row `failed`, so the assertion
 distinguishes the two readings rather than merely observing that something
 executed. No fourteenth named test is added; section 11 fixes the count at
 thirteen, and T04 set the precedent of covering an unreachable case in the gate.
+
+---
+
+## Domain decisions recorded at T06
+
+Recorded on 2026-08-12 after the required Opus execution review. This closes
+two gaps where BUILD_SPEC section 5 does not provide the reads T06 needs to
+produce complete audit snapshots and account for database-driven mutations.
+
+### D-23: domain snapshot and delete-cascade reads live in the SQL catalog
+
+Section 12 makes `backend/app/domain.py` the only writer of `tasks` and
+`task_events`, and defines T06 as a round trip through create, update, and event
+reads. Section 8 makes the snapshot requirement stronger than a partial diff:
+T07 reads `event.after["version"]` during its precheck and
+`event.before["id"]` when restoring a deletion. A complete pre-mutation task row
+is therefore part of T06's output contract.
+
+Section 5 provides `UPDATE_TASK_GUARDED`, which returns only the post-update
+row. It provides no statement that loads complete target rows by id before a
+mutation. `SELECT_TASKS_FOR_OWNER` cannot serve because it accepts filters,
+orders for display, and carries a limit of at most 50. `SELECT_TASK_OWNERS`
+cannot serve because it returns only `id` and `owner_id`. Inline SQL in
+`domain.py` is forbidden by CLAUDE.md and section 5.
+
+**Two constants are added to `backend/app/sql.py`:**
+
+```sql
+SELECT_TASKS_BY_IDS_FOR_UPDATE  complete owned target rows, ordered by id, locked
+SELECT_TASKS_BLOCKED_BY_IDS     complete owned rows whose blocked_by is a target, locked
+```
+
+Both run on the caller's connection and use `FOR UPDATE`, so the authoritative
+before snapshot and the following mutation share one transaction. The first
+orders by `id`, not request order. PostgreSQL takes row locks in the produced
+order, and request order lets two callers with reversed id arrays lock A then B
+and B then A. The required Opus execution review reproduced that deadlock. A
+canonical id order removed it over 200 concurrent rounds. Domain code keys the
+rows by id and replays the caller's distinct id order, so no consumer observes
+the lock ordering.
+
+The second statement closes a mutation hidden in the schema. `blocked_by` uses
+`ON DELETE SET NULL`, so deleting a blocker rewrites surviving tasks without
+calling `UPDATE_TASK_GUARDED`. T06 snapshots and locks the owned referencing
+rows before deletion, reads their database-produced state after deletion, and
+emits ordinary `updated` events for the cleared pointers. Those events are
+written before the `deleted` events. Section 8 undoes in descending event id
+order, so this makes the deleted blocker restore first and the pointer restore
+second. Reversing the event order attempts to restore a foreign key reference
+before its target exists.
+
+Passing snapshots into the domain layer was rejected because it moves
+authoritative reads outside the only-writer boundary and admits stale or
+partial audit records. Reconstructing the cascade's after row in Python was
+rejected because the database is the authority for the foreign-key action.
+Adding triggers, columns, or a new event operation was rejected because section
+4 closes the schema and section 8 already defines `updated` for this shape.
+
+**Limits.** The cascade query filters by `owner_id`. The schema permits a
+foreign actor's task to reference the deleted task, and PostgreSQL will clear
+that pointer without an event. Auditing it would introduce a cross-actor domain
+write and undo path, while preventing it requires a schema-level ownership
+constraint section 4 does not provide. T06 records the limitation rather than
+inventing either. `delete_tasks` also locks direct targets and referencing rows
+in two statements, so a narrower interleaving between concurrent deletes
+remains possible even though bulk target locks now have a canonical order.
+
+**Review provenance.** Section 12 routes T06 as Sol writes and Opus reviews.
+Opus verified the required transaction boundary, then the user directed Opus to
+apply the three execution-review fixes to the uncommitted worktree before
+handing it back. That edit to Sol-owned files is a T06-only routing exception.
+Sol read the applied code against this decision and the build contracts,
+reproduced the extended PostgreSQL gate, and accepted ownership of the result.
+The exception does not change the routing of any later task.
