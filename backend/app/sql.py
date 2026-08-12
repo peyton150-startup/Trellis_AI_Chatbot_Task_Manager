@@ -117,6 +117,40 @@ UPDATE tool_invocations
 RETURNING *;
 """
 
+# The two guarded reacquires from BUILD_SPEC section 7, added at T05 under D-19.
+# Section 5 lists no statement carrying either guard and none can be adapted to,
+# because COMPLETE_LEASE and FAIL_LEASE are unconditional writes.
+#
+# The guard is inside the UPDATE in both, and that placement is the whole point.
+# A SELECT that observes the state followed by an unguarded UPDATE is not
+# equivalent: two retries can both observe the same row and both proceed, which
+# is the duplicate execution the lease exists to prevent. Both statements return
+# the row they touched, so ownership is decided by whether a row came back.
+# Only the caller whose guarded UPDATE succeeds may execute.
+
+REACQUIRE_FAILED_LEASE = """
+UPDATE tool_invocations
+   SET status = 'pending',
+       attempt = attempt + 1,
+       error = NULL,
+       lease_expires_at = now() + make_interval(secs => %(lease_ttl_seconds)s)
+ WHERE run_id = %(run_id)s
+   AND tool_call_id = %(tool_call_id)s
+   AND status = 'failed'
+RETURNING *;
+"""
+
+STEAL_EXPIRED_LEASE = """
+UPDATE tool_invocations
+   SET status = 'pending',
+       attempt = attempt + 1,
+       lease_expires_at = now() + make_interval(secs => %(lease_ttl_seconds)s)
+ WHERE run_id = %(run_id)s
+   AND tool_call_id = %(tool_call_id)s
+   AND lease_expires_at < now()
+RETURNING *;
+"""
+
 INSERT_APPROVAL = """
 INSERT INTO approvals (
   run_id,

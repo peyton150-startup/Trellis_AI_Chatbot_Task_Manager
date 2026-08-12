@@ -1,19 +1,23 @@
 """The thirteen deterministic invariant tests from BUILD_SPEC section 11.
 
-T04 owns six of them. The remaining seven belong to T05, T07, and T08 and are
-deliberately absent rather than skipped, so the count of collected tests always
-matches the count of proven invariants.
+T04 owns six of them and T05 adds three more. The remaining four belong to T07
+and T08 and are deliberately absent rather than skipped, so the count of
+collected tests always matches the count of proven invariants.
 
 None of these constructs an Agent, calls a model, or makes a network call. They
-call the policy layer directly against real PostgreSQL, because policy.check
-reads task ownership from the database and a faked lookup would prove only the
-fake. Section 6 requires a missing row and another actor's row to produce the
-identical error, which is a claim about what the scope query actually returns.
+call the policy layer and the idempotency kernel directly against real
+PostgreSQL. For policy that is because check reads task ownership from the
+database and a faked lookup would prove only the fake. For idempotency it is
+because leases are database rows and every guard section 7 specifies lives
+inside an UPDATE statement, so a faked lease would prove nothing about the one
+property under test: that only the caller whose guarded UPDATE touches a row may
+execute.
 
 Fixture values are round and hand-checkable per section 11: no randomness, no
-faker, and no dependence on the current time except the expired approval, which
-is anchored by a negative TTL against the database clock rather than by
-injecting a clock into the kernel. See D-15.
+faker, and no dependence on the current time except the two expiry cases, both
+of which are anchored by a negative TTL against the database clock rather than
+by injecting a clock into the kernel. See D-15, which fixes that technique for
+the approval row and states that it covers lease_expires_at unchanged.
 """
 
 import sys
@@ -26,11 +30,11 @@ from psycopg.types.json import Json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import policy, sql
+from app import idempotency, policy, sql
 from app.config import settings
 from app.db import pool
 from app.errors import PolicyError
-from app.models import Approval, ToolName
+from app.models import Approval, LeaseAction, LeaseStatus, ToolInvocation, ToolName
 
 
 ACTOR_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -40,10 +44,15 @@ MISSING_TASK_ID = UUID("00000000-0000-0000-0000-0000000000ff")
 TOOL_CALL_ID = "call-t04-0001"
 OTHER_TOOL_CALL_ID = "call-t04-0002"
 
+LEASE_CALL_ID = "call-t05-0001"
+OTHER_LEASE_CALL_ID = "call-t05-0002"
+
 TODAY = date(2026, 8, 17)
 
 # INSERT_APPROVAL computes expires_at as now() + make_interval(secs => ttl), so a
 # negative TTL produces a row that is already expired against the database clock.
+# INSERT_LEASE computes lease_expires_at the same way, so the identical technique
+# produces the dead holder the theft test needs. See D-15.
 VALID_TTL_SECONDS = 300
 EXPIRED_TTL_SECONDS = -3600
 
@@ -164,6 +173,95 @@ def _load_approval(conn, run_id, tool_call_id):
 
 def _delete_arguments(task_ids):
     return {"task_ids": [str(task_id) for task_id in task_ids]}
+
+
+def _insert_lease(conn, run_id, tool_call_id, args_hash, ttl_seconds=VALID_TTL_SECONDS):
+    """Write a lease row directly, bypassing acquire.
+
+    Only the theft test uses this, to stand up a dead holder: a pending lease
+    whose expiry is already in the past. A negative TTL produces that against
+    the database clock, the same way the expired approval row does. Nothing here
+    injects a clock into the kernel, and the theft guard is evaluated server
+    side inside the UPDATE regardless.
+    """
+    conn.execute(
+        sql.INSERT_LEASE,
+        {
+            "run_id": run_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": ToolName.CREATE_TASK.value,
+            "arguments_hash": args_hash,
+            "lease_ttl_seconds": ttl_seconds,
+        },
+    )
+    conn.commit()
+    return _load_lease(conn, run_id, tool_call_id)
+
+
+def _load_lease(conn, run_id, tool_call_id):
+    row = conn.execute(
+        sql.SELECT_LEASE, {"run_id": run_id, "tool_call_id": tool_call_id}
+    ).fetchone()
+    return None if row is None else ToolInvocation.model_validate(row)
+
+
+def _commit_work(conn, run_id, tool_call_id, title):
+    """The section 10 step 4 transaction, in full.
+
+    The domain mutation, its task_events row, and complete() are one
+    transaction. Under D-18 complete() takes the caller's connection as a
+    required keyword argument precisely so this holds: were it to open its own
+    pooled connection it would commit separately, which is the window section 7
+    says must not exist.
+    """
+    task_row = conn.execute(
+        sql.INSERT_TASK,
+        {
+            "owner_id": ACTOR_ID,
+            "title": title,
+            "notes": "",
+            "due_date": TODAY,
+            "priority": "medium",
+            "blocked_by": None,
+        },
+    ).fetchone()
+    conn.execute(
+        sql.INSERT_TASK_EVENT,
+        {
+            "task_id": task_row["id"],
+            "run_id": run_id,
+            "actor_id": ACTOR_ID,
+            "operation": "created",
+            "before": None,
+            "after": Json({"id": str(task_row["id"]), "title": title, "version": 1}),
+        },
+    )
+    result = {"task_id": str(task_row["id"])}
+    idempotency.complete(run_id, tool_call_id, result, conn=conn)
+    conn.commit()
+    return task_row["id"], result
+
+
+def _count_tasks(conn):
+    rows = conn.execute(
+        sql.SELECT_TASKS_FOR_OWNER,
+        {
+            "owner_id": ACTOR_ID,
+            "status": None,
+            "due_before": None,
+            "due_after": None,
+            "priority": None,
+            "limit": 50,
+        },
+    ).fetchall()
+    return len(rows)
+
+
+def _count_events(conn, run_id):
+    rows = conn.execute(
+        sql.SELECT_EVENTS_FOR_RUN, {"run_id": run_id, "limit": 50}
+    ).fetchall()
+    return len(rows)
 
 
 def test_cross_actor_mutation_rejected(db):
@@ -463,3 +561,194 @@ def test_bulk_over_threshold_requires_approval(db):
         )
     assert over.value.code == "APPROVAL_REQUIRED"
     assert over.value.http_status == 202
+
+
+def test_duplicate_tool_call_commits_once(db):
+    """The lost-response retry, which D-04 calls the signature reliability moment.
+
+    Two scenarios. The first is the retry itself: the same key replays the
+    stored result and touches nothing. The second is the transaction boundary
+    section 7 calls non-negotiable, because a replay that returns the right
+    answer is worthless if the mutation and the lease could ever disagree.
+    """
+    run_id = _insert_run(db)
+    arguments = {"title": "Task L"}
+    args_hash = policy.arguments_hash(arguments)
+
+    first = idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, args_hash)
+    assert first.action is LeaseAction.EXECUTE
+    # Section 7: never return a null result for a pending row. EXECUTE carries
+    # no result by construction, and the caller must not read one from it.
+    assert first.result is None
+
+    task_id, result = _commit_work(db, run_id, LEASE_CALL_ID, "Task L")
+
+    second = idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, args_hash)
+    assert second.action is LeaseAction.REPLAY
+    assert second.result == result
+    assert second.result == {"task_id": str(task_id)}
+
+    # The replay committed nothing. This is the actual invariant: one tool call
+    # id, one mutation, regardless of how many times the caller retries.
+    assert _count_tasks(db) == 1
+    assert _count_events(db, run_id) == 1
+
+    replayed_lease = _load_lease(db, run_id, LEASE_CALL_ID)
+    assert replayed_lease.status is LeaseStatus.COMPLETED
+    # A replay is not an attempt. Section 7 increments attempt only on a
+    # reacquire or a steal, neither of which happened here.
+    assert replayed_lease.attempt == 1
+
+    # Scenario 2, the transaction boundary. The same three statements as
+    # _commit_work, rolled back instead of committed, standing in for a process
+    # that died before commit. Section 7: if it dies before commit, nothing
+    # happened.
+    rollback = idempotency.acquire(
+        run_id, OTHER_LEASE_CALL_ID, ToolName.CREATE_TASK, args_hash
+    )
+    assert rollback.action is LeaseAction.EXECUTE
+
+    db.execute(
+        sql.INSERT_TASK,
+        {
+            "owner_id": ACTOR_ID,
+            "title": "Task M",
+            "notes": "",
+            "due_date": TODAY,
+            "priority": "medium",
+            "blocked_by": None,
+        },
+    )
+    idempotency.complete(
+        run_id, OTHER_LEASE_CALL_ID, {"task_id": "rolled-back"}, conn=db
+    )
+    db.rollback()
+
+    # The mutation did not land, and neither did the lease completion. There is
+    # no window where one committed without the other.
+    assert _count_tasks(db) == 1
+    abandoned = _load_lease(db, run_id, OTHER_LEASE_CALL_ID)
+    assert abandoned.status is LeaseStatus.PENDING
+    assert abandoned.result is None
+
+    # The lease row itself survived the rollback, because acquire commits
+    # independently. It has to: a lease no concurrent retry can observe is not a
+    # lease, and INSERT_LEASE's ON CONFLICT DO NOTHING is what makes it one.
+    assert abandoned.tool_call_id == OTHER_LEASE_CALL_ID
+
+
+def test_reused_key_different_args_conflicts(db):
+    """Same key, different arguments. Section 7 step 4, ahead of the status switch.
+
+    The ordering is the point. A hash mismatch is never a replay, so the check
+    cannot sit after the switch on status, where a completed row would return
+    the stored result for arguments nobody ever approved or executed.
+    """
+    run_id = _insert_run(db)
+    original = {"title": "Task N"}
+    tampered = {"title": "Task O"}
+    original_hash = policy.arguments_hash(original)
+    tampered_hash = policy.arguments_hash(tampered)
+    assert original_hash != tampered_hash
+
+    first = idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, original_hash)
+    assert first.action is LeaseAction.EXECUTE
+
+    # Against a pending row. If the hash check sat after the status switch this
+    # would poll for two seconds and raise LEASE_IN_FLIGHT instead, so this
+    # assertion pins the order and not merely the code.
+    with pytest.raises(PolicyError) as pending_conflict:
+        idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, tampered_hash)
+    assert pending_conflict.value.code == "IDEMPOTENCY_CONFLICT"
+    assert pending_conflict.value.http_status == 409
+
+    task_id, result = _commit_work(db, run_id, LEASE_CALL_ID, "Task N")
+
+    # Against a completed row, which is where treating a mismatch as a replay
+    # would actually do damage: it would hand back another call's result.
+    with pytest.raises(PolicyError) as completed_conflict:
+        idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, tampered_hash)
+    assert completed_conflict.value.code == "IDEMPOTENCY_CONFLICT"
+    assert completed_conflict.value.http_status == 409
+
+    # Positive control. The conflict is about the arguments changing, not about
+    # the key having been used before. Without this, an acquire that raised
+    # IDEMPOTENCY_CONFLICT on every conflicting insert would pass everything
+    # above while destroying the replay path the previous test proves.
+    replay = idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, original_hash)
+    assert replay.action is LeaseAction.REPLAY
+    assert replay.result == result
+
+    # Nothing above committed a second mutation.
+    assert _count_tasks(db) == 1
+    assert _count_events(db, run_id) == 1
+    assert str(task_id) == result["task_id"]
+
+
+def test_expired_pending_lease_is_stolen(db):
+    """A dead holder's expired lease is stolen and the work re-executes once.
+
+    Section 14 lists this as correct rather than a bug, and section 7 explains
+    why it is safe: the mutation, its events, and complete() share one
+    transaction, so a pending row means the transaction never committed and the
+    stolen work left no trace.
+    """
+    run_id = _insert_run(db)
+    arguments = {"title": "Task P"}
+    args_hash = policy.arguments_hash(arguments)
+
+    # The dead holder. It acquired a lease and died before committing anything,
+    # so there is a pending row, no task, and no event.
+    dead = _insert_lease(db, run_id, LEASE_CALL_ID, args_hash, ttl_seconds=EXPIRED_TTL_SECONDS)
+    assert dead.status is LeaseStatus.PENDING
+    assert dead.attempt == 1
+    # Prove the fixture really produced an expired lease. Without this the test
+    # could pass because the row was never written the way it claims.
+    assert dead.lease_expires_at < datetime.now(timezone.utc)
+    assert _count_tasks(db) == 0
+
+    stolen = idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, args_hash)
+    assert stolen.action is LeaseAction.EXECUTE
+
+    after_steal = _load_lease(db, run_id, LEASE_CALL_ID)
+    assert after_steal.status is LeaseStatus.PENDING
+    # The steal took the lease rather than merely reading it: attempt moved, and
+    # the new expiry is live, so the thief now holds it against anyone else.
+    assert after_steal.attempt == 2
+    assert after_steal.lease_expires_at > datetime.now(timezone.utc)
+
+    task_id, result = _commit_work(db, run_id, LEASE_CALL_ID, "Task P")
+
+    # Exactly once. The dead holder committed nothing and the thief committed
+    # one mutation, so re-execution restored the work rather than duplicating it.
+    assert _count_tasks(db) == 1
+    assert _count_events(db, run_id) == 1
+
+    replay = idempotency.acquire(run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, args_hash)
+    assert replay.action is LeaseAction.REPLAY
+    assert replay.result == result
+    assert _count_tasks(db) == 1
+
+    # Negative control, and the reason the guard has to be inside the UPDATE. A
+    # live pending lease belongs to a holder that is still working, and stealing
+    # it would re-run work that may be about to commit. An acquire that stole
+    # unconditionally, or that read the expiry and then updated without the
+    # guard, would pass every assertion above and fail here.
+    live_run_id = _insert_run(db)
+    live = idempotency.acquire(live_run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, args_hash)
+    assert live.action is LeaseAction.EXECUTE
+
+    held = _load_lease(db, live_run_id, LEASE_CALL_ID)
+    assert held.lease_expires_at > datetime.now(timezone.utc)
+
+    # Polls every 250ms, eight times, then gives up. It never returns a null
+    # result for a pending row.
+    with pytest.raises(PolicyError) as in_flight:
+        idempotency.acquire(live_run_id, LEASE_CALL_ID, ToolName.CREATE_TASK, args_hash)
+    assert in_flight.value.code == "LEASE_IN_FLIGHT"
+    assert in_flight.value.http_status == 409
+
+    still_held = _load_lease(db, live_run_id, LEASE_CALL_ID)
+    assert still_held.attempt == 1
+    assert still_held.status is LeaseStatus.PENDING
+    assert _count_tasks(db) == 1
