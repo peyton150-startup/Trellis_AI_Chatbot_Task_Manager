@@ -364,3 +364,253 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  t05-kernel-idempotency:
+    name: T05 kernel idempotency
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # Section 7's two guards are concurrency controls, and the three named
+      # tests are sequential, so no test can construct the race they defend
+      # against. What is checkable without concurrency is that the predicate
+      # lives inside the UPDATE rather than in a preceding SELECT, which is the
+      # difference section 7 calls the bug. Each statement is run directly
+      # against a row it must refuse and a row it must take.
+      #
+      # This step also carries the failed-lease reacquire path. Section 11 names
+      # three tests for T05 and none of them constructs a failed lease, so
+      # without this the branch would ship unexercised, the way T04's
+      # unexercised error codes were covered by its own gate.
+      - name: Verify the section 7 guards are inside the UPDATE statements
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+
+          sys.path.insert(0, ".")
+          from app import sql
+          from app.db import pool
+
+          RUN = "00000000-0000-0000-0000-0000000000aa"
+          ACTOR = "00000000-0000-0000-0000-000000000001"
+          TTL = 120
+
+          problems = []
+
+          def lease(conn, call_id, ttl_seconds):
+              conn.execute(
+                  sql.INSERT_LEASE,
+                  {
+                      "run_id": RUN,
+                      "tool_call_id": call_id,
+                      "tool_name": "create_task",
+                      "arguments_hash": "a" * 64,
+                      "lease_ttl_seconds": ttl_seconds,
+                  },
+              )
+              conn.commit()
+
+          def read(conn, call_id):
+              row = conn.execute(
+                  sql.SELECT_LEASE, {"run_id": RUN, "tool_call_id": call_id}
+              ).fetchone()
+              conn.commit()
+              return row
+
+          def guarded(conn, statement, call_id):
+              row = conn.execute(
+                  statement,
+                  {
+                      "run_id": RUN,
+                      "tool_call_id": call_id,
+                      "lease_ttl_seconds": TTL,
+                  },
+              ).fetchone()
+              conn.commit()
+              return row
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_STATE)
+              conn.commit()
+              # INSERT_RUN generates the id, so take the one it returns rather
+              # than writing a lookup query. No SQL string exists outside sql.py.
+              run_row = conn.execute(
+                  sql.INSERT_RUN,
+                  {"actor_id": ACTOR, "prompt": "T05 gate", "model": "t05-gate"},
+              ).fetchone()
+              conn.commit()
+              RUN = str(run_row["id"])
+
+              # STEAL_EXPIRED_LEASE must refuse a live lease.
+              lease(conn, "live", TTL)
+              if guarded(conn, sql.STEAL_EXPIRED_LEASE, "live") is not None:
+                  problems.append("STEAL_EXPIRED_LEASE took a lease that has not expired")
+              if read(conn, "live")["attempt"] != 1:
+                  problems.append("STEAL_EXPIRED_LEASE moved attempt on a live lease")
+
+              # And must take an expired one, incrementing attempt.
+              lease(conn, "dead", -3600)
+              stolen = guarded(conn, sql.STEAL_EXPIRED_LEASE, "dead")
+              if stolen is None:
+                  problems.append("STEAL_EXPIRED_LEASE refused an expired lease")
+              elif stolen["attempt"] != 2:
+                  problems.append(f"steal left attempt at {stolen['attempt']}, expected 2")
+
+              # REACQUIRE_FAILED_LEASE must refuse anything not failed.
+              lease(conn, "pending", TTL)
+              if guarded(conn, sql.REACQUIRE_FAILED_LEASE, "pending") is not None:
+                  problems.append("REACQUIRE_FAILED_LEASE reacquired a pending lease")
+
+              lease(conn, "done", TTL)
+              conn.execute(
+                  sql.COMPLETE_LEASE,
+                  {"run_id": RUN, "tool_call_id": "done", "result": None},
+              )
+              conn.commit()
+              if guarded(conn, sql.REACQUIRE_FAILED_LEASE, "done") is not None:
+                  problems.append("REACQUIRE_FAILED_LEASE reacquired a completed lease")
+
+              # And must take a failed one, clearing the error and reopening it.
+              lease(conn, "broken", TTL)
+              conn.execute(
+                  sql.FAIL_LEASE,
+                  {"run_id": RUN, "tool_call_id": "broken", "error": "boom"},
+              )
+              conn.commit()
+              reacquired = guarded(conn, sql.REACQUIRE_FAILED_LEASE, "broken")
+              if reacquired is None:
+                  problems.append("REACQUIRE_FAILED_LEASE refused a failed lease")
+              else:
+                  if reacquired["status"] != "pending":
+                      problems.append(f"reacquire left status {reacquired['status']}")
+                  if reacquired["attempt"] != 2:
+                      problems.append(f"reacquire left attempt at {reacquired['attempt']}")
+                  if reacquired["error"] is not None:
+                      problems.append("reacquire did not clear the error")
+              # A second reacquire must now refuse, because the row is pending.
+              if guarded(conn, sql.REACQUIRE_FAILED_LEASE, "broken") is not None:
+                  problems.append("REACQUIRE_FAILED_LEASE reacquired the same failed lease twice")
+
+              conn.execute(sql.TRUNCATE_ALL_STATE)
+              conn.commit()
+
+          if problems:
+              raise SystemExit(
+                  "section 7 guards are not inside their UPDATE statements:\n"
+                  + "\n".join(problems)
+              )
+          print("PASS both section 7 guards refuse the row they must and take the row they must")
+          PY
+
+      # D-22. Section 7's poll block prints "becomes failed -> EXECUTE", which
+      # read literally is a read followed by an unguarded grant, and the same
+      # section's prose forbids exactly that. The prose governs: the poll hands
+      # control back to the guarded reacquire. Section 11's three T05 tests are
+      # sequential and cannot reach this branch, so without this check a future
+      # simplification toward the literal text would ship silently, and a blind
+      # execution review demonstrated that such a build lets two concurrent
+      # callers both execute one tool call.
+      #
+      # attempt is what distinguishes the two readings. Going through
+      # REACQUIRE_FAILED_LEASE moves it to 2 and returns the row to pending. A
+      # direct return from the poll leaves it at 1 and the row failed.
+      - name: Verify a polled failed lease is reacquired through the guard
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          import threading
+          import time
+
+          sys.path.insert(0, ".")
+          from app import idempotency, sql
+          from app.db import pool
+          from app.models import LeaseAction, LeaseStatus
+
+          ACTOR = "00000000-0000-0000-0000-000000000001"
+          CALL = "polled-then-failed"
+          ARGS_HASH = "b" * 64
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_STATE)
+              conn.commit()
+              run_id = conn.execute(
+                  sql.INSERT_RUN,
+                  {"actor_id": ACTOR, "prompt": "D-22 gate", "model": "t05-gate"},
+              ).fetchone()["id"]
+              conn.commit()
+
+          # The holder takes a live lease and then dies without committing.
+          held = idempotency.acquire(run_id, CALL, "create_task", ARGS_HASH)
+          if held.action is not LeaseAction.EXECUTE:
+              raise SystemExit(f"setup failed: first acquire returned {held.action}")
+
+          # It reports the failure while the retry below is already polling.
+          def die():
+              time.sleep(0.6)
+              idempotency.fail(run_id, CALL, "holder died")
+
+          killer = threading.Thread(target=die)
+          killer.start()
+          outcome = idempotency.acquire(run_id, CALL, "create_task", ARGS_HASH)
+          killer.join()
+
+          with pool.connection() as conn:
+              row = conn.execute(
+                  sql.SELECT_LEASE, {"run_id": run_id, "tool_call_id": CALL}
+              ).fetchone()
+              conn.commit()
+
+          problems = []
+          if outcome.action is not LeaseAction.EXECUTE:
+              problems.append(f"the retry got {outcome.action}, expected EXECUTE")
+          if row["attempt"] != 2:
+              problems.append(
+                  f"attempt is {row['attempt']}, expected 2. The poll returned EXECUTE "
+                  "directly instead of reacquiring through REACQUIRE_FAILED_LEASE."
+              )
+          if row["status"] != LeaseStatus.PENDING.value:
+              problems.append(f"status is {row['status']}, expected pending")
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_STATE)
+              conn.commit()
+
+          if problems:
+              raise SystemExit("D-22 is violated:\n" + "\n".join(problems))
+          print("PASS a lease that fails mid-poll is reacquired through the guard, attempt 2, pending")
+          PY
+
+      - name: Verify T05 invariant tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest tests/test_invariants.py -v
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v

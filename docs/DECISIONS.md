@@ -467,3 +467,235 @@ specifies `count = len(target_task_ids)`, so four references to one id count as
 four and require approval while touching one row. This is transcription, and it
 fails closed. It is not listed in section 14 and will look like a bug later, so
 it is recorded here.
+
+---
+
+## Contract corrections recorded at T05
+
+Recorded on 2026-08-12, before any T05 kernel code was written. Each closes a
+gap where BUILD_SPEC section 7 requires an operation it provides no means to
+perform. No existing decision above is amended, and `docs/BUILD_SPEC.md` is not
+edited, following the precedent D-12 set and D-15 through D-17 continued.
+
+### D-18: `idempotency.complete` takes the caller's connection as a required keyword argument
+
+Section 7 states the ordering requirement as non-negotiable:
+
+```
+the domain mutation and its task_events rows and the complete() call all
+happen inside one database transaction
+```
+
+Section 10 step 4 shows the same thing:
+
+```
+4. with transaction:
+       result = domain.<operation>(...)
+       domain.write_events(...)
+       idempotency.complete(run_id, tool_call_id, result)
+```
+
+The signature printed in section 7 passes no connection:
+
+```
+complete(run_id, tool_call_id, result) -> None
+```
+
+`backend/app/db.py` opens a `ConnectionPool` and every `pool.connection()` call
+yields a distinct connection with its own transaction. As printed, `complete`
+would therefore commit in a transaction of its own, which is exactly the window
+section 7 says must not exist: the mutation could commit while the lease did
+not, or the reverse.
+
+The signature is:
+
+```python
+complete(run_id, tool_call_id, result, *, conn) -> None
+```
+
+All three printed positional parameters keep their names and order. `conn` is
+required and keyword-only, so no caller can silently commit the lease
+separately. `complete` does not commit; the caller owns the transaction, and
+committing inside would end it early and reintroduce the same window. An
+optional `conn` was rejected because a caller who forgot it would get precisely
+the broken behavior, which fails open rather than closed. A module-level
+transaction context manager inside `idempotency.py` was rejected because section
+7 never asks this file to own transaction management, and it would hide the
+connection in module state.
+
+**`acquire` and `fail` keep their printed signatures and open their own
+connections.** This is not an inconsistency, it is the semantics. `acquire` must
+commit its `INSERT_LEASE` immediately or no concurrent retry can ever conflict
+with it, and a lease no one else can observe is not a lease. `fail` runs after
+the domain transaction has already rolled back, so there is no transaction left
+for it to join.
+
+### D-19: the two guarded lease statements, and T05's file list
+
+Section 7 requires two reacquires, and is explicit that the predicate belongs
+inside the UPDATE:
+
+```
+Never take a lease without the guard in the UPDATE statement itself:
+lease_expires_at < now() when stealing an expired lease, status = 'failed'
+when reacquiring a failed one. A read-then-write without the guard is the bug,
+not a style preference. Only the retry whose UPDATE touches a row may execute.
+```
+
+Section 5's statement list contains `INSERT_LEASE`, `SELECT_LEASE`,
+`COMPLETE_LEASE`, and `FAIL_LEASE`. None carries either guard and none can be
+adapted, because `COMPLETE_LEASE` and `FAIL_LEASE` are unconditional writes.
+CLAUDE.md and section 5 both forbid a SQL string anywhere except
+`backend/app/sql.py`.
+
+**Two constants are added to `backend/app/sql.py`:**
+
+```sql
+REACQUIRE_FAILED_LEASE   guarded on status = 'failed'
+STEAL_EXPIRED_LEASE      guarded on lease_expires_at < now()
+```
+
+Both use `RETURNING *`, so ownership is decided by whether a row came back.
+Exactly one racing caller can receive one, and only that caller may execute.
+
+**T05's file list is expanded** under the user's explicit authorization of
+2026-08-12 to `backend/app/idempotency.py`, `backend/app/sql.py`, the applicable
+portion of `backend/tests/test_invariants.py`, `.github/workflows/ci.yml`,
+`IMPLEMENTATION_NOTES.md`, and this file. The last two are the required
+companion files CLAUDE.md already names for every task.
+
+**What the guards can and cannot be shown to do.** They are concurrency
+controls. The three tests section 11 names for T05 are sequential, so none of
+them can construct the race the guards defend against: a caller whose SELECT
+observed one state while a competitor changed the row before its UPDATE ran.
+What is provable without concurrency is that the predicate sits inside the
+UPDATE rather than in a preceding SELECT, and the T05 CI gate proves it by
+running each statement directly against a row it must refuse and a row it must
+take. Do not describe the three tests as proving the guards.
+
+### D-20: T05 test-authorship routing exception
+
+D-16 scoped its exception to T04 alone and said so explicitly. T05 therefore
+needed its own. On 2026-08-12 the user granted a fresh exception, scoped to T05
+alone, under which Claude Opus 5 writes the three T05 invariant tests as well as
+the kernel.
+
+The reasoning differs from D-16's. At T04 the exception was forced, because Sol
+was unreachable. At T05 it is chosen: section 12 tags `idempotency.py` OPUS
+ONLY, so the kernel was never Sol's to write, and the compensating evidence
+available at T05 is stronger than the authorship split it replaces. The
+execution pass reproduces the mutation table independently, which is the one
+control no static reviewer at T04 could provide.
+
+The cost is unchanged and is restated rather than diminished: one model writes
+both the kernel and the tests that judge it, a self-consistent pair can be green
+and prove nothing, and the final blind review sees that pair rather than two
+independent readings. D-16's compensating measures 1 through 4 apply unchanged.
+Measure 5 becomes the T05 gate's guard check. The exception is T05 only and is
+not precedent for T07 or T08.
+
+### D-21: the D-16 chain is revised from seven steps to five
+
+D-16 recorded the intended seven-step chain as deliberately not binding, and
+asked for it to be confirmed or revised once T04 supplied evidence on its cost
+against its yield. T04 has now supplied that evidence, and it does not support
+the chain as written.
+
+**What the evidence says.** T04 ran two blind static reviews. Both returned no
+findings, and neither surfaced anything the author had not already found. Each
+read on the order of 150k tokens. Over the same period, the defects that were
+actually found in T04's tests were found by designing mutations: the suite was
+one-sided with every assertion a rejection, so nothing exercised section 6 step
+6 and a `check` rejecting every non-null approval row would have passed
+unchallenged; the fixture and the kernel computed the stored hash with the same
+function, so a broken canonicalization agreed with itself; and neither branch of
+step 5d was reached by any test. Four real defects, none found by review. One
+reviewer also executed the author's mutation script despite a read-only
+instruction, which is why reviews now run against a throwaway clone rather than
+the working tree.
+
+**The revision.** Two of the seven steps are static specification-conformance
+reviews of tests that cannot yet run, and D-16 already notes that neither
+establishes runtime behavior. Section 11 mandates the Opus one. The Terra
+component review is therefore dropped, and Sol resolves nothing between them.
+The chain becomes:
+
+1. Sol authors its assigned invariant-test slice and validates the fixtures with
+   a throwaway script outside the repository.
+2. Opus performs the section 11 pre-implementation review of those tests.
+3. Opus implements and owns the production kernel and the final package.
+4. Mutation evidence is produced for every test in the slice, one single-line
+   mutation per defect, applied one at a time, run, recorded, and reverted, with
+   the kernel verified restored by digest and the suite green afterwards. This
+   is mandatory, not a compensating measure for an exception, because it is the
+   step that has actually found defects.
+5. A blind, read-only final review of the pull request, against a throwaway
+   clone, with an execution pass where the task's behavior is observable only at
+   runtime.
+
+**What this trades away, stated plainly.** Sol's work loses its one independent
+review as Sol's work, which D-16 identified as the only point where that
+happens. The judgment is that a static review which found nothing at T04 is
+worth less than the execution pass that replaces it, not that the review had no
+value. Reopening this requires evidence that a dropped review would have caught
+something, which is exactly the standard this document's preamble sets.
+
+### D-22: a polled lease that becomes failed is reacquired through the guard, not executed directly
+
+Recorded on 2026-08-12 after the blind execution review of commit `406e735`
+raised it. It corrects an omission in that commit rather than a defect in its
+behavior, and it closes an internal contradiction in section 7 that the commit
+resolved silently.
+
+**The contradiction.** Section 7's prose is unambiguous:
+
+> Never take a lease without the guard in the UPDATE statement itself:
+> `lease_expires_at < now()` when stealing an expired lease, `status = 'failed'`
+> when reacquiring a failed one. A read-then-write without the guard is the bug,
+> not a style preference. Only the retry whose UPDATE touches a row may execute.
+
+The pseudocode in the same section prints the opposite for one branch. Inside
+the poll loop:
+
+```
+otherwise poll: re-SELECT every 250ms, up to 8 times (2s total)
+    becomes "completed" -> REPLAY
+    becomes "failed"    -> EXECUTE
+    still "pending"     -> raise LEASE_IN_FLIGHT
+```
+
+Read literally, `becomes "failed" -> EXECUTE` is a read followed by an
+unguarded grant, which is precisely what the prose forbids. The two cannot both
+be transcribed.
+
+**The resolution.** The prose governs. `_poll` returns `None` when it observes
+`failed`, and `_resolve_conflict` routes that back through the switch, where the
+guarded `REACQUIRE_FAILED_LEASE` decides which caller wins. The poll block's
+`EXECUTE` is read as naming the branch to take, not as a direct return.
+
+**Why the literal reading is unsafe, measured rather than argued.** The review
+built the race in a disposable microVM: two callers polling one live lease while
+its holder calls `fail()` mid-poll. Against the shipped code, exactly one caller
+received EXECUTE and the other received `LEASE_IN_FLIGHT`. Against a build
+patched to return EXECUTE directly from the poll, both callers received EXECUTE.
+Two concurrent executions of one tool call is the exact failure the module
+exists to prevent, and D-04 names this retry as the signature reliability
+moment, so the branch is not an edge case.
+
+**What was done wrong, and is corrected here.** Commit `406e735` resolved the
+contradiction correctly but recorded it only in an inline code comment, in the
+same commit that documented four other corrections as D-18 through D-21. Rule 1
+of section 0 and section 1A both require a contradiction to be written down
+rather than resolved by picking a side. Recording it here is the correction. A
+matching `docs/OPEN_QUESTIONS.md` entry is not added, because that file is
+outside the file list authorized for T05.
+
+**Coverage.** The branch is reachable by none of section 11's three T05 tests,
+which are sequential, and it was reachable by no gate check as committed. The
+T05 gate now exercises it directly: a live lease is failed from a second thread
+while `acquire` polls, and the gate asserts the outcome is EXECUTE with
+`attempt` incremented to 2 and status back to `pending`. A direct return from
+the poll leaves `attempt` at 1 and the row `failed`, so the assertion
+distinguishes the two readings rather than merely observing that something
+executed. No fourteenth named test is added; section 11 fixes the count at
+thirteen, and T04 set the precedent of covering an unreachable case in the gate.
