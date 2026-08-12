@@ -274,3 +274,93 @@ jobs:
       - name: Verify T03 models
         working-directory: backend
         run: pytest tests/test_models.py
+
+  t04-kernel-policy:
+    name: T04 kernel policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      # The six T04 invariant tests only ever construct five of the twelve codes
+      # in BUILD_SPEC section 6. Without this, a transposed status on an
+      # unexercised code would first surface at T05, in a file T05 may not edit.
+      # Runs before the database starts, because it needs none and fails fast.
+      - name: Verify the complete section 6 error table
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+
+          sys.path.insert(0, "backend")
+          from app.errors import ERRORS_BY_CODE, PolicyError
+
+          EXPECTED = {
+              "OUT_OF_SCOPE": 403,
+              "APPROVAL_REQUIRED": 202,
+              "APPROVAL_NOT_FOUND": 403,
+              "APPROVAL_MISMATCH": 403,
+              "APPROVAL_EXPIRED": 403,
+              "APPROVAL_ALREADY_DECIDED": 409,
+              "IDEMPOTENCY_CONFLICT": 409,
+              "LEASE_IN_FLIGHT": 409,
+              "VERSION_CONFLICT": 409,
+              "TOOL_TIMEOUT": 504,
+              "MODEL_TIMEOUT": 504,
+              "VALIDATION_ERROR": 422,
+          }
+
+          problems = []
+
+          missing = sorted(set(EXPECTED) - set(ERRORS_BY_CODE))
+          extra = sorted(set(ERRORS_BY_CODE) - set(EXPECTED))
+          if missing:
+              problems.append(f"codes missing from errors.py: {missing}")
+          if extra:
+              problems.append(f"codes in errors.py that section 6 does not define: {extra}")
+
+          for code, expected_status in EXPECTED.items():
+              error = ERRORS_BY_CODE.get(code)
+              if error is None:
+                  continue
+              if not issubclass(error, PolicyError):
+                  problems.append(f"{code}: {error.__name__} does not subclass PolicyError")
+              if error.http_status != expected_status:
+                  problems.append(
+                      f"{code}: section 6 says HTTP {expected_status}, errors.py says {error.http_status}"
+                  )
+              raised = error()
+              if raised.code != code or raised.http_status != expected_status:
+                  problems.append(f"{code}: an instance reports {raised.code}/{raised.http_status}")
+              if raised.message != code:
+                  problems.append(f"{code}: default message is {raised.message!r}")
+
+          if problems:
+              raise SystemExit("error table does not match BUILD_SPEC section 6:\n" + "\n".join(problems))
+          print(f"PASS all {len(EXPECTED)} section 6 error codes match their HTTP status and raise as PolicyError")
+          PY
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      - name: Verify T04 invariant tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest tests/test_invariants.py -v
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
