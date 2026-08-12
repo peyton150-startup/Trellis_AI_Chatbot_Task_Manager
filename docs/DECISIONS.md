@@ -228,3 +228,242 @@ that every gate now runs against the real application environment.
 `spike/backend/requirements.txt` is the one exception and keeps its own pins.
 That tree is disposable and is deleted at T12A under D-13, so coupling it to the
 production pin source would only create something to unwind.
+
+---
+
+## Contract corrections recorded at T04
+
+Recorded on 2026-08-12, before any T04 kernel code was written. Each one closes
+a gap where BUILD_SPEC section 6 requires an operation it provides no means to
+perform. No existing decision above is amended, and `docs/BUILD_SPEC.md` is not
+edited, following the precedent D-12 set when it corrected the stated premise of
+section 6 without rewriting it.
+
+### D-15: `policy.check` takes `run_id` and `tool_call_id` as required keyword arguments
+
+Section 6 step 5a requires `check` to verify that the approval row matches the
+current call:
+
+```
+5. VERIFY APPROVAL, in this order:
+   a. approval_row.run_id and tool_call_id match the current call,
+      else APPROVAL_NOT_FOUND
+```
+
+The signature printed in section 6 and the call site printed in section 10 pass
+neither value:
+
+```
+check(actor_id, tool_name, arguments, target_task_ids, approval_row)
+```
+
+Step 5a is therefore unimplementable as printed. The tool body holds both
+values already: section 10 states that every tool takes `ctx` carrying
+`actor_id` and the application `run_id`, and `tool_call_id` is
+`ctx.tool_call_id`. The call site simply does not forward them.
+
+The signature is:
+
+```python
+check(
+    actor_id,
+    tool_name,
+    arguments,
+    target_task_ids,
+    approval_row,
+    *,
+    run_id,
+    tool_call_id,
+) -> PolicyDecision
+```
+
+All five positional parameters keep their specified names and order. `run_id`
+and `tool_call_id` are required keyword arguments, so no caller can silently
+skip step 5a. The call site printed in section 10 is incomplete and every caller
+must forward both.
+
+**What step 5a is and is not.** It is defense against a caller passing the wrong
+approval row. It is not the primary protection against a forged approval. In
+production the caller loads the row with `SELECT_APPROVAL`, which is keyed on
+`(run_id, tool_call_id)`, so a returned row matches by construction and 5a can
+essentially never fire. Forgery is closed by step 4, which raises
+`APPROVAL_REQUIRED` when no row exists, and by step 5b, which rejects a row
+whose `arguments_hash` does not cover the arguments actually being executed. Do
+not describe 5a as the forgery gate.
+
+**`APPROVAL_REQUIRED` and `APPROVAL_NOT_FOUND` are not interchangeable.**
+`approval_row is None` at step 4 raises `APPROVAL_REQUIRED`, HTTP 202.
+`APPROVAL_NOT_FOUND`, HTTP 403, belongs to step 5a alone, where a non-null row's
+`run_id` or `tool_call_id` does not match the current call.
+
+**`approval_row` is `models.Approval | None`**, built with
+`Approval.model_validate(row)` from a `SELECT_APPROVAL` result. Note that
+`Approval.preview` is `ApprovalPreview` with `extra="forbid"`, so a stored
+preview must carry exactly `creates`, `updates`, and `deletes`.
+
+**No clock parameter.** `check` reads the production clock for step 5c. Expiry
+is exercised by writing an `approvals` row that is already expired, which
+`INSERT_APPROVAL` produces from a substantially negative
+`approval_ttl_seconds`, and the test confirms the loaded row is expired before
+invoking `check` so a silently failed fixture cannot produce a false pass.
+Adding an injectable `now` to a correctness-kernel file to simulate something
+the database clock already does is rejected. The same technique covers T05,
+whose theft guard evaluates `lease_expires_at < now()` server side inside the
+UPDATE.
+
+### D-16: T04 test-authorship routing exception, and the intended chain
+
+T04 is the first task where one pull request would contain work owned by two
+models. Section 11 routes `tests/test_invariants.py` as SOL WRITES, OPUS
+REVIEWS. Section 12 tags the T04 kernel files OPUS ONLY and defines T04's
+completion as six of those same tests passing. The two assignments meet inside
+one task.
+
+**The exception.** On 2026-08-12 the user authorized Claude Opus 5 to write the
+six T04 invariant tests as well as the kernel, for T04 only. Sol was not
+reachable for this task, and T04 cannot ship without the tests: section 12's
+definition of done is exactly those six passing, and the required T04 status
+check has nothing to run without them. Deferring the tests would leave the
+kernel merged and unproven, which is worse than the exception.
+
+**What the exception costs, stated plainly.** One model now writes both the
+kernel and the tests that judge it. That is the pairing section 11 splits
+authorship to prevent, because a self-consistent pair can be green and prove
+nothing, and the same misreading of section 6 can be encoded twice. Sonnet's
+final review sees that consistent pair rather than two independent readings.
+Nothing below removes this. It reduces it.
+
+**Compensating measures. All are required, none is optional.**
+
+1. The tests are written first, against section 6's text, with no kernel file
+   in the tree. The resulting collection failure is preserved as the test-first
+   ordering evidence, following the precedent set by T02 and T03.
+2. Because collection failure means no fixture ever executes under pytest, the
+   fixture path is validated separately against live PostgreSQL with a
+   throwaway script outside the repository, and that script and its output are
+   preserved.
+3. Every one of the six tests is shown to fail under at least one single-line
+   mutation of the finished kernel, each mutation representing the defect that
+   test guards. Mutations are applied one at a time, run, recorded, and
+   reverted. The kernel is then verified restored by digest and the full suite
+   run green again. No mutation survives into the commit. This is what carries
+   the weight the authorship split would otherwise have carried: it proves each
+   test detects a specific defect in the code that ships, not merely that it
+   fails when nothing exists. Where two scenarios sit in one test as sequential
+   assertions, each gets its own targeted mutation rather than one transposition
+   covering both, because a test aborts at its first failure and a single
+   mutation would leave the later scenario unproven.
+4. Sonnet reviews the six tests against BUILD_SPEC section 6 directly, not only
+   against `policy.py`, so the review has a reference independent of the
+   implementation. The reviewer is given no question list and no area guidance,
+   and it runs against a throwaway clone rather than the working tree, so it
+   cannot alter the artifact it is reviewing.
+5. The T04 CI gate asserts all twelve code and HTTP status pairs from section
+   6's table, because the six tests construct only six of them and a transposed
+   status on an unexercised code would otherwise surface at T05, in a file T05
+   may not edit.
+
+Coverage as delivered: the six tests behaviorally exercise six of the twelve
+codes, including both branches of section 6 step 5d. Neither 5d branch is on the
+production path, since D-12 step 0 raises before `check` is reached and the
+server persists the decision before constructing a continuation, so both are
+defense against retries, races, bypasses, and incorrect continuation
+sequencing. The remaining six codes are covered by the complete-table check now
+and by their owning tasks later, except `MODEL_TIMEOUT`, which no test in
+section 11 names and which the table check alone covers.
+
+**Section 11's OPUS REVIEWS half is satisfied vacuously here.** Opus reviewing
+tests Opus wrote is not a review. It is recorded as satisfied only because the
+authoring model is the one section 11 names as reviewer, and no claim is made
+that an independent pre-implementation review occurred.
+
+**Scope.** The exception is T04 only. It does not extend to T05, T07, or T08,
+and it is not precedent for any later task.
+
+**The intended chain, for the split kernel tasks that follow.** When Sol is
+reachable, the pattern below applies. It is recorded now so it is not
+redesigned under time pressure, and it is deliberately not binding, because its
+cost against its yield is unmeasured. Confirm or revise it in a later decision
+using observed review yield, elapsed time, findings, and round trips.
+
+1. Sol authors its assigned invariant-test slice and validates the database
+   fixtures with a throwaway script outside the repository.
+2. Terra receives only the applicable specification and decisions, Sol's test
+   diff, the fixture-validation script, and its output.
+3. Terra performs a blind, read-only component review.
+4. Sol resolves Terra's findings.
+5. Opus performs the section 11 pre-implementation review of the accepted tests.
+6. Opus implements and owns the production kernel and the final package.
+7. Sonnet performs the blind, read-only final review of the Opus pull request.
+
+Two properties of that chain are worth recording with it. Terra's assignment
+would extend beyond the 2026-08-11 decision's wording, which covers Sol-produced
+pull requests, to an uncommitted Sol-authored component inside an Opus-owned
+one, because that is the only point at which Sol's work is reviewed as Sol's.
+And both pre-implementation reviews are static specification-conformance
+reviews: they read tests that cannot yet run, so they assess assertions,
+scenarios, and fixture design, and neither establishes runtime behavior.
+
+The full Sol prompt for the six T04 tests was written before the exception was
+granted and is preserved outside the repository at
+`C:\Users\nicol\trellis-handoffs\T04-sol-invariant-tests-prompt.md`, with notes
+on what to change to reuse it for T05's three tests.
+
+**Independence, described narrowly wherever it is claimed.** Even under the
+intended chain, D-15 and D-17 fix the signature, the error-code split, the
+`approval_row` type, the expiry mechanism, and the assertion style before any
+test is written. Sol would independently translate frozen contracts into tests
+without having seen `policy.py`. It would not independently choose those
+contracts. Do not describe that as a clean-room split.
+
+**Authorship trailers.** None are added to the T04 commit. No verified Git
+identity exists for Sol, and inventing one would put a false attribution in the
+permanent history. Authorship is recorded in `IMPLEMENTATION_NOTES.md` and the
+pull request instead.
+
+### D-17: `policy.check` scope loading
+
+Section 6 step 1 requires `check` to load `owner_id` for every id in
+`target_task_ids`, but `check` is passed no connection, CLAUDE.md requires all
+SQL to live in `backend/app/sql.py` as uppercase constants, and section 5's
+statement list contains nothing that loads owners by a set of task ids.
+`SELECT_TASKS_FOR_OWNER` cannot serve: it filters by `owner_id`, has no id
+filter, and carries a LIMIT, so it cannot distinguish a missing task from
+another actor's task by id.
+
+**One constant is added to `backend/app/sql.py`:**
+
+```sql
+SELECT id, owner_id
+  FROM tasks
+ WHERE id = ANY(%(task_ids)s::uuid[]);
+```
+
+**T04's file list is expanded** to include `backend/app/sql.py` under the user's
+explicit authorization of 2026-08-12. The alternatives were rejected: inline SQL
+in `policy.py` breaks the single-catalog rule in CLAUDE.md and section 5, and
+passing preloaded ownership into `check` moves an authoritative kernel check out
+to every call site, which is the opposite of what section 6 is for.
+
+**Missing and foreign ids produce the identical `OUT_OF_SCOPE`,** as section 6
+requires. A missing id returns no row; a foreign id returns a row whose
+`owner_id` differs. Both fail the same comparison and neither is distinguished
+in the error.
+
+**An empty `target_task_ids` skips the query and satisfies scope.** Tools such
+as `create_task` and `propose_plan` have no targets. The query would be
+vacuously satisfied, but relying on that is relying on an accident, so the skip
+is explicit.
+
+**The pool is imported lazily, inside the loading function.** `backend/app/db.py`
+opens its `ConnectionPool` at import time with `open=True`, so a module-level
+import would make importing `policy` require a live database, including for
+`classify()` and `arguments_hash()`. Section 6 calls `classify` pure with no
+database, and T10 imports it for step 0 of every tool body under D-12. The lazy
+import keeps that true.
+
+**`len(target_task_ids)` is preserved without deduplication.** Section 6 step 2
+specifies `count = len(target_task_ids)`, so four references to one id count as
+four and require approval while touching one row. This is transcription, and it
+fails closed. It is not listed in section 14 and will look like a bug later, so
+it is recorded here.

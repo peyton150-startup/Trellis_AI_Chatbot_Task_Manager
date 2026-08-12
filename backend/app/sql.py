@@ -10,6 +10,18 @@ SELECT *
  LIMIT %(limit)s;
 """
 
+# The scope load for BUILD_SPEC section 6 step 1, added at T04 under D-17.
+# Section 5 lists no statement that loads owners by a set of task ids, and
+# SELECT_TASKS_FOR_OWNER cannot serve because it filters by owner_id, has no id
+# filter, and carries a LIMIT. A missing id returns no row and a foreign id
+# returns a non-matching owner_id, so both fail the same comparison and produce
+# the identical OUT_OF_SCOPE that section 6 requires.
+SELECT_TASK_OWNERS = """
+SELECT id, owner_id
+  FROM tasks
+ WHERE id = ANY(%(task_ids)s::uuid[]);
+"""
+
 INSERT_TASK = """
 INSERT INTO tasks (owner_id, title, notes, due_date, priority, blocked_by)
 VALUES (
@@ -188,6 +200,16 @@ SELECT *
   FROM agent_runs
  WHERE id = %(run_id)s
    AND actor_id = %(actor_id)s;
+"""
+
+# The five-table reset specified for POST /api/demo/reset in BUILD_SPEC section
+# 13, added at T04 under D-17 because the invariant fixtures need it and
+# agent_runs has no delete statement. T09 consumes this rather than duplicating
+# it. RESTART IDENTITY resets the task_events bigserial so event ids stay
+# hand-checkable across a reset.
+TRUNCATE_ALL_STATE = """
+TRUNCATE TABLE tasks, task_events, agent_runs, tool_invocations, approvals
+RESTART IDENTITY CASCADE;
 """
 
 SWEEP_ORPHAN_RUNS = """
