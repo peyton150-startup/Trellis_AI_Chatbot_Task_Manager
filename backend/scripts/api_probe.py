@@ -4,9 +4,10 @@ import asyncio
 import inspect
 import json
 import sys
+import traceback
 from dataclasses import dataclass
 from importlib.metadata import version
-from typing import Any
+from typing import Any, Callable
 
 from ag_ui.core import (
     ResumeEntry,
@@ -38,6 +39,20 @@ from pydantic_ai.ui.ag_ui import AGUIAdapter
 
 
 CALL_ID = "probe-call-42"
+TOTAL_FACTS = 6
+
+
+class ProbeCheckError(AssertionError):
+    """Raised when a probed API fact does not hold."""
+
+
+def require(condition: object, message: str) -> None:
+    # Deliberately not `assert`. Python strips assert statements under
+    # PYTHONOPTIMIZE, which would let this probe print its success line while
+    # verifying nothing. This script's only job is to be trustworthy on the day a
+    # dependency upgrade breaks a fact recorded in docs/DECISIONS.md.
+    if not condition:
+        raise ProbeCheckError(message)
 
 
 @dataclass(frozen=True)
@@ -124,12 +139,15 @@ def probe_imports() -> ProbeResult:
         "ToolApproved": ToolApproved,
         "ToolDenied": ToolDenied,
     }
+    # The recorded fact is that these four names import directly from
+    # `pydantic_ai`, which the module-level import above already proves. Do not
+    # assert on `__module__`: the defining module is a private implementation
+    # detail, and pinning it turns an internal refactor into a false failure.
     for expected_name, imported_type in expected.items():
-        assert imported_type.__name__ == expected_name
-        assert imported_type.__module__ in {
-            "pydantic_ai._deferred",
-            "pydantic_ai.tools",
-        }
+        require(
+            imported_type.__name__ == expected_name,
+            f"pydantic_ai.{expected_name} resolved to {imported_type!r}",
+        )
     return ProbeResult(
         1,
         "deferred approval imports",
@@ -139,9 +157,20 @@ def probe_imports() -> ProbeResult:
 
 def probe_static_approval_parameter() -> ProbeResult:
     parameter = inspect.signature(Agent.tool_plain).parameters.get("requires_approval")
-    assert parameter is not None
-    assert parameter.default is False
-    assert parameter.annotation in {bool, "bool"}
+    require(
+        parameter is not None,
+        "Agent.tool_plain has no requires_approval parameter",
+    )
+    require(
+        parameter.default is False,
+        f"requires_approval default is {parameter.default!r}, expected False",
+    )
+    require(
+        parameter.annotation in {bool, "bool"},
+        f"requires_approval is annotated {parameter.annotation!r}, expected bool. "
+        "A widened annotation may mean conditional approval is now expressible "
+        "declaratively, which would supersede API fact 4 in docs/DECISIONS.md.",
+    )
 
     executions: list[str] = []
     agent = Agent(
@@ -159,9 +188,18 @@ def probe_static_approval_parameter() -> ProbeResult:
         return "updated"
 
     first = agent.run_sync("update four tasks")
-    assert isinstance(first.output, DeferredToolRequests)
-    assert first.output.approvals[0].tool_call_id == CALL_ID
-    assert executions == []
+    require(
+        isinstance(first.output, DeferredToolRequests),
+        f"expected a deferred request, got output {first.output!r}",
+    )
+    require(
+        first.output.approvals[0].tool_call_id == CALL_ID,
+        f"deferred approval carried tool_call_id {first.output.approvals[0].tool_call_id!r}",
+    )
+    require(
+        executions == [],
+        f"the gated tool body ran before approval: {executions!r}",
+    )
     return ProbeResult(
         2,
         "static approval registration",
@@ -177,8 +215,15 @@ def probe_message_history_round_trip() -> ProbeResult:
     serialized = ModelMessagesTypeAdapter.dump_json(messages)
     json_value = json.loads(serialized)
     restored = ModelMessagesTypeAdapter.validate_json(serialized)
-    assert isinstance(json_value, list)
-    assert restored == messages
+    require(
+        isinstance(json_value, list),
+        f"serialized history is {type(json_value).__name__}, expected a JSON array "
+        "storable in the agent_runs.message_history jsonb column",
+    )
+    require(
+        restored == messages,
+        "history did not survive the dump_json and validate_json round trip",
+    )
     return ProbeResult(
         3,
         "message history round trip",
@@ -186,7 +231,7 @@ def probe_message_history_round_trip() -> ProbeResult:
     )
 
 
-def probe_conditional_approval() -> tuple[ProbeResult, Agent[Any, Any], list[ModelMessage]]:
+def probe_conditional_approval() -> ProbeResult:
     callable_checks: list[list[str]] = []
 
     def callable_requirement(task_ids: list[str]) -> bool:
@@ -210,24 +255,51 @@ def probe_conditional_approval() -> tuple[ProbeResult, Agent[Any, Any], list[Mod
         return f"updated {len(task_ids)} tasks"
 
     callable_result = callable_agent.run_sync("update three tasks")
-    assert isinstance(callable_result.output, DeferredToolRequests)
-    assert callable_checks == []
+    require(
+        isinstance(callable_result.output, DeferredToolRequests),
+        "three ids below the threshold did not defer, so a callable may now be "
+        "evaluated. That would supersede API fact 4 in docs/DECISIONS.md.",
+    )
+    require(
+        callable_checks == [],
+        f"the callable was invoked with {callable_checks!r}. A callable is no "
+        "longer treated as a truthy static gate, which supersedes API fact 4 in "
+        "docs/DECISIONS.md.",
+    )
 
     below_threshold_executions: list[tuple[str, tuple[str, ...]]] = []
     below_threshold_agent = make_conditional_agent(
         below_threshold_executions, ["a", "b", "c"]
     )
     below_threshold_result = below_threshold_agent.run_sync("update three tasks")
-    assert below_threshold_result.output == "tool completed"
-    assert below_threshold_executions == [(CALL_ID, ("a", "b", "c"))]
+    require(
+        below_threshold_result.output == "tool completed",
+        f"below-threshold run produced output {below_threshold_result.output!r}",
+    )
+    require(
+        below_threshold_executions == [(CALL_ID, ("a", "b", "c"))],
+        f"below-threshold executions were {below_threshold_executions!r}",
+    )
 
     executions: list[tuple[str, tuple[str, ...]]] = []
     agent = make_conditional_agent(executions, ["a", "b", "c", "d"])
     first = agent.run_sync("update four tasks")
-    assert isinstance(first.output, DeferredToolRequests)
-    assert executions == []
-    assert len(first.output.approvals) == 1
-    assert first.output.approvals[0].tool_call_id == CALL_ID
+    require(
+        isinstance(first.output, DeferredToolRequests),
+        f"four ids over the threshold did not defer, output was {first.output!r}",
+    )
+    require(
+        executions == [],
+        f"the tool committed before approval: {executions!r}",
+    )
+    require(
+        len(first.output.approvals) == 1,
+        f"expected one deferred approval, got {len(first.output.approvals)}",
+    )
+    require(
+        first.output.approvals[0].tool_call_id == CALL_ID,
+        f"deferred approval carried tool_call_id {first.output.approvals[0].tool_call_id!r}",
+    )
 
     history = first.all_messages()
     resumed = agent.run_sync(
@@ -236,16 +308,18 @@ def probe_conditional_approval() -> tuple[ProbeResult, Agent[Any, Any], list[Mod
             approvals={CALL_ID: ToolApproved()}
         ),
     )
-    assert resumed.output == "tool completed"
-    assert executions == [(CALL_ID, ("a", "b", "c", "d"))]
-    return (
-        ProbeResult(
-            4,
-            "conditional approval",
-            "a callable is treated as a truthy static gate and is never invoked; raise ApprovalRequired in the tool",
-        ),
-        agent,
-        history,
+    require(
+        resumed.output == "tool completed",
+        f"the approved continuation produced output {resumed.output!r}",
+    )
+    require(
+        executions == [(CALL_ID, ("a", "b", "c", "d"))],
+        f"approved executions were {executions!r}",
+    )
+    return ProbeResult(
+        4,
+        "conditional approval",
+        "a callable is treated as a truthy static gate and is never invoked; raise ApprovalRequired in the tool",
     )
 
 
@@ -275,8 +349,14 @@ def build_ag_ui_adapter(
         ]
     run_input = AGUIAdapter.build_run_input(json.dumps(payload).encode())
     if approved is not None:
-        assert isinstance(run_input.resume, list)
-        assert isinstance(run_input.resume[0], ResumeEntry)
+        require(
+            isinstance(run_input.resume, list),
+            f"build_run_input parsed resume as {type(run_input.resume).__name__}",
+        )
+        require(
+            isinstance(run_input.resume[0], ResumeEntry),
+            f"resume[0] parsed as {type(run_input.resume[0]).__name__}, expected ResumeEntry",
+        )
     return AGUIAdapter(agent=agent, run_input=run_input)
 
 
@@ -297,7 +377,10 @@ async def collect_adapter_events(
             on_complete=capture_history,
         )
     ]
-    assert len(captured_history) == 1
+    require(
+        len(captured_history) == 1,
+        f"on_complete fired {len(captured_history)} times, expected once",
+    )
     return events, captured_history[0]
 
 
@@ -318,8 +401,13 @@ async def run_ag_ui_approval_flow(
         ],
     )
     first_events, history = await collect_adapter_events(first_adapter)
-    assert executions == []
+    require(
+        executions == [],
+        f"the tool committed before the interrupt was answered: {executions!r}",
+    )
 
+    # The continuation sends no client messages and supplies history from the
+    # server, which is the shape production uses under decision D-05.
     continuation_adapter = build_ag_ui_adapter(
         agent,
         run_id="probe-continuation",
@@ -333,77 +421,108 @@ async def run_ag_ui_approval_flow(
     return first_events, continuation_events, executions
 
 
-def probe_ag_ui_interrupt_and_continuation() -> tuple[ProbeResult, ProbeResult]:
-    approved_first, approved_continuation, approved_executions = asyncio.run(
-        run_ag_ui_approval_flow(approved=True)
-    )
-    denied_first, denied_continuation, denied_executions = asyncio.run(
-        run_ag_ui_approval_flow(approved=False)
-    )
+def find_run_finished(events: list[Any], label: str) -> RunFinishedEvent:
+    for event in events:
+        if isinstance(event, RunFinishedEvent):
+            return event
+    raise ProbeCheckError(f"the {label} stream emitted no RUN_FINISHED event")
 
-    for first_events in (approved_first, denied_first):
-        initial_finish = next(
-            event for event in first_events if isinstance(event, RunFinishedEvent)
-        )
-        assert initial_finish.outcome is not None
-        assert initial_finish.outcome.type == "interrupt"
-        assert len(initial_finish.outcome.interrupts) == 1
-        interrupt = initial_finish.outcome.interrupts[0]
-        assert interrupt.id == f"int-{CALL_ID}"
-        assert interrupt.tool_call_id == CALL_ID
-        assert any(
-            isinstance(event, ToolCallStartEvent)
-            and event.tool_call_id == CALL_ID
-            for event in first_events
-        )
 
-    for continuation_events in (approved_continuation, denied_continuation):
-        continuation_finish = next(
-            event
-            for event in continuation_events
-            if isinstance(event, RunFinishedEvent)
+def probe_ag_ui_resume_shape() -> ProbeResult:
+    for label, approved in (("approval", True), ("denial", False)):
+        first_events, _, _ = asyncio.run(run_ag_ui_approval_flow(approved=approved))
+        finish = find_run_finished(first_events, f"initial {label}")
+        require(
+            finish.outcome is not None,
+            f"the initial {label} run finished with no outcome",
         )
-        assert continuation_finish.outcome is not None
-        assert continuation_finish.outcome.type == "success"
-        assert any(
-            isinstance(event, ToolCallResultEvent)
-            and event.tool_call_id == CALL_ID
-            for event in continuation_events
+        require(
+            finish.outcome.type == "interrupt",
+            f"the initial {label} run finished as {finish.outcome.type!r}, expected 'interrupt'",
         )
-        assert not any(
-            isinstance(event, ToolCallStartEvent)
-            and event.tool_call_id == CALL_ID
-            for event in continuation_events
+        require(
+            len(finish.outcome.interrupts) == 1,
+            f"the initial {label} run raised {len(finish.outcome.interrupts)} interrupts, expected one",
         )
-
-    assert approved_executions == [(CALL_ID, ("a", "b", "c", "d"))]
-    assert denied_executions == []
-    return (
-        ProbeResult(
-            5,
-            "AG-UI resume shape",
-            "a real interrupt resumes via resume=[{interruptId, status='resolved', payload={approved: bool}}]",
-        ),
-        ProbeResult(
-            6,
-            "tool call identity",
-            f"the adapter emits int-{CALL_ID}, resumes the original {CALL_ID}, and emits only its result",
-        ),
+        require(
+            finish.outcome.interrupts[0].id == f"int-{CALL_ID}",
+            f"interrupt id was {finish.outcome.interrupts[0].id!r}, expected 'int-{CALL_ID}'",
+        )
+    return ProbeResult(
+        5,
+        "AG-UI resume shape",
+        "a real interrupt resumes via resume=[{interruptId, status='resolved', payload={approved: bool}}]",
     )
 
 
-def run_probe() -> list[ProbeResult]:
-    results = [
-        probe_imports(),
-        probe_static_approval_parameter(),
-        probe_message_history_round_trip(),
-    ]
-    conditional_result, _, _ = probe_conditional_approval()
-    results.append(conditional_result)
-    ag_ui_result, identity_result = probe_ag_ui_interrupt_and_continuation()
-    results.append(ag_ui_result)
-    results.append(identity_result)
-    return results
+def probe_tool_call_identity() -> ProbeResult:
+    flows = {
+        label: asyncio.run(run_ag_ui_approval_flow(approved=approved))
+        for label, approved in (("approval", True), ("denial", False))
+    }
+
+    for label, (first_events, continuation_events, _) in flows.items():
+        interrupt = find_run_finished(first_events, f"initial {label}").outcome.interrupts[0]
+        require(
+            interrupt.tool_call_id == CALL_ID,
+            f"the {label} interrupt referenced tool_call_id {interrupt.tool_call_id!r}, "
+            f"expected the original {CALL_ID!r}",
+        )
+        require(
+            any(
+                isinstance(event, ToolCallStartEvent) and event.tool_call_id == CALL_ID
+                for event in first_events
+            ),
+            f"the initial {label} stream emitted no TOOL_CALL_START for {CALL_ID}",
+        )
+
+        finish = find_run_finished(continuation_events, f"{label} continuation")
+        require(
+            finish.outcome is not None and finish.outcome.type == "success",
+            f"the {label} continuation did not finish successfully",
+        )
+        require(
+            any(
+                isinstance(event, ToolCallResultEvent) and event.tool_call_id == CALL_ID
+                for event in continuation_events
+            ),
+            f"the {label} continuation emitted no TOOL_CALL_RESULT for the original {CALL_ID}",
+        )
+        require(
+            not any(
+                isinstance(event, ToolCallStartEvent) and event.tool_call_id == CALL_ID
+                for event in continuation_events
+            ),
+            f"the {label} continuation re-emitted TOOL_CALL_START, so the call was "
+            "restarted rather than resumed",
+        )
+
+    approved_executions = flows["approval"][2]
+    denied_executions = flows["denial"][2]
+    require(
+        approved_executions == [(CALL_ID, ("a", "b", "c", "d"))],
+        f"approval executed the tool body as {approved_executions!r}, expected exactly "
+        f"one execution under the original {CALL_ID}",
+    )
+    require(
+        denied_executions == [],
+        f"denial executed the tool body: {denied_executions!r}",
+    )
+    return ProbeResult(
+        6,
+        "tool call identity",
+        f"the adapter emits int-{CALL_ID}, resumes the original {CALL_ID}, and emits only its result",
+    )
+
+
+CHECKS: list[tuple[int, str, Callable[[], ProbeResult]]] = [
+    (1, "deferred approval imports", probe_imports),
+    (2, "static approval registration", probe_static_approval_parameter),
+    (3, "message history round trip", probe_message_history_round_trip),
+    (4, "conditional approval", probe_conditional_approval),
+    (5, "AG-UI resume shape", probe_ag_ui_resume_shape),
+    (6, "tool call identity", probe_tool_call_identity),
+]
 
 
 def main() -> int:
@@ -413,15 +532,29 @@ def main() -> int:
     print(f"pydantic-ai-slim {version('pydantic-ai-slim')}")
     print(f"ag-ui-protocol {version('ag-ui-protocol')}")
     print()
-    try:
-        results = run_probe()
-    except Exception as exc:
-        print(f"FAIL: {type(exc).__name__}: {exc}")
-        return 1
 
-    for result in results:
-        print(f"PASS {result.number}/6 {result.name}: {result.detail}")
-    print("ALL 6 API FACTS CONFIRMED")
+    confirmed: list[ProbeResult] = []
+    for number, name, check in CHECKS:
+        try:
+            confirmed.append(check())
+        except Exception as exc:
+            for result in confirmed:
+                print(f"PASS {result.number}/{TOTAL_FACTS} {result.name}: {result.detail}")
+            print(f"FAIL {number}/{TOTAL_FACTS} {name}: {type(exc).__name__}: {exc}")
+            print()
+            traceback.print_exc(file=sys.stdout)
+            print()
+            print(
+                f"Fact {number} of {TOTAL_FACTS} no longer holds for pydantic-ai "
+                f"{version('pydantic-ai')} and ag-ui-protocol {version('ag-ui-protocol')}. "
+                "Update the matching row in docs/DECISIONS.md and every task that "
+                "consumes it before changing this probe to agree with the new behavior."
+            )
+            return 1
+
+    for result in confirmed:
+        print(f"PASS {result.number}/{TOTAL_FACTS} {result.name}: {result.detail}")
+    print(f"ALL {TOTAL_FACTS} API FACTS CONFIRMED")
     return 0
 
 

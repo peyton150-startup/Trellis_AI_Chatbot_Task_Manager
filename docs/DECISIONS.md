@@ -150,3 +150,81 @@ Ten prompts, both candidates, scored on correct tool behavior, clarification whe
 | Day | Cut | Position in cut order | Reason |
 |---|---|---|---|
 | | | | |
+
+---
+
+## Hardening decisions recorded at T00R
+
+Recorded on 2026-08-12 after an audit of the completed T00 and T00A work. Each
+one closes a consequence that was discovered earlier but never written down. No
+existing decision above is amended.
+
+### D-12: conditional approval raises at tool step 0
+
+API fact 4 established that `requires_approval` accepts only a boolean, so
+`delete_tasks` gates declaratively while `bulk_update_tasks` must raise
+`ApprovalRequired` from inside its own tool body, guarded by
+`not ctx.tool_call_approved`. Three consequences follow, and all three are
+binding.
+
+The premise stated in BUILD_SPEC section 6, that the agent framework gates an
+approval-required call before the tool function runs, holds only for
+`delete_tasks`. On the conditional path the body does run, as far as the raise,
+and then runs again after approval.
+
+The raise is therefore step 0 of the tool body, ahead of `arguments_hash` and
+ahead of `idempotency.acquire`. If it sits anywhere after lease acquisition, the
+first deferring pass acquires a lease it never completes, and the approved
+continuation then fails against its own lease with `LEASE_IN_FLIGHT`.
+
+Every mutating tool carries the identical step 0:
+
+```python
+requirement = policy.classify(tool_name, arguments, len(target_ids))
+if requirement.required and not ctx.tool_call_approved:
+    raise ApprovalRequired(metadata={"reason": requirement.reason})
+```
+
+It is inert for ungated tools, and for `delete_tasks` the framework gate fires
+first so step 0 is never reached. The identical five-step body in section 10
+therefore still holds, with this step in front of it. `policy.py` needs no
+change: `classify` is already pure and correct for both paths.
+
+Actor scope is resolved before the raise, never after. An `ApprovalRequired`
+raised for target ids the actor does not own would build an approval card
+describing another actor's rows, which is exactly the disclosure T12B prohibits.
+
+### D-13: drop the T00A required check before the spike is deleted
+
+BUILD_SPEC requires deleting `spike/` before T12A, and `T00A spike build` is a
+required status check on `master` with admin enforcement enabled. A T12A pull
+request that deletes the directory would fail its own required check, because
+`npm ci` would run against a path that no longer exists, and branch protection
+cannot be edited from inside that pull request.
+
+The order is fixed: remove `T00A spike build` from master branch protection
+first, then delete the CI job and the `spike/` tree in the T12A pull request.
+Strict up-to-date checks, admin enforcement, conversation resolution, the GitHub
+Actions app bindings, and the force-push and deletion restrictions are all
+preserved while doing it.
+
+### D-14: `backend/requirements.txt` is the single backend pin source
+
+Every backend job in `.github/workflows/ci.yml` installs from
+`backend/requirements.txt`. Inline `pip install` pin lists in the workflow are
+not permitted for backend jobs.
+
+The reason is that the T00 probe's pins previously lived only in the workflow.
+Bumping an application dependency elsewhere would have left the probe proving
+API facts for a version the application no longer installed, while
+`docs/DECISIONS.md` continued to present those facts as current. Facts are only
+worth recording if the thing that proves them runs against the versions actually
+in use.
+
+The cost is accepted deliberately: each backend job installs the whole pinned
+set, so jobs are slower and share one install failure surface. The exchange is
+that every gate now runs against the real application environment.
+
+`spike/backend/requirements.txt` is the one exception and keeps its own pins.
+That tree is disposable and is deleted at T12A under D-13, so coupling it to the
+production pin source would only create something to unwind.
