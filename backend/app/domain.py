@@ -9,6 +9,11 @@ Task rows are authoritative current state. Event snapshots are JSON-safe,
 complete task rows so T07 can compare ``after["version"]`` and restore a
 deleted task with ``before["id"]`` and every other original field.
 
+Two entry points exist for T07 alone and are not tool paths.
+``delete_task_guarded`` and ``restore_task`` carry the compensating writes undo
+needs, and they live here rather than in ``undo.py`` so that this module remains
+the only code that writes either table. See D-39 and D-41.
+
 One mutation in this schema does not originate here. ``tasks.blocked_by`` is a
 self reference declared ``ON DELETE SET NULL``, so deleting a task rewrites
 every surviving row that pointed at it, without passing through any function
@@ -230,6 +235,100 @@ def delete_tasks(
     # pointer to it is restored. The opposite order would write a foreign key
     # reference to a row that does not exist yet.
     return MutationResult(tasks=deleted, events=cascade_events + deleted_events)
+
+
+def delete_task_guarded(
+    owner_id: UUID,
+    task_id: UUID,
+    expected_version: int,
+    *,
+    conn: Connection,
+) -> MutationResult:
+    """Delete one task only if its version still matches, for T07 under D-39.
+
+    ``delete_tasks`` is the tool path and carries no version predicate, which is
+    correct there because the policy check and the row lock run immediately
+    before it in the same transaction. Undo establishes the version in an
+    earlier precheck pass, so it needs the guard on the write itself or a
+    concurrent change lands inside the window and is destroyed rather than
+    refused.
+
+    The delete cascade is audited exactly as ``delete_tasks`` audits it. See
+    D-41: one inverse operation may legitimately emit one direct compensation
+    event plus N cascade events, because suppressing the cascade would reopen
+    the audit hole D-23 closed.
+    """
+    # Snapshot and lock the referencing rows while they still point at the
+    # target, before ON DELETE SET NULL rewrites them.
+    blocked_before = _tasks_blocked_by(owner_id, (task_id,), conn=conn)
+
+    row = conn.execute(
+        sql.DELETE_TASK_GUARDED,
+        {
+            "id": task_id,
+            "owner_id": owner_id,
+            "expected_version": expected_version,
+        },
+    ).fetchone()
+    if row is None:
+        # The row moved, vanished, or is not this owner's. All three are a
+        # concurrent-state change to the caller, which fails closed.
+        raise VersionConflictError()
+
+    deleted = _task(row)
+    deleted_event = PendingTaskEvent(
+        task_id=deleted.id,
+        operation=EventOperation.DELETED,
+        before=_snapshot(deleted),
+        after=None,
+    )
+    cascade_events = _cascade_events(owner_id, blocked_before, conn=conn)
+    # Cleared pointers first, the deletion last, matching delete_tasks so that
+    # persisted ids ascend in the order a later reverse-order undo needs.
+    return MutationResult(tasks=(deleted,), events=cascade_events + (deleted_event,))
+
+
+def restore_task(
+    owner_id: UUID,
+    snapshot: TaskSnapshot,
+    *,
+    version: int,
+    conn: Connection,
+) -> MutationResult:
+    """Re-insert a deleted task under its original id, for T07 under D-39.
+
+    The caller supplies ``version`` rather than this function deriving it.
+    Section 8 owns the rule that a restored task continues from the deleted
+    row's version plus one, and that is undo semantics; this layer executes the
+    write and reports what the database produced.
+
+    The emitted event carries ``created``, which is the physical operation. Undo
+    relabels the direct compensation to ``restored`` under D-41, so that the
+    operation this layer reports always describes the write it actually made.
+    """
+    row = conn.execute(
+        sql.INSERT_TASK_RESTORED,
+        {
+            "id": snapshot["id"],
+            "owner_id": owner_id,
+            "title": snapshot["title"],
+            "notes": snapshot["notes"],
+            "due_date": snapshot["due_date"],
+            "priority": snapshot["priority"],
+            "status": snapshot["status"],
+            "blocked_by": snapshot["blocked_by"],
+            "version": version,
+            "created_at": snapshot["created_at"],
+        },
+    ).fetchone()
+    task = _task(row)
+    event = PendingTaskEvent(
+        task_id=task.id,
+        operation=EventOperation.CREATED,
+        before=None,
+        after=_snapshot(task),
+    )
+    return MutationResult(tasks=(task,), events=(event,))
 
 
 def write_events(

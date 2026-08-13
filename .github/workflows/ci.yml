@@ -1440,3 +1440,457 @@ jobs:
           print("PASS FakeTracker: resolution, create conflict, per-field updated_at, archive leaves")
           print("     updated_at alone, archived excluded by default, unarchive restores intact")
           PY
+
+  t07-kernel-undo:
+    name: T07 kernel undo
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # Section 11 names exactly one T07 test, and D-40 keeps it at one name
+      # rather than widening the enumerated thirteen. That test carries seven
+      # scenarios and reaches everything constructible from a single sequential
+      # connection. This gate carries what it structurally cannot: the guard
+      # placement on the two new statements, the unbounded read, the delete
+      # cascade round trip, the no-partial property on a multi-task refusal, and
+      # the concurrent race between the precheck and the apply pass.
+      #
+      # Same precedent as T04's error table and T05's lease guards: what a named
+      # test cannot construct goes in the gate rather than shipping unexercised.
+      - name: Verify T07 undo guards, unbounded read, cascade, and atomicity
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import threading
+          import time
+          from uuid import UUID
+
+          import psycopg
+
+          from app import domain, sql, undo
+          from app.db import pool
+          from app.models import (
+              CreateTaskArgs,
+              DeleteTasksArgs,
+              EventOperation,
+              UndoReason,
+              UpdateTaskArgs,
+          )
+
+          ACTOR = UUID("00000000-0000-0000-0000-000000000001")
+          problems = []
+
+
+          def require(condition, message):
+              if not condition:
+                  problems.append(message)
+
+
+          def reset_and_run(label):
+              with pool.connection() as conn:
+                  conn.execute(sql.TRUNCATE_ALL_STATE)
+                  row = conn.execute(
+                      sql.INSERT_RUN,
+                      {"actor_id": ACTOR, "prompt": label, "model": "t07-gate"},
+                  ).fetchone()
+                  conn.commit()
+                  return row["id"]
+
+
+          def new_run(label):
+              with pool.connection() as conn:
+                  row = conn.execute(
+                      sql.INSERT_RUN,
+                      {"actor_id": ACTOR, "prompt": label, "model": "t07-gate"},
+                  ).fetchone()
+                  conn.commit()
+                  return row["id"]
+
+
+          def step(run_id, make):
+              """One tool-shaped transaction: mutate, event, commit."""
+              with pool.connection() as conn:
+                  mutation = make(conn)
+                  domain.write_events(run_id, ACTOR, mutation.events, conn=conn)
+                  conn.commit()
+                  return mutation
+
+
+          def tasks():
+              with pool.connection() as conn:
+                  rows = conn.execute(
+                      sql.SELECT_TASKS_FOR_OWNER,
+                      {
+                          "owner_id": ACTOR,
+                          "status": None,
+                          "due_before": None,
+                          "due_after": None,
+                          "priority": None,
+                          "limit": 50,
+                      },
+                  ).fetchall()
+                  conn.commit()
+                  return {row["id"]: dict(row) for row in rows}
+
+
+          def events(run_id):
+              with pool.connection() as conn:
+                  rows = conn.execute(
+                      sql.SELECT_ALL_EVENTS_FOR_RUN, {"run_id": run_id}
+                  ).fetchall()
+                  conn.commit()
+                  return rows
+
+
+          def fingerprint(run_id):
+              return tasks(), len(events(run_id))
+
+
+          # ---------------------------------------------------------------
+          # 1. The guards are on the writes, not in a preceding read.
+          #
+          # These are the two statements D-39 adds, and they are the reason
+          # undo is correct without holding a lock across the two passes. Each
+          # is run directly against a row it must refuse and a row it must take,
+          # exactly as the T05 gate proves the lease guards.
+          run_id = reset_and_run("T07 guard placement")
+          with pool.connection() as conn:
+              victim = domain.create_task(
+                  ACTOR, CreateTaskArgs(title="Guarded"), conn=conn
+              ).tasks[0]
+              conn.commit()
+
+          with pool.connection() as conn:
+              stale = conn.execute(
+                  sql.DELETE_TASK_GUARDED,
+                  {"id": victim.id, "owner_id": ACTOR, "expected_version": 99},
+              ).fetchone()
+              conn.commit()
+          require(stale is None, "DELETE_TASK_GUARDED deleted a row at the wrong version")
+          require(victim.id in tasks(), "the refused delete removed the row anyway")
+
+          with pool.connection() as conn:
+              taken = conn.execute(
+                  sql.DELETE_TASK_GUARDED,
+                  {"id": victim.id, "owner_id": ACTOR, "expected_version": 1},
+              ).fetchone()
+              conn.commit()
+          require(taken is not None, "DELETE_TASK_GUARDED refused a matching version")
+          require(victim.id not in tasks(), "the guarded delete did not remove the row")
+
+          # And the restore insert's guard is its primary key.
+          snapshot = victim.model_dump(mode="json")
+          with pool.connection() as conn:
+              domain.restore_task(ACTOR, snapshot, version=2, conn=conn)
+              conn.commit()
+          duplicated = False
+          try:
+              with pool.connection() as conn:
+                  domain.restore_task(ACTOR, snapshot, version=3, conn=conn)
+                  conn.commit()
+          except psycopg.errors.UniqueViolation:
+              duplicated = True
+          require(duplicated, "INSERT_TASK_RESTORED accepted a second row under one id")
+
+          restored_row = tasks()[victim.id]
+          require(
+              restored_row["created_at"] == victim.created_at,
+              "the restore did not carry the original created_at",
+          )
+          require(restored_row["version"] == 2, "the restore did not continue the version")
+
+          # ---------------------------------------------------------------
+          # 2. The undo read is unbounded.
+          #
+          # SELECT_EVENTS_FOR_RUN is the display read and keeps its LIMIT. If
+          # undo used it, the events past the bound would silently not be
+          # compensated and the result would still report success, which is the
+          # partial undo section 8 forbids. Twelve events, read back two ways.
+          run_id = reset_and_run("T07 unbounded read")
+          for index in range(12):
+              step(
+                  run_id,
+                  lambda conn, index=index: domain.create_task(
+                      ACTOR, CreateTaskArgs(title=f"Bulk {index:02d}"), conn=conn
+                  ),
+              )
+          with pool.connection() as conn:
+              paged = conn.execute(
+                  sql.SELECT_EVENTS_FOR_RUN, {"run_id": run_id, "limit": 5}
+              ).fetchall()
+              conn.commit()
+          require(len(paged) == 5, "the display read did not honour its limit")
+          require(len(events(run_id)) == 12, "the unbounded read truncated")
+
+          result = undo.undo_run(run_id, ACTOR)
+          require(result.refused is False, f"the twelve-event undo refused: {result.reason}")
+          require(result.applied == 12, f"undo applied {result.applied} of 12 events")
+          require(tasks() == {}, "undo left tasks behind, so the read was truncated")
+
+          # ---------------------------------------------------------------
+          # 3. The delete cascade, round trip.
+          #
+          # D-23 orders the cascade events so that reverse-order undo restores a
+          # deleted blocker before any pointer to it. If that order were wrong
+          # the restore would write a foreign key reference to a row that does
+          # not exist yet, and this section would refuse instead of applying.
+          run_id = reset_and_run("T07 cascade round trip")
+          with pool.connection() as conn:
+              blocker = domain.create_task(
+                  ACTOR, CreateTaskArgs(title="Blocker"), conn=conn
+              ).tasks[0]
+              blocked = domain.create_task(
+                  ACTOR,
+                  CreateTaskArgs(title="Blocked", blocked_by=blocker.id),
+                  conn=conn,
+              ).tasks[0]
+              conn.commit()
+
+          step(
+              run_id,
+              lambda conn: domain.delete_tasks(
+                  ACTOR, DeleteTasksArgs(task_ids=[blocker.id]), conn=conn
+              ),
+          )
+          require(tasks()[blocked.id]["blocked_by"] is None, "the cascade did not fire")
+
+          result = undo.undo_run(run_id, ACTOR)
+          require(result.refused is False, f"the cascade undo refused: {result.reason}")
+          # applied counts the run's own events, both of them: the cleared
+          # pointer and the deletion.
+          require(result.applied == 2, f"cascade undo applied {result.applied}, expected 2")
+          current = tasks()
+          require(blocker.id in current, "undo did not restore the deleted blocker")
+          require(
+              current[blocked.id]["blocked_by"] == blocker.id,
+              "undo did not restore the pointer",
+          )
+
+          # ---------------------------------------------------------------
+          # 4. One inverse operation, one direct compensation event plus N
+          #    cascade events, and the cascade keeps its own operation. D-41.
+          run_id = reset_and_run("T07 compensation event shape")
+          created = step(
+              run_id,
+              lambda conn: domain.create_task(
+                  ACTOR, CreateTaskArgs(title="Target"), conn=conn
+              ),
+          ).tasks[0]
+          with pool.connection() as conn:
+              pointer = domain.create_task(
+                  ACTOR,
+                  CreateTaskArgs(title="Points at target", blocked_by=created.id),
+                  conn=conn,
+              ).tasks[0]
+              conn.commit()
+
+          result = undo.undo_run(run_id, ACTOR)
+          require(result.refused is False, f"the compensation undo refused: {result.reason}")
+          written = events(run_id)
+          require(len(written) == 3, f"expected 1 original and 2 compensation rows, got {len(written)}")
+          compensation = [row for row in written if row["id"] > written[-1]["id"]]
+          direct = [row for row in compensation if row["task_id"] == created.id]
+          cascade = [row for row in compensation if row["task_id"] == pointer.id]
+          require(len(direct) == 1, "the direct compensation event is missing")
+          require(
+              direct[0]["operation"] == EventOperation.RESTORED.value,
+              f"the direct compensation is {direct[0]['operation']}, expected restored",
+          )
+          require(len(cascade) == 1, "the cascade side effect was not audited")
+          require(
+              cascade[0]["operation"] == EventOperation.UPDATED.value,
+              "the cascade event was relabelled restored, which the log would not mean",
+          )
+
+          # ---------------------------------------------------------------
+          # 5. No partial undo when a later event conflicts.
+          #
+          # The named test's refusal scenarios each touch one task, so none of
+          # them can show that an earlier, applicable event was not applied
+          # anyway. Three tasks, only the third moved.
+          run_id = reset_and_run("T07 no partial undo")
+          targets = []
+          with pool.connection() as conn:
+              for name in ("First", "Second", "Third"):
+                  targets.append(
+                      domain.create_task(ACTOR, CreateTaskArgs(title=name), conn=conn).tasks[0]
+                  )
+              conn.commit()
+          for target in targets:
+              step(
+                  run_id,
+                  lambda conn, target=target: domain.update_task(
+                      ACTOR,
+                      UpdateTaskArgs(
+                          task_id=target.id, expected_version=1, notes="run edit"
+                      ),
+                      conn=conn,
+                  ),
+              )
+          with pool.connection() as conn:
+              conn.execute(
+                  sql.UPDATE_TASK_GUARDED,
+                  {
+                      "id": targets[2].id,
+                      "owner_id": ACTOR,
+                      "expected_version": 2,
+                      "title": "moved by someone else",
+                      "notes": None,
+                      "due_date": None,
+                      "set_due_date": False,
+                      "priority": None,
+                      "status": None,
+                      "blocked_by": None,
+                      "set_blocked_by": False,
+                  },
+              )
+              conn.commit()
+
+          before = fingerprint(run_id)
+          result = undo.undo_run(run_id, ACTOR)
+          require(result.refused is True, "a moved third row did not refuse the undo")
+          require(result.reason is UndoReason.VERSION_CONFLICT, f"reason was {result.reason}")
+          require(result.applied == 0, f"a refused undo reported {result.applied} applied")
+          require(fingerprint(run_id) == before, "the refused undo wrote to the database")
+          survivors = tasks()
+          require(
+              all(row["notes"] == "run edit" for row in survivors.values()),
+              "an applicable event was compensated before the conflict was found",
+          )
+
+          # ---------------------------------------------------------------
+          # 6. The precheck-to-apply race, which no sequential test can build.
+          #
+          # A competing writer moves a row while undo is between its two passes.
+          # The only acceptable outcomes are a complete undo or a refusal that
+          # wrote nothing. A half-applied undo is the failure this whole file
+          # exists to prevent, and it is what an unguarded delete produces.
+          partial = 0
+          applied_rounds = 0
+          refused_rounds = 0
+          for round_index in range(20):
+              run_id = reset_and_run(f"T07 race {round_index}")
+              pair = []
+              with pool.connection() as conn:
+                  for name in ("Race A", "Race B"):
+                      pair.append(
+                          domain.create_task(
+                              ACTOR, CreateTaskArgs(title=name), conn=conn
+                          ).tasks[0]
+                      )
+                  conn.commit()
+              for target in pair:
+                  step(
+                      run_id,
+                      lambda conn, target=target: domain.update_task(
+                          ACTOR,
+                          UpdateTaskArgs(
+                              task_id=target.id, expected_version=1, notes="run edit"
+                          ),
+                          conn=conn,
+                      ),
+                  )
+
+              gate = threading.Barrier(2, timeout=30)
+              outcome = {}
+              # Half the rounds let the writer in first and half let undo take
+              # its locks first, so both branches are exercised. Left to raw
+              # timing the writer wins every round, and a run of twenty
+              # refusals would prove nothing about the applying path.
+              writer_delay = 0.0 if round_index % 2 == 0 else 0.4
+
+              def compete(task_id=pair[0].id, delay=writer_delay):
+                  gate.wait()
+                  time.sleep(delay)
+                  try:
+                      with pool.connection() as conn:
+                          conn.execute(
+                              sql.UPDATE_TASK_GUARDED,
+                              {
+                                  "id": task_id,
+                                  "owner_id": ACTOR,
+                                  "expected_version": 2,
+                                  "title": "raced",
+                                  "notes": None,
+                                  "due_date": None,
+                                  "set_due_date": False,
+                                  "priority": None,
+                                  "status": None,
+                                  "blocked_by": None,
+                                  "set_blocked_by": False,
+                              },
+                          )
+                          conn.commit()
+                  except Exception as exc:  # noqa: BLE001
+                      outcome["writer"] = f"{type(exc).__name__}: {exc}"
+
+              writer = threading.Thread(target=compete)
+              writer.start()
+              gate.wait()
+              result = undo.undo_run(run_id, ACTOR)
+              writer.join(30)
+
+              current = tasks()
+              compensated = sum(
+                  1 for row in current.values() if row["notes"] == ""
+              )
+              if result.refused:
+                  refused_rounds += 1
+                  if compensated != 0:
+                      partial += 1
+              else:
+                  applied_rounds += 1
+                  if compensated != 2:
+                      partial += 1
+
+          require(
+              partial == 0,
+              f"{partial} of 20 rounds left a half-applied undo behind",
+          )
+          print(
+              f"     race rounds: {applied_rounds} applied in full, "
+              f"{refused_rounds} refused with zero writes"
+          )
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_STATE)
+              conn.commit()
+
+          if problems:
+              raise SystemExit("T07 undo does not hold its contract:\n" + "\n".join(problems))
+          print(
+              "PASS T07: guards on the compensating writes, unbounded event read, "
+              "delete cascade round trip, one direct compensation plus N audited "
+              "cascade events, no partial undo on a later conflict, and no "
+              "half-applied undo under a concurrent writer"
+          )
+          PY
+
+      - name: Verify T07 invariant tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest tests/test_invariants.py -v
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
