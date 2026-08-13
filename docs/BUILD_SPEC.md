@@ -12,16 +12,15 @@ Read these before writing any code. They are not style preferences.
 
 1. **Do not invent.** If a name, column, status value, error code, or endpoint is not in this document, it does not exist. If something is genuinely missing, stop and write the question into `docs/OPEN_QUESTIONS.md`. Do not guess and continue.
 2. **Do not redesign.** Do not add ORMs, caching, message queues, background workers, auth, migrations frameworks, or state management libraries. Do not replace psycopg with SQLAlchemy. Do not replace the SQL in section 5 with query-builder calls.
-
    Two additions are out of bounds regardless of what category they belong to, and being a product integration rather than infrastructure exempts neither: **anything that adds a task to section 12, and anything that edits a KERNEL file.** Both require an explicit re-plan against the schedule in `docs/PROJECT_PLAN.md` and a decision in `docs/DECISIONS.md` naming what was cut to pay for it. The cut order in PROJECT_PLAN is where the payment comes from; a re-plan that pays for new tasks with optimism is not a re-plan. Everything else that is not already in this document waits until after T15 is green, and goes to `docs/OPEN_QUESTIONS.md` as a productionization discussion rather than into an implementation task.
 
    This gate is about cost and blast radius, not about taxonomy. Do not spend time arguing whether a proposed dependency is infrastructure or a product integration, hosted or self-run. Count the tasks it adds and check whether it reaches a KERNEL file.
-3. **Do not skip the verification step.** Every task in section 12 ends with a command. Run it. If it fails, fix it before starting the next task. Do not batch tasks.
+3. **Do not skip the verification step.** Every task in section 12 ends with a command. Run it. If it fails, fix it before starting the next task. Do not batch task implementation or verification. The review-only batching exception is defined in section 1A.
 4. **Do not touch files outside the task's stated file list.**
 5. **Kernel files are transcription only.** Files marked KERNEL in section 3 contain logic specified line by line in sections 6, 7, and 8. Transcribe the specified logic exactly. Do not "improve" it, do not reorder checks, do not collapse branches.
 6. **No em-dashes in any file, comment, or commit message.**
 7. **Commit after every task**, message format `T##: <task name>`.
-8. One task, one commit, one verification. Stop after each task and report the verification output.
+8. One task, one commit, one verification. Stop after each task and report the verification output. A later review checkpoint may cover multiple completed commits, but does not combine those tasks or their verification.
 9. **Check the model tag on every task before you start it.** Section 1A is the routing table. If a task is tagged OPUS ONLY and you are not Opus, stop. Do not attempt it. Do not write a placeholder. Print the handoff block in section 1A and end your turn.
 
 ---
@@ -36,7 +35,7 @@ The split between the two is not about capability in general. It is about where 
 |---|---|---|
 | **OPUS ONLY** | Claude Opus 5 | The correctness kernel and the experimental-API spikes. Files where a subtly wrong line passes tests and fails in front of the interviewer. |
 | **SOL** | Sol 5.6, high | Transcription work: schema, routes, React, seed data, styling, test bodies from named assertions. The majority of the build. |
-| **SOL WRITES, OPUS REVIEWS** | Both | Sol produces it, Opus reads it before the task is marked done. Cheap for Opus: reading 80 lines costs a fraction of writing them. |
+| **SOL WRITES, OPUS REVIEWS** | Both | Sol produces it and Opus reviews it at the applicable review gate. Before T07 that gate remains task-local. From T07 forward, the schedule-pressure exception below controls when the review occurs. |
 
 ### If you are Sol and you hit an OPUS ONLY task
 
@@ -90,6 +89,69 @@ If Opus availability runs short before the kernel is done, spend what is left in
 5. T12B, the approval interrupt spike
 
 Those five are the demo. Everything else is scaffolding around them, and Sol builds scaffolding fine.
+
+### Review-budget triage from T07 forward
+
+**Active schedule exception:** task implementation, commits, and verification remain strictly one at a time. Dedicated model review is compressed into two checkpoints so scarce review usage is spent where a subtle mistake can invalidate the demo. This exception changes review cadence only; it does not change task order, author routing, file ownership, verification commands, or the rule against working ahead around a failed task.
+
+If review capacity is constrained, spend it in this order:
+
+**T12B > T08 > T12A > T07 > T10 > everything else.**
+
+Use these checkpoints:
+
+```text
+T07
+ |
+T08
+ |
+REVIEW CHECKPOINT 1
+undo + wire boundary
+
+T09
+T10
+T11
+ |
+T12A
+T12B
+ |
+REVIEW CHECKPOINT 2
+tools + transport + APPROVAL PATH
+
+T13
+T14
+ |
+T15 UGLY DEMO
+ |
+SMOKE / MANUAL REVIEW
+```
+
+The second checkpoint must pass before UI work continues past the ugly-demo bar. After T15 is green, reduce review depth and prioritize a finished, tested, reproducible, and rehearsed demo.
+
+| Task | Dedicated review | Required treatment |
+|---|---|---|
+| T07 undo | Yes, lightweight | Review with T08 at checkpoint 1 if usage is tight. |
+| T08 wire contract | **Yes** | Do not defer beyond checkpoint 1. |
+| T09 seed/reset | No | Verification only. |
+| T10 tools | Partial | Review `create_task` as the reference implementation and the shared transaction shape, not all six tools separately. |
+| T11 prompts | No separate review | Inspect with T12A at checkpoint 2, or at T15 if needed. |
+| T12A AG-UI | **Yes** | May share checkpoint 2 with T12B. |
+| T12B approvals | **Yes, highest priority** | Check the full approval path at checkpoint 2. Do not defer. |
+| T13 board | No | T15 smoke review covers it. |
+| T14 chat | No | T15 smoke review covers it. |
+| T15 ugly demo | Checkpoint smoke/manual review | This is the major stopping point. |
+| T16 approval UI | No blind review | Manually test approve and reject. |
+| T17 clarification | Deferred | Review with T23 only if that later review is taken. |
+| T18 undo button | No | Functional test. |
+| T19 timeout/degraded | No | Functional test. |
+| T20 Run Inspector | No blind review | Visual and manual inspection. |
+| T21 resume/orphan | **No review budget** | If this task remains when T21 is reached, cut it before spending further scope or review budget. If retained, verification only. |
+| T22 OTel | No | Verify spans. |
+| T23 injection | If time permits | Security-sensitive, but lower priority than a green T15. |
+| T24 evals | No per-task review | Run the suite and perform one adversarial read. |
+| T25 polish | No | Rehearsal and clean-clone verification. |
+
+This is a deliberate exception to the original meaning of `SOL WRITES, OPUS REVIEWS`: from T07 forward, a task may pass its own verification before the dedicated review occurs. It is not allowed past the checkpoint that owns its review until that checkpoint passes.
 
 ### Never let either model do these
 
@@ -912,13 +974,13 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T14 | Chat | SOL | `Chat.tsx` | Streaming turn visible, board refetches after tool completion. See the assistant-ui ownership note below. |
 | T15 | **UGLY DEMO BAR** | either | none | Prompt to committed board update, unstyled |
 | T16 | Approval card | SOL | `ApprovalCard.tsx`, `useRun.ts` | Delete pauses, approve and reject both work. See the assistant-ui ownership note below. |
-| T17 | Clarifying question | SOL WRITES, OPUS REVIEWS | `prompts.py` | "Clear my tasks" asks rather than deletes |
+| T17 | Clarifying question | SOL | `prompts.py` | "Clear my tasks" asks rather than deletes. Review with T23 only if that optional review is taken. |
 | T18 | Undo endpoint and button | SOL | `main.py`, `Board.tsx` | Undo restores; refuses after an external edit. `undo.py` is KERNEL, do not edit it here. |
 | T19 | Timeout, retry, degraded state | SOL | `tools.py`, `agent.py`, `Chat.tsx` | Forced timeout shows degraded state, does not hang |
 | T20 | Run Inspector | SOL | `RunInspector.tsx` | Shows attempts, COMMITTED and DEDUPLICATED, usage |
-| T21 | Resume and orphan sweep | SOL WRITES, OPUS REVIEWS | `runs.py`, `main.py` | Killed run marked interrupted at boot, resume works. Opus checks it against lease stealing. |
+| T21 | Resume and orphan sweep | SOL | `runs.py`, `main.py` | If retained: killed run marked interrupted at boot and resume works. Verification only under the active review-budget exception. |
 | T22 | OTel | SOL | `telemetry.py`, `tests/test_telemetry.py`, `requirements.txt` | `pytest tests/test_telemetry.py` passes: at least one `chat` span and at least one `execute_tool` span, captured at the exporter. See the T22 note below and D-30. |
-| T23 | Injection path | SOL WRITES, OPUS REVIEWS | `prompts.py`, `seed.py` | Flag true wrecks the board, flag false does not. Opus checks the startup guard. |
+| T23 | Injection path | SOL | `prompts.py`, `seed.py` | Flag true wrecks the board, flag false does not. Opus reviews the startup guard only if time remains after T15 is green. |
 | T24 | Eval suite | SOL | `test_evals.py`, `fixtures/cases.py` | 15 cases run, pass rate recorded |
 | T25 | Polish, README, restore drill | SOL | `README.md` | Clean clone plus compose up reproduces the app |
 

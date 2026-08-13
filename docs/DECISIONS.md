@@ -1050,3 +1050,17 @@ section 12 and edits two KERNEL files for lint, which trips both halves of the
 D-31 gate and would require a named cut while the Linear expansion is already
 unpaid. Option B touches neither `policy.py` nor `idempotency.py`, so it needs
 no re-plan.
+
+### D-35: dedicated review is compressed into checkpoints from T07 forward
+
+The active schedule exception changes review cadence, not implementation
+discipline. Tasks retain their order, author routing, file ownership, separate
+commits, and task-local verification. Dedicated model review is batched after
+T08 for undo and the wire boundary, and after T12B for the reference tool,
+transport, trust boundary, and approval path.
+
+Remaining review budget is spent in this order:
+`T12B > T08 > T12A > T07 > T10 > everything else`. T21 receives no dedicated
+review budget. Once the T15 ugly-demo smoke path is green, finishing, testing,
+reproducibility, and rehearsal take priority over deeper review. The complete
+task-by-task treatment is authoritative in BUILD_SPEC section 1A.

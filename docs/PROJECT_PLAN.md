@@ -256,6 +256,18 @@ Cutting item 6 costs a demo beat, so it is last. Cutting item 3 shortens the hum
 
 Adding people is not available and would not help on work this coupled. The available levers, in order of soundness: cut scope per the pre-agreed order, then extend working hours, then accept a less polished surface. Do not assume lost time is recovered later; delays compound rather than self-correct.
 
+### Review compression from T07 forward
+
+The original review cadence assumed every review-tagged task received a dedicated blind read before it was marked done. Under the active schedule pressure, keep task implementation, commits, and verification separate, but batch dedicated model review at the two boundaries where a subtle defect can invalidate the demo:
+
+1. **After T08:** review T07 undo and T08 wire contract together. T08 is mandatory; T07 may receive a lightweight read.
+2. **After T12B:** review the T10 reference tool and transaction shape, T12A transport and trust boundary, and T12B approval path. T12B is the highest remaining review priority.
+3. **At T15:** run the full ugly-demo smoke path and inspect it manually. Once this is green, reduce review depth and finish, test, make reproducible, and rehearse the demonstrable system.
+
+Remaining review budget is allocated in this order: **T12B > T08 > T12A > T07 > T10 > everything else.** Seed/reset, prompts, board, chat, approval UI, undo UI, timeout handling, Run Inspector, OTel, evals, and polish use their specified verification, functional, visual, or rehearsal checks rather than dedicated blind reviews. T17 may be reviewed with T23 if that work is reached. T23 receives a security review only if time remains after T15 is green.
+
+Do not spend dedicated review usage on T21. Resume and orphan sweep is already second in the scope cut order and is the first task to drop from the remaining review queue.
+
 ---
 
 ## Step 4: Responsibilities and risk
@@ -315,7 +327,7 @@ Testing alone tops out well short of what combining techniques achieves, and ins
 
 | Technique | Applied to | Cadence |
 |---|---|---|
-| Non-authoring model review, then human read | Policy layer, wire contract, idempotency lease | Every kernel PR |
+| Non-authoring model review, then human read | Policy layer, wire contract, idempotency lease, undo, transport, approvals | T04 and T05 at their task-local gates; from T07, the two review checkpoints above |
 | Deterministic invariant suite | Boundary behavior | Every commit, CI gate, 100% required |
 | Behavioral evals | Agent tool selection | On demand and before the demo, threshold |
 | Smoke test | Full path, prompt to committed board update | Every build |
