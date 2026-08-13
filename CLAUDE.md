@@ -71,6 +71,7 @@ The working directory is part of the contract. Ruff resolves configuration by di
 ## Code and workflow conventions
 
 - One task, one commit, with message `T##: <task name>`.
+- From T07 forward, follow the compressed review schedule in `docs/BUILD_SPEC.md` section 1A. Implementation, commits, and verification stay task-local; only dedicated review is batched. Stop at the review checkpoints after T08 and T12B. After T15 is green, reduce review depth as specified there.
 - Open a separate PR after T00 and after T00A. Pause after the T00A PR for user review.
 - Never merge, squash and merge, rebase and merge, close, or otherwise finalize a PR. Only the user may merge PRs.
 - Write implementation-specific PR descriptions. List files and components added or changed, exact interfaces and data flow, observed verification evidence, limitations, reviewer findings and dispositions, and follow-up ownership. Do not substitute only an architectural summary. Link to durable documentation where it contains the full detail, then summarize the relevant facts in the PR.

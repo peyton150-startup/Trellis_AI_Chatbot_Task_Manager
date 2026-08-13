@@ -25,7 +25,7 @@ Architecture frozen. Implementation starts at T00.
 - Anything proposed after Day 2 is filed as STRETCH and stays there.
 - Exactly two models touch this repository: Claude Opus 5 and Sol 5.6. Task-level routing is in BUILD\_SPEC section 1A.
 - Four KERNEL files (`policy.py`, `idempotency.py`, `undo.py`, and the wire contract in `main.py`) are Opus only. A plausible-but-wrong line in those survives every smoke test and fails in front of a reviewer.
-- Every task ends with a runnable verification. Tasks are not batched.
+- Every task ends with a runnable verification. Implementation, commits, and verification are not batched. Under the active schedule exception in BUILD_SPEC section 1A, dedicated reviews from T07 forward are grouped at the T08 and T12B checkpoints.
 
 ## Stack
 
