@@ -98,3 +98,241 @@ Options:   Add the empty file under whichever task owns `backend/app/`, or
 Resolution: None yet. T04's file list does not include `__init__.py` and
            creating it would be an unauthorized scope expansion, so this is
            recorded rather than fixed.
+
+## Q-05  How is `tests/test_contract.py` excluded from CI when no pytest configuration exists and no `eval` marker is registered?
+Task:      T00B
+Blocking:  yes, for `test_contract.py`, the pytest configuration, and the T00B
+           CI gate. Not blocking for the six Linear API facts or Gate B, which
+           are measurements already recorded in `docs/DECISIONS.md` and which no
+           marker decision can change.
+Status:    RESOLVED by D-32, agreed with the user on 2026-08-13
+Context:   Section 4.6 of `docs/LINEAR_INTEGRATION.md` says `test_contract.py`
+           is "marked, network-dependent, and excluded from CI on the same
+           grounds as `test_evals.py` under D-09". The T00B task prompt further
+           says to mark it so `pytest -m "not eval"` does not collect it, and to
+           register the marker "in the pytest configuration alongside the
+           existing `eval` marker".
+           Both premises of that last clause are false against master at
+           954bd83. There is no pytest configuration anywhere in the repository:
+           no `pyproject.toml`, `pytest.ini`, `setup.cfg`, `tox.ini`, or
+           `conftest.py`. No `eval` marker is registered. BUILD_SPEC line 791
+           declares that `test_evals.py` will carry `@pytest.mark.eval`, but
+           that file belongs to T24 and does not exist yet.
+           That leaves a contradiction rather than a gap. The T00B gate must
+           prove `pytest -m "not eval"` does not collect `test_contract.py`. Any
+           marker other than `eval` leaves it collected by that exact command.
+           Making the command exclude it means editing the CI command BUILD_SPEC
+           line 821 fixes as `pytest -m "not eval"`, which is section 11, while
+           T00B's file list permits only the section 12 table row. Creating a
+           pytest configuration file is likewise outside the file list. Rule 0.4
+           forbids both, and rule 0.1 directs writing the question here and
+           stopping rather than picking a side.
+Options:   A. Mark it `@pytest.mark.eval` and `@pytest.mark.contract`, and add
+              `backend/pytest.ini` registering both. Keeps the CI command
+              frozen. Costs a config file outside the file list, permanently
+              overloads `eval` to mean "excluded from CI" rather than
+              "behavioral evaluation", and collides at T24 because
+              `pytest -m eval` would then collect a network contract test.
+           B. Mark it `@pytest.mark.eval` only. No new file and no BUILD_SPEC
+              edit, but the same overload and the same T24 collision, and it
+              records a contract test as a behavioral eval.
+           C. Use a `contract` marker and change CI to
+              `pytest -m "not eval and not contract"`. Clean taxonomy, but CI
+              must then name every taxonomy it excludes and the command grows a
+              clause per class, which is the wrong abstraction: CI does not care
+              what kind of test it is, only why it cannot run.
+           D. Separate taxonomy from execution constraint. `eval` and `contract`
+              describe what a test is; a new `network` marker describes an
+              execution requirement. Default CI becomes `pytest -m "not network"`
+              and the known assignments are fixed now rather than at T24:
+
+                  test_contract.py   @pytest.mark.contract  @pytest.mark.network
+                  test_evals.py      @pytest.mark.eval      @pytest.mark.network
+
+              `pytest -m eval` then runs the behavioral suite and
+              `pytest -m contract` the provider suite, with no exclusion
+              workaround in either. `network` is preferred over a name like
+              `nonci` because it records a property of the test rather than
+              today's CI policy, and stays true if external tests are ever run
+              deliberately in a protected nightly job.
+Resolution: D, agreed with the user on 2026-08-13 during the T00B session. It is
+           the only option that leaves no marker overloaded and no latent T24
+           failure. Recorded here rather than acted on, because implementing it
+           edits BUILD_SPEC section 11, `CLAUDE.md`, `.github/workflows/ci.yml`,
+           and a new pytest configuration file, none of which are in T00B's file
+           list. T00B stops here and resumes after the specification carries the
+           correction.
+Note:      The correction is not a search and replace of the CI command. Every
+           statement that currently equates `eval` with CI exclusion has to
+           move. BUILD_SPEC line 791 reads "behavioral, marked
+           `@pytest.mark.eval`, excluded from CI", which becomes false the
+           moment `network` is what excludes; the eval section of
+           `docs/ARCHITECTURE.md` needs the same check. Missing either one
+           leaves a future reader concluding that marking a test `eval` keeps it
+           out of CI, after which the next network test is collected by the
+           default gate.
+
+## Q-06  May the probe create more than one throwaway issue when facts need independent state?
+Task:      T00B
+Blocking:  yes, for finalizing T00B. Not blocking for the six facts or Gate B,
+           which are already recorded in `docs/DECISIONS.md`.
+Status:    RESOLVED by D-33, agreed with the user on 2026-08-13
+Context:   The T00B task prompt authorizes the probe to "create and then archive
+           a single throwaway issue to confirm fact 3, and it must clean up
+           after itself". As written the probe creates three, one each for facts
+           3, 4, and 6, and archives every one of them in a `finally`.
+           The three are not a convenience. Fact 3 ends with its issue archived,
+           so a shared issue would have to be unarchived before fact 4 runs,
+           which contaminates the archived-exclusion check that fact 4 exists to
+           make. Fact 6 must create an issue under a client-supplied id that has
+           never been used, so it cannot reuse an existing one at all. Sharing
+           one issue would couple the three checks and make the probe less
+           trustworthy in order to satisfy the sentence.
+           The probe's current behaviour is believed correct and the
+           specification should move to match it, rather than the probe being
+           reshaped to obey a count that was never measured.
+Options:   A. Authorize a fixed larger number, for example "up to three
+              throwaway issues". Rejected: three is an artifact of today's
+              probe and the wording breaks again the moment a further
+              state-sensitive fact is added, which is the same defect as the
+              original "a single throwaway issue".
+           B. State the property rather than the count:
+
+                  Each fact that requires uncontaminated initial state creates
+                  its own throwaway issue and archives it in a `finally`.
+                  Pre-existing workspace issues are never modified.
+
+              This stays correct at four, six, or ten state-sensitive facts and
+              needs no further correction as the probe grows.
+Resolution: B, agreed with the user on 2026-08-13. Recorded here rather than
+           acted on, because T00B is already stopped at Q-05 and the correction
+           belongs to the specification, not to this task. Chat approval is not
+           treated as sufficient to leave the spec saying one thing while the
+           probe does another.
+
+## Q-07  T00B's ruff gate is not executable as specified: no pin, no configuration, and a non-clean baseline
+Task:      T00B
+Blocking:  yes, for the T00B CI gate. Not blocking for the six facts or Gate B.
+Status:    RESOLVED by D-34, agreed with the user on 2026-08-13
+Context:   BUILD_SPEC line 821 states that CI runs `ruff check`. The T00B gate is
+           further specified to run "ruff clean", and to install from
+           `backend/requirements.txt` with no inline pin list, per D-14. Three
+           separate things prevent that from being executable, and all three were
+           measured against `954bd83` rather than assumed.
+
+           **1. ruff is absent from the single backend pin source.** There is no
+           `ruff` entry in `backend/requirements.txt`, and no job in
+           `.github/workflows/ci.yml` invokes ruff today. D-14 states that
+           "Inline `pip install` pin lists in the workflow are not permitted for
+           backend jobs", so ruff must come from the pin source. Note that
+           D-14's stated *rationale* concerns the probe proving API facts for
+           versions the application does not install, which a linter cannot
+           affect; it is D-14's *mechanism* that binds here, not its reasoning.
+           `backend/requirements.txt` is not in T00B's file list.
+
+           **2. There is no repository-owned ruff configuration.** No
+           `ruff.toml`, `.ruff.toml`, or `pyproject.toml` exists anywhere in the
+           repository. "ruff clean" therefore has no fixed meaning: it resolves
+           to whatever the installed ruff version defaults to, and ruff can fall
+           back to a user-level configuration before its built-in defaults, so
+           the same pinned binary can enforce different policies on different
+           machines. No user-level configuration exists on the machine that took
+           these measurements, confirmed by `--isolated` returning an identical
+           result, so the numbers below are ruff's genuine defaults. The drift is
+           demonstrated rather than hypothetical: ruff 0.16.3's default set
+           includes `I`, `UP`, `BLE`, `FURB`, `RUF`, and `SIM`, well beyond the
+           `E4,E7,E9,F` that ruff defaulted to for years.
+
+           **3. master is not clean, and T00B may not make it clean.** ruff
+           0.16.3 under isolated defaults reports 22 violations repository-wide
+           and 19 under `backend/`. Five of the 19 belong to
+           `backend/scripts/linear_probe.py`, which T00B owns. The remaining
+           **14 are the master baseline**, and every one of them sits in a file
+           outside T00B's file list:
+
+               3  backend/scripts/api_probe.py       T00 and T00R
+               2  backend/app/domain.py              explicitly forbidden
+               2  backend/app/idempotency.py         KERNEL, explicitly forbidden
+               2  backend/tests/test_invariants.py   explicitly forbidden
+               1  backend/app/config.py              explicitly out of scope
+               1  backend/app/policy.py              KERNEL, explicitly forbidden
+               1  backend/app/db.py                  not in T00B's file list
+               1  backend/app/models.py              not in T00B's file list
+               1  backend/tests/test_models.py       not in T00B's file list
+
+           By rule: `I001` 8, `UP035` 2, `BLE001` 1, `FURB157` 1, `RUF059` 1,
+           `SIM102` 1. A gate requiring ruff clean over a surface T00B is
+           forbidden to repair cannot be satisfied by T00B at any version pin.
+Options:   A. Clean all 14 first, as a prerequisite task. Architecturally
+              cleanest and rejected on schedule: it adds a task to section 12 and
+              edits two KERNEL files for lint, which trips the blast-radius gate
+              and requires a named schedule cut while the Linear expansion is
+              already unpaid.
+           B. Define an explicit, defect-oriented rule set that master already
+              satisfies, and gate prospectively. Measured and viable:
+
+                  select = ["E4", "E7", "E9", "F"]   ->  exit 0
+
+              clean both with and without `linear_probe.py`. That set is
+              pyflakes (undefined names, unused imports and variables,
+              redefinitions) plus bare `except:`, `== None`, type comparisons,
+              import placement, and syntax errors. It is the real-defect tier
+              rather than the style tier, and it is the set ruff itself shipped
+              as its default for years. It must be documented as a deliberate
+              contract validated by master passing it, not as whatever made CI
+              green; had the set needed contorting to fit master, option C would
+              be the honest answer instead.
+              Naive alternatives are worse, not better, and were measured:
+              `select = ["E","F"]` yields 51 `E501` line-too-long violations
+              because ruff's default selects only `E4,E7,E9` and thereby omits
+              `E501`; `["E","F","I"]` yields 59.
+           C. Scope T00B's gate to T00B-owned files only, proving that T00B
+              introduced no violations while leaving repository debt explicit.
+              Smallest change, but it requires correcting any BUILD_SPEC language
+              claiming the backend is globally ruff clean, and it gives no
+              repository-wide gate going forward.
+Resolution: B, agreed with the user on 2026-08-13 after the measurements above.
+           The correction must settle three things together, because any one
+           alone leaves the gate ambiguous:
+
+               tool       ruff==0.16.3 in backend/requirements.txt.
+                          No requirements-dev.txt: this repository deliberately
+                          established one backend pin source and adding a second
+                          reopens D-14 for no benefit here.
+               policy     A repository-owned ruff configuration pinning
+                          select = ["E4", "E7", "E9", "F"].
+               surface    The exact invocation and working directory, not a bare
+                          `ruff check`. ruff resolves configuration by directory
+                          hierarchy, so a `backend/ruff.toml` governs files under
+                          `backend/` and nothing else. Fixing the surface also
+                          keeps the disposable `spike/` tree, which holds 3 of
+                          the 22 repository-wide violations and is deleted before
+                          T12A, from ever blocking the gate.
+
+           Consequences to state explicitly in the correction. The 14 baseline
+           violations are deferred lint-adoption debt, not violations of the
+           contract being defined, and they belong to a named future task rather
+           than to silence. Findings from ruff's broader default set are outside
+           the contract and must not become an unwritten second gate; T00B will
+           voluntarily clear the five in `linear_probe.py` as hygiene, and that
+           choice must not be recorded as a requirement.
+
+           Correction, 2026-08-13, from the T00B review. The voluntary cleanup
+           above was committed to here and then not done, so this paragraph and
+           the shipped code disagreed. The commitment is withdrawn rather than
+           honoured, and it is struck here rather than deleted so the record
+           shows it was made and why it was dropped. Clearing the five would
+           rebuild exactly the second gate this question rejects, and three of
+           them are percent-formatting inside GraphQL query strings, where
+           f-strings would force escaping every brace in a language made of
+           braces. The pinned `E4, E7, E9, F` contract is the gate, and
+           "passes ruff's current defaults" is not a second one. UP035, a
+           deprecated import, is the one case worth fixing on its own merits
+           whenever `linear_probe.py` is next open. BUILD_SPEC line 821
+           currently implies a repository-wide `ruff check` and needs the same
+           semantic sweep Q-05 requires, or the documented surface and the real
+           surface disagree again.
+Note:      Because nothing in option B touches `policy.py` or `idempotency.py`,
+           the lint work no longer trips the blast-radius gate and needs no
+           re-plan or schedule cut. That is a consequence of the measurement, not
+           an assumption; option A would have required both.

@@ -9,6 +9,8 @@ Trellis is a technical interview artifact: an LLM operates a todo application th
 - Read `docs/BUILD_SPEC.md` before implementation. Execute its tasks in order and do not invent missing contracts.
 - Read `docs/ARCHITECTURE.md` for the trust boundary, data model, and demo rationale.
 - Read `docs/DECISIONS.md` for closed API and architecture decisions.
+- Read `docs/LINEAR_INTEGRATION.md` for the Linear projection design, why
+  Postgres stays authoritative, and the tasks that implement it.
 - Record genuinely missing or contradictory requirements in `docs/OPEN_QUESTIONS.md` and stop.
 - Record how major implementations fit locally and system-wide in `IMPLEMENTATION_NOTES.md`.
 
@@ -78,6 +80,13 @@ The working directory is part of the contract. Ruff resolves configuration by di
 - Review neutrally. Give a blind reviewer only the task specification, commit diff, and verification evidence. Do not imply that defects exist. Require evidence-backed findings and allow an explicit no-findings result.
 - Use Terra as the default neutral, blind, read-only reviewer for Codex- or Sol-produced PRs under the user's 2026-08-11 instruction. Give Terra only the task specification, commit diff, and verification evidence. Terra must not edit, generate, stage, or commit repository content. Record its findings and their disposition in the PR.
 - Use Claude Sonnet as the default neutral, blind, read-only reviewer for Claude-produced PRs whose implementation model is Opus. Give Sonnet only the task specification, commit diff, and verification evidence. Sonnet must not edit, generate, stage, or commit repository content. Record its findings and their disposition in the PR.
+- A Sonnet review is one agent, not two, and it runs in three phases in this order: read, execute, reconcile. Do not dispatch a separate executor and reviewer in parallel, and do not let the agent run the code before it has read the diff.
+  1. **Read.** Review the commit diff against the task specification before running anything, while still blind to any result. Produce the findings this pass supports, plus the open hypotheses that only execution can settle.
+  2. **Execute.** Reproduce the author's own verification gate, then run independent probes, and design those probes to test the hypotheses phase 1 raised rather than only replaying the author's gate.
+  3. **Reconcile.** Revisit the phase 1 findings against what execution showed. Confirm, withdraw, or add, and report which happened to each.
+- Read before execute, because a reviewer that sees a green board first anchors on it and stops looking. Findings the gate cannot reach are the ones worth having: the T00B review on 2026-08-13 found that `docs/DECISIONS.md` recorded fact 4 as tested across ten cases including cleared labels and a cleared project, while the shipped probe tested at most eight and cleared nothing. That is invisible to every passing test and was found by reading.
+- The execution phase runs in a Vercel Sandbox against a pinned commit SHA, never in a live worktree and never on the host. Name the Vercel Sandbox in the reviewer's prompt every time, including for a small or targeted follow-up pass. "An isolated clone" is not a substitute and does not satisfy this rule: a clone isolates the repository from the agent, while the sandbox isolates the host from whatever the agent runs. If a sandbox genuinely cannot be provisioned, the reviewer reports the failure verbatim, falls back to the pinned clone, and labels every result with the environment that produced it, so a host-run result is never mistaken for a sandboxed one.
+- The reviewer records both the SHA reviewed and the SHA it executed against, and states plainly which claims it could not independently verify, such as anything needing a live credential the sandbox is deliberately denied. Executing in a sandbox is not an exception to the read-only rule above: the agent still must not edit, generate, stage, or commit repository content.
 - Terra review does not replace Opus when the routing table says `SOL WRITES, OPUS REVIEWS` or otherwise requires Opus review.
 - Kernel files are transcription-only. Preserve the specified check order and transaction boundaries.
 - Put all SQL statements in `backend/app/sql.py` as uppercase constants.

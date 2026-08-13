@@ -56,6 +56,45 @@ Confirmed on 2026-08-10 using Python 3.12.13, `pydantic-ai` 2.27.0,
 
 ---
 
+## API facts confirmed at T00B
+
+Confirmed on 2026-08-13 against `https://api.linear.app/graphql` using Python
+3.12.13 and `httpx` 0.28.1, with a personal API key and demo team `TRE` in
+workspace `trellis-app-proejct`.
+
+Unlike the T00 table there is no pinned dependency version to record here.
+Linear's GraphQL endpoint is unversioned and live, so the date and the observed
+shapes below are the whole provenance. That is precisely why `test_contract.py`
+freezes the subset this build depends on and fails when it drifts.
+
+| # | Fact | Confirmed value | Date |
+|---|---|---|---|
+| 1 | Authentication header format | Send the personal API key raw in `Authorization`, with no `Bearer` prefix. `Bearer <key>` is rejected with HTTP 400 and the message "It looks like you're trying to use an API key as a Bearer token. Remove the Bearer prefix from the Authorization header." Omitting the header returns HTTP 401 `AUTHENTICATION_ERROR`. | 2026-08-13 |
+| 2 | Workspace object resolution | Query one collection at a time: `teams(filter: { key: { eq: $key } }, first: 1) { nodes { id key name <collection>(first: 50) { nodes { id name ... } } } }`, where `<collection>` is `states`, `labels`, `members`, or `projects`. Requesting all four in one query costs complexity 13315 against a 10000 ceiling and is rejected, so T26 issues one query per collection. Team `TRE` returned 7 workflow states (`Backlog` backlog, `Todo` unstarted, `In Progress` started, `In Review` started, `Done` completed, `Canceled` canceled, `Duplicate` duplicate), 3 labels, 1 member, 1 project, each carrying a UUID. Names are unique within the team for all four collections, so name to id resolution needs no tiebreak. Labels resolve with `team: null` through `issueLabels`, meaning they are workspace scoped rather than team scoped; a workspace that also defines a team label of the same name could collide, which was not observed here. | 2026-08-13 |
+| 3 | Mutation shapes for create, update, archive, unarchive | `issueCreate(input: IssueCreateInput!)` and `issueUpdate(id: String!, input: IssueUpdateInput!)` both return `IssuePayload { lastSyncId: Float!, issue: Issue, success: Boolean! }`. `issueArchive(id: String!, trash: Boolean)` and `issueUnarchive(id: String!)` both return `IssueArchivePayload { lastSyncId: Float!, success: Boolean!, entity: Issue }`. Of the fields this build sets, `IssueCreateInput` carries `id: String` (client supplied and honoured), `teamId: String!`, `title: String`, `description: String`, `stateId: String`, `priority: Int`, `dueDate: TimelessDate`, `assigneeId: String`, `labelIds: [String!]`, and `projectId: String`; `IssueUpdateInput` carries the same set minus `id` and with `teamId: String` nullable. `dueDate` is a date with no time component. `labelIds` replaces the list rather than appending. `Issue.priority` reads back as `Float!` while the input is `Int`. `issueArchive` then `issueUnarchive` round-trips: `archivedAt` is set and then cleared, and title, workflow state, and priority all survive. `issueDelete(id, permanentlyDelete)` exists and this build never calls it. | 2026-08-13 |
+| 4 | Change detection | Poll with `issues(filter: { team: { key: { eq: $key } }, updatedAt: { gt: $since } }, first: N, orderBy: updatedAt)`, where `$since` is `DateTimeOrDuration!`. Pagination is `pageInfo { hasNextPage endCursor }` with an opaque cursor. `updatedAt` moved for every field this build sets, tested one field at a time: title, description, priority, dueDate, stateId, assigneeId, labelIds, and projectId. Clearing moves it too, measured separately because setting a field says nothing about clearing it: `labelIds: []` and `projectId: null` each emptied the field and bumped `updatedAt`. Those are the two clear shapes Linear honours, and T26 and T28 should use them. Both clear cases read the field back and confirmed it was genuinely empty before judging the timestamp, so a mutation that silently did nothing cannot be recorded as a field that fails to bump `updatedAt`. Archived issues are excluded from the default query and are returned only with `includeArchived: true`, which is what D-27 requires so a deleted task does not resurrect through the import path. After our own mutation `updatedAt` moves and the mutation's own response payload already carries the new value, with a read-back immediately afterwards agreeing; observed mutation round trips were 0.23 to 0.68 seconds. | 2026-08-13 |
+| 5 | Key scope and limits | The personal API key is user scoped, not team scoped. It resolves `viewer` and `organization` and enumerates `teams(first: 50)` with no team parameter anywhere in the request, so the demo team restriction is a policy check in our code and not an API guarantee. Say that out loud in the README rather than implying the key is scoped. Observed response headers were `x-ratelimit-requests-limit: 2500` and `x-ratelimit-complexity-limit: 3000000`, each with a `-remaining` and `-reset` companion. Per D-29 the numbers are an observation and not an architectural constant; the conclusion this build depends on is that they are comfortably above demo and rehearsal usage, which costs roughly 25 calls per reset. | 2026-08-13 |
+| 6 | Delivery deduplication | No. All 361 mutations were scanned and none carries an argument advertising idempotency, replay, or deduplication semantics. The only client-controlled identifier is `IssueCreateInput.id`, and replaying `issueCreate` with an id that already exists is rejected with HTTP 400 `INPUT_ERROR` and the message "Entity Issue with id `<uuid>` already exists" rather than returning the original issue. That is a uniqueness constraint and not a replay guarantee, so it does not count under D-25 and the local `UNIQUE(event_id)` constraint is the only deduplication layer, which D-25 states is sufficient. The consequence for T27 is that a retry after an ambiguous create receives an error rather than the issue, so the projector must treat that specific conflict as evidence the create already landed and recover the remote id by query, or it will record a delivered create as failed. | 2026-08-13 |
+
+Two things this table deliberately does not claim.
+
+**The archived recovery boundary is unestablished.** Fact 3 asked what happens
+when an archived issue is too old to recover. The probe archived and unarchived
+within seconds and never approached a boundary, and none was encountered. No
+value is recorded rather than a guessed one, because D-25 forbids inventing a
+fallback to create until the behaviour is confirmed. `restored` maps to
+`unarchive` unconditionally, and if a boundary is later found this row is where
+the correction goes.
+
+**Archiving does not move `updatedAt`.** Observed directly: an `issueArchive`
+left `updatedAt` unchanged. Archived issues leave the default poll instead of
+appearing as a modification, so a human archiving an issue in Linear is not
+detectable by the fact 4 query. T28 cannot use `updatedAt` alone to notice
+external archival, and a task whose issue vanishes from the poll is not the same
+signal as a task whose issue changed.
+
+---
+
 ## Gate A: AG-UI interrupt path (T00A, Day 1)
 
 **Result:** GATE A: PASS
@@ -126,6 +165,55 @@ Denial uses the same shape with `"approved": false`.
 **Symptom, if FAIL:** Not applicable. The native interrupt path passed.
 
 **Consequence if FAIL:** chat continues to stream over AG-UI; approvals move to `GET /api/runs/{id}` plus `POST /api/runs/{id}/approvals/{tool_call_id}`, with the approval card rendered from run state. T12B's seven proofs apply to the fallback unchanged.
+
+---
+
+## Gate B: Linear API (T00B)
+
+**Result:** GATE B: PASS
+
+**The three failure criteria, each checked directly.** Gate B fails if the demo
+team's workflow states, projects, labels, or members cannot be enumerated for
+enum construction; if `issueArchive` and `issueUnarchive` do not round-trip; or
+if issues changed by another actor cannot be detected by an `updatedAt` query.
+None of the three holds.
+
+Enumeration works for all four collections, one query per collection, and every
+name is unique within the team so resolution needs no tiebreak. Archive and
+unarchive round-trip with `archivedAt` set and then cleared and the issue's
+fields intact. An `updatedAt` filter detects a change to every field this build
+sets, including the label and project changes that fact 4 singled out as the
+most likely place for the design to fail.
+
+**Workspace the gate ran against:** organization `trellis-app-proejct`
+(`f798e328-66df-4eee-a99a-27bf8bcb3667`), team `TRE`
+(`49744eb7-0013-4b96-8e32-d4649e59642f`). This workspace holds no TAD project
+tickets; it contained only Linear's four stock onboarding issues before the
+probe ran, and the probe touched none of them.
+
+**Demo readiness item found and closed.** The team had zero projects when the
+gate first ran. Enumeration succeeded and returned an empty list, which is not a
+Gate B failure, but the `project` enum T26 builds at startup would have had no
+members and the demo beat that moves an issue between projects would have been
+unrunnable. One project, `Trellis Demo`
+(`0ac3eb70-b897-4cf9-8675-1ac091e5902e`), was created on 2026-08-13 under
+explicit user authorization and left in place. Fact 4's project case was then
+confirmed against it. The probe now fails fact 2 with a named message if the
+demo team has no projects, so this cannot silently regress.
+
+**Observed proof:** `python -B backend/scripts/linear_probe.py` against team
+`TRE` printed `PASS` for all six facts and the closing line
+`ALL 6 LINEAR API FACTS CONFIRMED`. Every fact is reproduced in the T00B table
+above with the query or mutation that established it. The probe writes only to
+the demo team, archives every issue it creates, and never calls `issueDelete`.
+After the run the team held the same four onboarding issues it started with.
+
+**Symptom, if FAIL:** Not applicable. All three criteria passed.
+
+**Consequence if FAIL:** Linear is cut. The demo runs on the local board, the
+projection design goes in the README as the integration shape that was designed
+but not built, and T00L and T26 through T29 are never written. No workaround is
+attempted; Gate A had a designed fallback and this gate has one too.
 
 ---
 

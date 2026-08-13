@@ -1199,3 +1199,244 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  t00b-linear-contract:
+    name: T00B Linear contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # T00B's gate is specified to run ruff clean. Rather than duplicate the Lint
+    # job, which already runs `cd backend && ruff check .` on every pull request,
+    # this gate depends on it: T00B cannot report success unless Lint passed.
+    # Copying the ruff step in here would get cargo-culted into every later task
+    # gate and run the same check a dozen times per pull request.
+    needs: lint
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      # The offline half of T00B's verification only. The live half needs a
+      # secret and a network, produces the six facts in docs/DECISIONS.md, and is
+      # deliberately not automated here: adding a Linear API key to GitHub
+      # Actions is not in this task's scope.
+      - name: Verify the contract fixture parses and holds the depended-on subset
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+
+          with open("tests/fixtures/linear_contract.json", encoding="utf-8") as handle:
+              contract = json.load(handle)
+
+          problems = []
+
+          if contract.get("endpoint") != "https://api.linear.app/graphql":
+              problems.append(f"endpoint is {contract.get('endpoint')!r}")
+
+          required_types = {
+              "Issue", "IssueCreateInput", "IssueUpdateInput", "IssuePayload",
+              "IssueArchivePayload", "WorkflowState", "IssueLabel", "Project",
+              "Team", "User",
+          }
+          missing = sorted(required_types - set(contract.get("types", {})))
+          if missing:
+              problems.append(f"the fixture is missing types {missing}")
+
+          required_mutations = {"issueCreate", "issueUpdate", "issueArchive", "issueUnarchive"}
+          missing = sorted(required_mutations - set(contract.get("mutations", {})))
+          if missing:
+              problems.append(f"the fixture is missing mutations {missing}")
+
+          # issueDelete must never be frozen in, because nothing in this build may
+          # call it. D-25 maps the destructive path to archive so that undo works.
+          if "issueDelete" in contract.get("mutations", {}):
+              problems.append("issueDelete is in the fixture; this build must never call it")
+
+          for name, entry in contract.get("types", {}).items():
+              if not entry.get("fields"):
+                  problems.append(f"{name} records no fields")
+              if entry.get("kind") not in {"OBJECT", "INPUT_OBJECT"}:
+                  problems.append(f"{name} has kind {entry.get('kind')!r}")
+
+          # The fields the tool layer and the projector actually set.
+          for field in ("stateId", "priority", "dueDate", "assigneeId", "labelIds", "projectId"):
+              if field not in contract["types"]["IssueUpdateInput"]["fields"]:
+                  problems.append(f"IssueUpdateInput does not record {field}")
+          if "id" not in contract["types"]["IssueCreateInput"]["fields"]:
+              problems.append("IssueCreateInput does not record the client-supplied id")
+
+          if problems:
+              raise SystemExit("the contract fixture is not usable:\n" + "\n".join(problems))
+          print(
+              f"PASS the fixture parses: {len(contract['types'])} types, "
+              f"{len(contract['mutations'])} mutations, issueDelete absent"
+          )
+          PY
+
+      # D-32. `network` is what excludes this file, not `contract` and not `eval`.
+      # The collected count is asserted as well as the absence, because a suite
+      # that collected nothing at all would also contain no contract tests.
+      - name: Verify the contract test is excluded from the default suite
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          collected="$(python -m pytest --strict-markers -m "not network" --collect-only -q 2>&1 || true)"
+          if printf '%s' "$collected" | grep -q "test_contract"; then
+            printf '%s\n' "$collected"
+            echo "FAIL: the default suite collected test_contract.py, which needs a network and a key"
+            exit 1
+          fi
+          if ! printf '%s' "$collected" | grep -qE "[0-9]+ tests collected"; then
+            printf '%s\n' "$collected"
+            echo "FAIL: the default suite collected nothing, so the exclusion above proves nothing"
+            exit 1
+          fi
+          selected="$(python -m pytest --strict-markers -m contract --collect-only -q 2>&1 || true)"
+          if ! printf '%s' "$selected" | grep -q "test_contract"; then
+            printf '%s\n' "$selected"
+            echo "FAIL: pytest -m contract did not collect test_contract.py, so the marker is wrong"
+            exit 1
+          fi
+          echo "PASS the contract test is deselected by not-network and selected by contract"
+
+      - name: Verify FakeTracker satisfies the surface it claims
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+
+          sys.path.insert(0, "tests")
+
+          from fakes import FakeTracker, TrackerConflict, TrackerNotFound
+
+          problems = []
+
+          def check(condition, message):
+              if not condition:
+                  problems.append(message)
+
+          tracker = FakeTracker(
+              team_key="TRE",
+              names={
+                  "states": {"Todo": "s-todo", "In Progress": "s-doing", "Done": "s-done"},
+                  "labels": {"Bug": "l-bug", "Feature": "l-feature"},
+                  "projects": {"Trellis Demo": "p-demo"},
+                  "members": {"Nic": "u-nic"},
+              },
+          )
+
+          check(tracker.resolve("states", "In Progress") == "s-doing", "resolve returned the wrong id")
+          check(tracker.members("states") == ["Done", "In Progress", "Todo"], "members are not sorted")
+          for collection, name in (("states", "Nope"), ("nope", "Todo")):
+              try:
+                  tracker.resolve(collection, name)
+              except TrackerNotFound:
+                  pass
+              else:
+                  problems.append(f"resolve({collection!r}, {name!r}) did not raise")
+
+          created = tracker.create_issue("issue-1", "First", "2026-08-13T10:00:00Z", state="Todo")
+          check(created.id == "issue-1", "create did not honour the client-supplied id")
+          check(created.archived_at is None, "a new issue is archived")
+
+          # T00B fact 6: a replay is a conflict, not a replay.
+          try:
+              tracker.create_issue("issue-1", "Replay", "2026-08-13T10:00:01Z")
+          except TrackerConflict:
+              pass
+          else:
+              problems.append("creating twice under one id did not raise TrackerConflict")
+
+          for method, args in (
+              (tracker.create_issue, ("issue-x", "X", "2026-08-13T10:00:00Z")),
+              (tracker.update_issue, ("issue-1", "2026-08-13T10:00:02Z")),
+          ):
+              try:
+                  method(*args, blocked_by="issue-2")
+              except ValueError:
+                  pass
+              else:
+                  problems.append(f"{method.__name__} accepted an unmapped field")
+
+          # Fact 4: updated_at moves for every mapped field.
+          previous = created.updated_at
+          for index, (field_name, value) in enumerate(
+              [
+                  ("title", "Renamed"),
+                  ("description", "notes"),
+                  ("state", "In Progress"),
+                  ("priority", 2),
+                  ("due_date", "2026-08-20"),
+                  ("assignee", "Nic"),
+                  ("project", "Trellis Demo"),
+                  ("labels", ["Bug"]),
+              ],
+              start=3,
+          ):
+              stamp = f"2026-08-13T10:00:{index:02d}Z"
+              updated = tracker.update_issue("issue-1", stamp, **{field_name: value})
+              check(updated.updated_at == stamp, f"updating {field_name} did not move updated_at")
+              check(updated.updated_at != previous, f"updating {field_name} left updated_at alone")
+              previous = updated.updated_at
+          check(tracker.get_issue("issue-1").labels == ("Bug",), "labels were not replaced as a tuple")
+
+          # D-28: no mapped field changed, so nothing is sent.
+          unchanged = tracker.update_issue("issue-1", "2026-08-13T10:59:59Z")
+          check(unchanged.updated_at == previous, "an empty update moved updated_at")
+
+          # The counterintuitive one: archiving does not move updated_at.
+          before_archive = tracker.get_issue("issue-1").updated_at
+          archived = tracker.archive_issue("issue-1", "2026-08-13T11:00:00Z")
+          check(archived.archived_at == "2026-08-13T11:00:00Z", "archive did not set archived_at")
+          check(
+              archived.updated_at == before_archive,
+              "archive moved updated_at, which the real API does not do",
+          )
+
+          tracker.create_issue("issue-2", "Second", "2026-08-13T12:00:00Z")
+          default = [issue.id for issue in tracker.issues_changed_since("2026-08-13T00:00:00Z")]
+          included = [
+              issue.id
+              for issue in tracker.issues_changed_since("2026-08-13T00:00:00Z", include_archived=True)
+          ]
+          check(default == ["issue-2"], f"default listing returned {default}, expected only issue-2")
+          check(sorted(included) == ["issue-1", "issue-2"], f"include_archived returned {included}")
+
+          later = [issue.id for issue in tracker.issues_changed_since("2026-08-13T12:00:00Z")]
+          check(later == [], f"since filter returned {later} for its own timestamp")
+
+          restored = tracker.unarchive_issue("issue-1", "2026-08-13T13:00:00Z")
+          check(restored.archived_at is None, "unarchive did not clear archived_at")
+          check(restored.title == "Renamed", "unarchive lost the title")
+          check(restored.priority == 2, "unarchive lost the priority")
+          check(restored.labels == ("Bug",), "unarchive lost the labels")
+          back = [issue.id for issue in tracker.issues_changed_since("2026-08-13T00:00:00Z")]
+          check(sorted(back) == ["issue-1", "issue-2"], f"unarchived issue did not rejoin: {back}")
+
+          for method in (tracker.archive_issue, tracker.unarchive_issue):
+              try:
+                  method("nope", "2026-08-13T14:00:00Z")
+              except TrackerNotFound:
+                  pass
+              else:
+                  problems.append(f"{method.__name__} accepted an unknown id")
+
+          if problems:
+              raise SystemExit("FakeTracker does not satisfy its surface:\n" + "\n".join(problems))
+          print("PASS FakeTracker: resolution, create conflict, per-field updated_at, archive leaves")
+          print("     updated_at alone, archived excluded by default, unarchive restores intact")
+          PY

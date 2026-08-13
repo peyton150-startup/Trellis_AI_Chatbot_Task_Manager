@@ -900,6 +900,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T04 | KERNEL errors and policy | **OPUS ONLY** | `errors.py`, `policy.py` | 6 of 13 invariant tests pass |
 | T05 | KERNEL idempotency | **OPUS ONLY** | `idempotency.py` | 3 more invariant tests pass, including lease theft |
 | T06 | Domain services and events | SOL WRITES, OPUS REVIEWS | `domain.py` | Round-trip create, update, read events. Opus checks the transaction boundary. |
+| T00B | Gate B: Linear API probe | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, this table row, `CLAUDE.md` sources-of-truth line | Six facts recorded in `docs/DECISIONS.md`, fixture written, GATE B PASS or FAIL. Runs after T06 and before T07; see section 8 of `docs/LINEAR_INTEGRATION.md` for why. |
 | T07 | KERNEL undo | **OPUS ONLY** | `undo.py` | `test_stale_undo_refused` passes |
 | T08 | Runs and wire contract | **OPUS ONLY** | `runs.py`, `main.py` | 12 of 13 pass; the AG-UI history test unblocks at T12A |
 | T09 | Seed and reset | SOL | `seed.py` | `POST /api/demo/reset` returns 11 tasks |

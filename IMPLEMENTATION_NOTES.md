@@ -267,3 +267,91 @@ change is documentation with no code, no CI gate, and no behavioural effect; the
 waiver is recorded in the pull request. This entry exists because CLAUDE.md names
 `IMPLEMENTATION_NOTES.md` a required companion file, even though this pull
 request is not a numbered task.
+
+## T00B: Gate B, the Linear API probe and contract fixture
+
+**Local role:** Establishes, against the live Linear GraphQL API, the six facts
+that the Linear-facing tasks are built on, and freezes the subset of Linear's
+schema this build depends on so a change to it fails as a named test rather than
+as a confusing runtime error. It adds no application code and touches no kernel
+file. Four artifacts: `backend/scripts/linear_probe.py`, which confirms the six
+facts and writes only to the demo team; `backend/tests/fixtures/linear_contract.json`,
+the frozen subset; `backend/tests/test_contract.py`, a marked drift test that
+introspects the live endpoint and compares; and `backend/tests/fakes.py`, the
+offline `FakeTracker` the later Linear tasks test against.
+
+**Whole-system role:** The demo runs on Linear, but the write path does not, and
+this task is what makes that claim safe to build on. BUILD_SPEC section 7 puts
+the domain mutation, its `task_events` rows, and `idempotency.complete` in one
+Postgres transaction, and a Linear GraphQL call cannot join it. Calling Linear
+from inside a tool body would leave a window where Linear had mutated and the
+lease was still `pending`, and lease stealing would then re-execute work that had
+already landed externally, falsifying the exactly-once claim in exactly the
+scenario the 8:00 demo moment dramatizes. So Postgres stays authoritative and
+Linear is an asynchronously projected surface, per D-24, and nothing here moves
+where the write path terminates.
+
+Four downstream tasks consume these facts. **T00L** takes the workspace object
+shapes and the divergence semantics into `migrations/002_linear.sql`, the
+`EXTERNAL_DIVERGENCE` code, and the `policy.check` divergence step. **T26** builds
+tool argument enums at startup from fact 2's enumeration and resolves name to id
+using fact 2's uniqueness result. **T27** delivers mutations using fact 3's input
+shapes and must handle fact 6's finding that a replayed create conflicts rather
+than replaying. **T28** polls with fact 4's filter, cursor, and archived
+exclusion. T07 also gains its `EXTERNALLY_MODIFIED` precheck from the same
+design. If Gate B had failed, none of those would have been written.
+
+**Inputs and dependencies:** `docs/LINEAR_INTEGRATION.md` at revision 01, which
+landed separately as PR #10 and is the authoritative specification for this task
+and the four that follow. D-24 through D-29 are the Linear decisions; D-02, D-09,
+D-12, D-14, D-19, and D-22 constrain what this task may do. A personal Linear API
+key and a demo team separate from the one holding the TAD tickets, read from the
+environment as `LINEAR_API_KEY` and `LINEAR_TEAM_KEY`; `backend/app/config.py` is
+deliberately out of scope, and wiring Linear settings there belongs to T26. The
+test marker taxonomy and the lint contract from D-32 and D-34, which landed on
+the clarification branch because resolving them required files outside this
+task's list.
+
+**Outputs and consumers:** The six-fact table and the `GATE B: PASS` block in
+`docs/DECISIONS.md`, which are the durable record and the reason rerunning the
+probe is unnecessary. The contract fixture, consumed by `test_contract.py` now
+and by T26 and T27 as the reference for what Linear's shapes are. `FakeTracker`,
+consumed by T26 through T29 so their tests run offline. Two findings that change
+downstream work: a replayed `issueCreate` under the same client-supplied id is
+rejected as a uniqueness conflict rather than returning the original issue, so
+T27 must read that error as evidence the create already landed instead of
+recording a delivered create as failed; and archiving does not move `updatedAt`,
+so T28 cannot detect an external archival from the fact 4 query alone.
+
+**Verification:** The live half is `python -B backend/scripts/linear_probe.py`
+against team `TRE`, which prints `PASS` for each of the six facts and
+`ALL 6 LINEAR API FACTS CONFIRMED`, exit 0. It writes only to the demo team,
+archives every issue it creates in a `finally`, and never calls `issueDelete`.
+The offline half is the `T00B Linear contract` CI gate, which proves three
+things: the fixture parses and holds the depended-on subset with `issueDelete`
+absent; `pytest -m "not network"` does not collect `test_contract.py` while
+`pytest -m contract` does, asserting the collected count as well as the absence
+so an empty suite cannot pass by accident; and `FakeTracker` satisfies its
+surface, including the three counterintuitive behaviours it exists to encode.
+The gate declares `needs: lint` rather than repeating `ruff check`, so it cannot
+report success unless the lint contract passed. Locally,
+`pytest -m contract` passes 13 tests against the live API with 36 deselected, and
+`cd backend && ruff check .` exits 0.
+
+**Limitations and review status:** The live half is not automated in CI, because
+it needs a secret and a network and adding a Linear API key to GitHub Actions is
+out of scope; the recorded facts are therefore point-in-time against an
+unversioned endpoint, which is precisely why the drift test exists. The archived
+recovery boundary in fact 3 is unestablished rather than assumed: the probe never
+approached one, and D-25 forbids inventing a fallback until the behaviour is
+confirmed. The demo team had zero projects when the gate first ran, which is not
+a Gate B failure since enumeration succeeded, but would have left T26's `project`
+enum with no members; one project was created under explicit user authorization
+and the probe now fails fact 2 with a named message if none exists. `FakeTracker`
+is a test double, not a provider abstraction: there is one external system and it
+is Linear, `linear.py` is a client rather than an interface with one
+implementation, and nothing here is designed so that Jira could be dropped in.
+The probe creates one throwaway issue per state-sensitive fact rather than the
+single issue originally authorized, because sharing one would couple the checks;
+that is recorded as D-33. The blind Sonnet review that CLAUDE.md requires for
+Opus-produced pull requests is outstanding and is the next step.
