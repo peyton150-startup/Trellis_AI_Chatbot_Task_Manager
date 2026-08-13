@@ -173,6 +173,23 @@ Effort in days. Solo project, so nearly everything is serial and the critical pa
 | AA | Rehearsal, five passes | 0.50 | Y | 0 |
 | AB | Model bakeoff, 10 prompts | 0.25 | T | 0.50 |
 | AC | Surprise-change drill | 0.25 | W | 0.25 |
+| AD | Linear integration expansion: T00B, T00L, T26 through T29 | 1.50 | see sequence below | 0 |
+
+**AD is one priced activity, not six.** The 1.50 figure is the aggregate already
+recorded in `docs/LINEAR_INTEGRATION.md`, and no per-task estimate was ever
+recorded. Splitting it into six equal quarters would put a convenient division
+into the plan and claim a precision nobody measured, so it is not done here. The
+internal sequence and its dependencies are authoritative in
+`docs/LINEAR_INTEGRATION.md` section 8: T00B and T00L before T07, T26 after T08,
+and T27 through T29 after T21 targeting end of day five. T27 and T28 carry the
+highest overrun risk, T27 for the projector ordering, serialization, retry, and
+atomic writeback, and T28 for reconciliation and divergence detection. T00B is
+delivered, so 0.25 of the 1.50 is already spent.
+
+The `EXTERNALLY_MODIFIED` precheck that Linear adds to `undo.py` is incremental
+scope inside activity O, not a separate activity. It carries no additional
+scheduled effort and a real increase in kernel blast radius, which D-36 records
+and answers with a focused review of the delta rather than a schedule change.
 
 **Delivery spine.** The formal forward and backward pass is not worth running on a solo seven-day build, and an earlier version of this line stated a path that did not match its own dependency table. What matters is the order that cannot be resequenced:
 
@@ -196,7 +213,22 @@ Everything not on that spine has slack and appears in the cut order below.
 
 Undo is deliberately **not** on the spine. It is a should-have deliverable, and an earlier version of this plan had it gating the ugly demo bar, which was an inconsistency: a should-have was blocking a must-have. Day 3 now reaches a working agent through approval, reject, and clarification, and undo lands after that gate. If Day 3 goes badly you still finish the day with a working agent.
 
-**Total estimated effort: 11.0 days across 7 calendar days.**
+**Total estimated effort: 12.5 days across 7 calendar days.** That is 11.0 as
+originally estimated, plus the 1.50 day Linear expansion in activity AD, less
+0.0 because none of the expansion was funded by reducing an existing activity.
+
+The ledger behind that number is D-36, and its shape matters more than the
+total. Of the 1.50 days, about 0.42 has quantified funding from cuts actually
+taken, 0.25 is already delivered as T00B, and about 0.83 remains as unoffset
+future schedule pressure accepted under R5. The Linear specification originally
+named STRETCH items and the external OTel viewer as its funding, and both credit
+zero against this table: no STRETCH activity was ever in the baseline, and
+activity U budgets instrumentation that the viewer cut keeps.
+
+Read 12.5 as "11.0 as recorded, plus Linear," not as a complete current
+estimate. T00R merged without ever appearing in this table, and the marker and
+lint work in D-32 through D-34 was never priced either, so the 11.0 baseline is
+itself understated by an unmeasured amount.
 
 That is the most important number in this plan and it should not be softened. At an ordinary pace the scope does not fit. It is plausible only at the throughput demonstrated on Datum, where an agent did the bulk implementation while review stayed human. The margin is thin, which is why the cut order is pre-agreed rather than negotiated on Day 5, and why the STRETCH list is empty of anything the demo needs.
 
@@ -251,6 +283,10 @@ Referenced throughout this plan and now stated once, here, so the evening contro
 - Rehearsal
 
 Cutting item 6 costs a demo beat, so it is last. Cutting item 3 shortens the human-control beat to approve and reject, which still stands on its own.
+
+**Already taken, on 2026-08-13, to fund the Linear expansion:** items 1, 2, 4, and 5. The ledger and the credit each one actually earns are in D-36; items 1 and 5 credit zero and are recorded as scope reductions rather than schedule savings. Item 3, undo, is deliberately not cut and would be incoherent to cut, because the Linear expansion adds kernel logic to `undo.py`.
+
+**Linear-specific contingency.** If schedule pressure requires another reduction after T15 is green, T28, the reconciler, is cut before anything on the never-cut list and before any further reduction of the core demo. The reconciliation and divergence design stays documented as designed but not built. This is defensible because Linear is a projected surface and never the authority, so the outbound projection path stands without it. No schedule credit is claimed for this in advance, because the 1.50 day figure is an aggregate and T28 has no recorded individual estimate. The credit is recorded when T28 is estimated or cut, not before.
 
 ### Compression options if Day 2 slips
 
