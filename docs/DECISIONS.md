@@ -237,7 +237,11 @@ Ten prompts, both candidates, scored on correct tool behavior, clarification whe
 
 | Day | Cut | Position in cut order | Reason |
 |---|---|---|---|
-| | | | |
+| 2026-08-13 | Resume affordance and orphan sweep, activity S | 2 | Funds part of the Linear expansion. Credits 0.25d. See D-36. |
+| 2026-08-13 | Behavioral evals, fifteen cases to ten, activity X | 4 | Funds part of the Linear expansion. Credits ~0.17d, being a one third reduction of a 0.50d activity. See D-36. |
+| 2026-08-13 | Model bakeoff, ten prompts to five, activity AB | 5 | Taken as scope reduction, credited at 0.00d. Halving prompts does not halve setup, scoring, and write-up. See D-36. |
+| 2026-08-13 | External OTel trace viewer | 1 | Named as Linear funding by `docs/LINEAR_INTEGRATION.md`, credited at 0.00d. Activity U budgets instrumentation, which the cut keeps. See D-36. |
+| 2026-08-13 | STRETCH items | not in the cut order | Named as Linear funding by `docs/LINEAR_INTEGRATION.md`, credited at 0.00d. No STRETCH activity exists in the 11.0d baseline. See D-36. |
 
 ---
 
@@ -1064,3 +1068,102 @@ Remaining review budget is spent in this order:
 review budget. Once the T15 ugly-demo smoke path is green, finishing, testing,
 reproducibility, and rehearsal take priority over deeper review. The complete
 task-by-task treatment is authoritative in BUILD_SPEC section 1A.
+---
+
+## Linear schedule ledger recorded at T06
+
+### D-36: the Linear expansion is priced at 1.50d, of which about 0.4d has quantified funding
+
+D-31 requires that anything adding a task to section 12, or editing a KERNEL
+file, carry an explicit re-plan against `docs/PROJECT_PLAN.md` and a decision
+naming what was cut to pay for it. The Linear expansion trips both halves. It
+adds six tasks (T00B, T00L, T26 through T29) and edits KERNEL `undo.py` for the
+`EXTERNALLY_MODIFIED` precheck. This decision closes that requirement.
+
+**The cost is not a new estimate.** `docs/LINEAR_INTEGRATION.md` already records
+it: "Estimated cost for T00B, T00L, and T26 through T29 together: about a day
+and a half." That aggregate stands. No implementation evidence contradicts it,
+so this decision adopts 1.50d rather than substituting a fresh guess.
+
+**The original funding plan named two sources that credit nothing.** The same
+passage continues: "Paid for from the STRETCH items first, then cut order item
+1, the external OTel viewer, keeping the instrumentation. If more is needed,
+evals drop from fifteen cases to ten and the bakeoff from ten prompts to five."
+Audited against the step 3 activity table:
+
+| Named source | Credit | Why |
+|---|---|---|
+| STRETCH items | **0.00d** | STRETCH is a change-control bucket for ideas arriving after Day 2, which stay there per R6. No STRETCH activity appears in the 11.0d baseline. Cancelling work that was never scheduled frees no scheduled effort. |
+| Cut order 1, external OTel viewer | **0.00d** | Activity U budgets 0.25d for OTel *instrumentation*, and the cut explicitly keeps the instrumentation and drops only the viewer. No viewer effort is identifiable anywhere in the activity table, so there is nothing to credit. |
+| Cut order 2, resume and orphan sweep | **0.25d** | Activity S, removed in full. |
+| Evals fifteen cases to ten | **~0.17d** | Activity X is 0.50d for fifteen cases. Ten cases is a one third reduction, not a half. Straight line, 0.33d remains. |
+| Bakeoff ten prompts to five | **0.00d** | Recorded as taken, credited at zero. Halving the prompt count does not halve setup, scoring, and write-up, and no defensible decomposition of activity AB's 0.25d exists. |
+
+Quantified payment is therefore about **0.42d**, written as ~0.4d, against a
+1.50d expansion. The expansion was approved against a funding line whose first
+two tranches were worth nothing, which is the finding this decision exists to
+record. Neither tranche was dishonest; neither was priced.
+
+**The ledger, reconciled.**
+
+```
+Original PROJECT_PLAN effort                 11.00d
+Recorded Linear expansion                    +1.50d
+                                             ------
+Revised gross plan                           12.50d
+
+T00B already delivered                       -0.25d
+                                             ------
+Remaining gross Linear work                   1.25d
+
+Quantified schedule cuts                     -0.42d
+                                             ------
+Remaining unoffset schedule pressure         ~0.83d
+```
+
+The full funding gap is ~1.08d (1.50 minus 0.42). Of that, 0.25d has already
+been spent on T00B, leaving ~0.83d as future pressure. The residual is accepted
+as buffer exposure under R5, estimate overruns, whose stated mitigation is the
+pre-agreed cut order applied without renegotiation on the evening a slip
+appears. No further cut is manufactured here to make the arithmetic balance.
+
+**D-35 is deliberately not credited.** Review compression saves model review
+budget, not implementation effort. No activity in the step 3 table is review,
+and PROJECT_PLAN's 11.0d is plausible only on the assumption that review stays
+human and outside the estimate. Booking D-35 against this debt would change no
+number in the ledger while making it appear balanced.
+
+**No per-task allocation is recorded.** The 1.50d is authoritative only as an
+aggregate. Dividing it into six equal quarters would launder a convenient split
+into the plan and is not done. T27 and T28 carry the highest overrun risk, T27
+for the projector ordering, serialization, retry, and atomic writeback, and T28
+for reconciliation and divergence detection.
+
+**T28 is the first Linear-specific contingency, without a manufactured savings
+figure.** If schedule pressure requires another Linear-specific reduction after
+T15 is green, T28 implementation is cut before anything on the never-cut list,
+and the reconciliation and divergence design remains documented in
+`docs/LINEAR_INTEGRATION.md` and the README as designed but not built. Cutting
+it is defensible because Linear is a projected surface and not the authority, so
+the outbound projection path stands on its own. A schedule credit is recorded
+only when T28 is actually estimated or cut. This decision does not derive a
+per-task fraction from the aggregate in order to claim relief it cannot size.
+
+**The T07 kernel exposure, which is not an effort number.** T00L and T07 add
+`EXTERNALLY_MODIFIED` logic to KERNEL `undo.py` at the same time that D-35 has
+compressed T07 review and ranked it fourth in the remaining review budget. Those
+two decisions were taken independently and compound. The effort ledger above
+does not change, because T07 already carries activity O at 0.50d and a few
+kernel lines cannot be priced honestly at another quarter day. The mitigation is
+a review exception rather than a schedule one: when T07 and T08 are reviewed
+together at the post-T08 checkpoint, the Linear-added kernel delta receives
+focused review even though the task as a whole does not.
+
+**Limitation: this audit covers Linear only.** T00R is a task that exists, has
+merged, and appears nowhere in the step 3 activity table, and the marker and
+lint work recorded as D-32 through D-34 was likewise never priced. The 11.0d
+baseline is therefore itself understated by an unmeasured amount, and 12.50d
+should be read as "11.0d as originally recorded, plus Linear," not as a complete
+current estimate. Pricing those is not attempted here. D-31 exists so that the
+next such addition is priced when it is proposed rather than reconstructed
+afterwards, which is what this decision had to do.
