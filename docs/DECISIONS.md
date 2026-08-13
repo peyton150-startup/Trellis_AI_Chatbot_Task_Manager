@@ -56,6 +56,45 @@ Confirmed on 2026-08-10 using Python 3.12.13, `pydantic-ai` 2.27.0,
 
 ---
 
+## API facts confirmed at T00B
+
+Confirmed on 2026-08-13 against `https://api.linear.app/graphql` using Python
+3.12.13 and `httpx` 0.28.1, with a personal API key and demo team `TRE` in
+workspace `trellis-app-proejct`.
+
+Unlike the T00 table there is no pinned dependency version to record here.
+Linear's GraphQL endpoint is unversioned and live, so the date and the observed
+shapes below are the whole provenance. That is precisely why `test_contract.py`
+freezes the subset this build depends on and fails when it drifts.
+
+| # | Fact | Confirmed value | Date |
+|---|---|---|---|
+| 1 | Authentication header format | Send the personal API key raw in `Authorization`, with no `Bearer` prefix. `Bearer <key>` is rejected with HTTP 400 and the message "It looks like you're trying to use an API key as a Bearer token. Remove the Bearer prefix from the Authorization header." Omitting the header returns HTTP 401 `AUTHENTICATION_ERROR`. | 2026-08-13 |
+| 2 | Workspace object resolution | Query one collection at a time: `teams(filter: { key: { eq: $key } }, first: 1) { nodes { id key name <collection>(first: 50) { nodes { id name ... } } } }`, where `<collection>` is `states`, `labels`, `members`, or `projects`. Requesting all four in one query costs complexity 13315 against a 10000 ceiling and is rejected, so T26 issues one query per collection. Team `TRE` returned 7 workflow states (`Backlog` backlog, `Todo` unstarted, `In Progress` started, `In Review` started, `Done` completed, `Canceled` canceled, `Duplicate` duplicate), 3 labels, 1 member, 1 project, each carrying a UUID. Names are unique within the team for all four collections, so name to id resolution needs no tiebreak. Labels resolve with `team: null` through `issueLabels`, meaning they are workspace scoped rather than team scoped; a workspace that also defines a team label of the same name could collide, which was not observed here. | 2026-08-13 |
+| 3 | Mutation shapes for create, update, archive, unarchive | `issueCreate(input: IssueCreateInput!)` and `issueUpdate(id: String!, input: IssueUpdateInput!)` both return `IssuePayload { lastSyncId: Float!, issue: Issue, success: Boolean! }`. `issueArchive(id: String!, trash: Boolean)` and `issueUnarchive(id: String!)` both return `IssueArchivePayload { lastSyncId: Float!, success: Boolean!, entity: Issue }`. Of the fields this build sets, `IssueCreateInput` carries `id: String` (client supplied and honoured), `teamId: String!`, `title: String`, `description: String`, `stateId: String`, `priority: Int`, `dueDate: TimelessDate`, `assigneeId: String`, `labelIds: [String!]`, and `projectId: String`; `IssueUpdateInput` carries the same set minus `id` and with `teamId: String` nullable. `dueDate` is a date with no time component. `labelIds` replaces the list rather than appending. `Issue.priority` reads back as `Float!` while the input is `Int`. `issueArchive` then `issueUnarchive` round-trips: `archivedAt` is set and then cleared, and title, workflow state, and priority all survive. `issueDelete(id, permanentlyDelete)` exists and this build never calls it. | 2026-08-13 |
+| 4 | Change detection | Poll with `issues(filter: { team: { key: { eq: $key } }, updatedAt: { gt: $since } }, first: N, orderBy: updatedAt)`, where `$since` is `DateTimeOrDuration!`. Pagination is `pageInfo { hasNextPage endCursor }` with an opaque cursor. `updatedAt` moved for every field this build sets, tested one field at a time: title, description, priority, dueDate, stateId, assigneeId, labelIds, and projectId. Clearing moves it too, measured separately because setting a field says nothing about clearing it: `labelIds: []` and `projectId: null` each emptied the field and bumped `updatedAt`. Those are the two clear shapes Linear honours, and T26 and T28 should use them. Both clear cases read the field back and confirmed it was genuinely empty before judging the timestamp, so a mutation that silently did nothing cannot be recorded as a field that fails to bump `updatedAt`. Archived issues are excluded from the default query and are returned only with `includeArchived: true`, which is what D-27 requires so a deleted task does not resurrect through the import path. After our own mutation `updatedAt` moves and the mutation's own response payload already carries the new value, with a read-back immediately afterwards agreeing; observed mutation round trips were 0.23 to 0.68 seconds. | 2026-08-13 |
+| 5 | Key scope and limits | The personal API key is user scoped, not team scoped. It resolves `viewer` and `organization` and enumerates `teams(first: 50)` with no team parameter anywhere in the request, so the demo team restriction is a policy check in our code and not an API guarantee. Say that out loud in the README rather than implying the key is scoped. Observed response headers were `x-ratelimit-requests-limit: 2500` and `x-ratelimit-complexity-limit: 3000000`, each with a `-remaining` and `-reset` companion. Per D-29 the numbers are an observation and not an architectural constant; the conclusion this build depends on is that they are comfortably above demo and rehearsal usage, which costs roughly 25 calls per reset. | 2026-08-13 |
+| 6 | Delivery deduplication | No. All 361 mutations were scanned and none carries an argument advertising idempotency, replay, or deduplication semantics. The only client-controlled identifier is `IssueCreateInput.id`, and replaying `issueCreate` with an id that already exists is rejected with HTTP 400 `INPUT_ERROR` and the message "Entity Issue with id `<uuid>` already exists" rather than returning the original issue. That is a uniqueness constraint and not a replay guarantee, so it does not count under D-25 and the local `UNIQUE(event_id)` constraint is the only deduplication layer, which D-25 states is sufficient. The consequence for T27 is that a retry after an ambiguous create receives an error rather than the issue, so the projector must treat that specific conflict as evidence the create already landed and recover the remote id by query, or it will record a delivered create as failed. | 2026-08-13 |
+
+Two things this table deliberately does not claim.
+
+**The archived recovery boundary is unestablished.** Fact 3 asked what happens
+when an archived issue is too old to recover. The probe archived and unarchived
+within seconds and never approached a boundary, and none was encountered. No
+value is recorded rather than a guessed one, because D-25 forbids inventing a
+fallback to create until the behaviour is confirmed. `restored` maps to
+`unarchive` unconditionally, and if a boundary is later found this row is where
+the correction goes.
+
+**Archiving does not move `updatedAt`.** Observed directly: an `issueArchive`
+left `updatedAt` unchanged. Archived issues leave the default poll instead of
+appearing as a modification, so a human archiving an issue in Linear is not
+detectable by the fact 4 query. T28 cannot use `updatedAt` alone to notice
+external archival, and a task whose issue vanishes from the poll is not the same
+signal as a task whose issue changed.
+
+---
+
 ## Gate A: AG-UI interrupt path (T00A, Day 1)
 
 **Result:** GATE A: PASS
@@ -126,6 +165,55 @@ Denial uses the same shape with `"approved": false`.
 **Symptom, if FAIL:** Not applicable. The native interrupt path passed.
 
 **Consequence if FAIL:** chat continues to stream over AG-UI; approvals move to `GET /api/runs/{id}` plus `POST /api/runs/{id}/approvals/{tool_call_id}`, with the approval card rendered from run state. T12B's seven proofs apply to the fallback unchanged.
+
+---
+
+## Gate B: Linear API (T00B)
+
+**Result:** GATE B: PASS
+
+**The three failure criteria, each checked directly.** Gate B fails if the demo
+team's workflow states, projects, labels, or members cannot be enumerated for
+enum construction; if `issueArchive` and `issueUnarchive` do not round-trip; or
+if issues changed by another actor cannot be detected by an `updatedAt` query.
+None of the three holds.
+
+Enumeration works for all four collections, one query per collection, and every
+name is unique within the team so resolution needs no tiebreak. Archive and
+unarchive round-trip with `archivedAt` set and then cleared and the issue's
+fields intact. An `updatedAt` filter detects a change to every field this build
+sets, including the label and project changes that fact 4 singled out as the
+most likely place for the design to fail.
+
+**Workspace the gate ran against:** organization `trellis-app-proejct`
+(`f798e328-66df-4eee-a99a-27bf8bcb3667`), team `TRE`
+(`49744eb7-0013-4b96-8e32-d4649e59642f`). This workspace holds no TAD project
+tickets; it contained only Linear's four stock onboarding issues before the
+probe ran, and the probe touched none of them.
+
+**Demo readiness item found and closed.** The team had zero projects when the
+gate first ran. Enumeration succeeded and returned an empty list, which is not a
+Gate B failure, but the `project` enum T26 builds at startup would have had no
+members and the demo beat that moves an issue between projects would have been
+unrunnable. One project, `Trellis Demo`
+(`0ac3eb70-b897-4cf9-8675-1ac091e5902e`), was created on 2026-08-13 under
+explicit user authorization and left in place. Fact 4's project case was then
+confirmed against it. The probe now fails fact 2 with a named message if the
+demo team has no projects, so this cannot silently regress.
+
+**Observed proof:** `python -B backend/scripts/linear_probe.py` against team
+`TRE` printed `PASS` for all six facts and the closing line
+`ALL 6 LINEAR API FACTS CONFIRMED`. Every fact is reproduced in the T00B table
+above with the query or mutation that established it. The probe writes only to
+the demo team, archives every issue it creates, and never calls `issueDelete`.
+After the run the team held the same four onboarding issues it started with.
+
+**Symptom, if FAIL:** Not applicable. All three criteria passed.
+
+**Consequence if FAIL:** Linear is cut. The demo runs on the local board, the
+projection design goes in the README as the integration shape that was designed
+but not built, and T00L and T26 through T29 are never written. No workaround is
+attempted; Gate A had a designed fallback and this gate has one too.
 
 ---
 
@@ -773,3 +861,192 @@ handing it back. That edit to Sol-owned files is a T06-only routing exception.
 Sol read the applied code against this decision and the build contracts,
 reproduced the extended PostgreSQL gate, and accepted ownership of the result.
 The exception does not change the routing of any later task.
+---
+
+## Spec clarifications recorded at T06
+
+D-24 through D-29 are reserved by `docs/LINEAR_INTEGRATION.md` section 3 and are
+not yet appended to this file. The next free number after that reserved block is
+D-30, and this decision takes it. Do not reuse a reserved number.
+
+### D-30: T22 uses Pydantic AI's own instrumentation, and the working API is version-specific
+
+T22 asks for spans on model and tool operations. Pydantic AI emits them already,
+so `telemetry.py` configures a tracer provider and turns instrumentation on. It
+does not wrap model calls or tool bodies. Hand instrumentation would duplicate
+the framework spans and would put telemetry code inside the five-step tool body
+that section 10 specifies, which is the one place in the build where an extra
+line is expensive.
+
+Confirmed on 2026-08-13 against the pinned `pydantic-ai` 2.27.0, by running an
+agent with an in-memory span exporter and reading the finished spans.
+
+| # | Fact | Confirmed value |
+|---|---|---|
+| 1 | How instrumentation is enabled | `Agent.instrument_all(InstrumentationSettings(tracer_provider=...))`, imported from `pydantic_ai`. `Agent(instrument=...)` is not a constructor argument in this version and raises `TypeError`. |
+| 2 | Spans emitted by one tool-calling turn | `invoke_agent`, one `chat` per model request, and `execute_tool <name>` per tool call, carrying `gen_ai.operation.name` values of `invoke_agent`, `chat`, and `execute_tool`, and `gen_ai.tool.name` on the tool span. |
+| 3 | Span counts | A single tool-calling turn emits **two** `chat` spans, one before the tool call and one after. `tests/test_telemetry.py` therefore asserts at least one span of each class and never an exact total. |
+| 4 | Packages | `opentelemetry-api` is a hard dependency of `pydantic-ai-slim` at `>=1.28.0`. `opentelemetry-sdk` is not a declared dependency and is present today only transitively, through the `logfire` extra that `pydantic-ai` pulls in. `telemetry.py` imports the SDK directly, so T22 pins `opentelemetry-sdk==1.44.0` in `backend/requirements.txt` per D-14. |
+
+Recorded because the obvious spelling fails. A model writing `telemetry.py` from
+memory reaches for the constructor argument first, and against this pin that
+raises a `TypeError` which reads like a typo rather than a version difference.
+The cost of finding this at T22 is an hour of the wrong kind of debugging; the
+cost of reading it here is a minute.
+
+### D-31: new tasks and kernel edits are gated on an explicit re-plan
+
+Rule 0.2 previously banned a list of implementation categories: ORMs, caching,
+message queues, background workers, auth, migration frameworks, state management
+libraries. The list is still correct and still binding, but it turned out to be
+the wrong shape for the question that actually arrives, which is whether some
+proposed addition counts as one of the banned categories at all. That question is
+arguable, and arguing it is not work.
+
+Rule 0.2 now carries a second gate that does not depend on categories. Anything
+that adds a task to section 12, and anything that edits a KERNEL file, requires
+an explicit re-plan against `docs/PROJECT_PLAN.md` and a decision here naming
+what was cut to pay for it. Everything else that is not already in
+`docs/BUILD_SPEC.md` waits until after T15 is green and goes to
+`docs/OPEN_QUESTIONS.md`.
+
+The gate is deliberately indifferent to whether an addition is hosted or
+self-run, and to whether it is infrastructure or a product integration behind the
+tool and policy boundary. Those distinctions do not predict cost. Task count and
+kernel reach do.
+
+This is recorded rather than left implicit because the Linear integration in
+`docs/LINEAR_INTEGRATION.md` is exactly the shape the gate is meant to catch: it
+adds six tasks (T00B, T00L, T26 through T29), two of them OPUS ONLY, it
+introduces a background projector worker draining an outbox table, and it edits
+KERNEL `undo.py` to add the `EXTERNALLY_MODIFIED` precheck. Two of those, the
+worker and the outbox, are named in the first sentence of rule 0.2. The
+integration may still be the right call, and this decision does not reverse it.
+What it does is require that the schedule cost be stated and paid rather than
+absorbed, and the payment is still outstanding.
+
+---
+
+## Spec corrections recorded at T00B
+
+Recorded on 2026-08-13 after T00B stopped at three contradictions between the
+specification and the repository. Each was measured against `954bd83` rather
+than reasoned about. No decision above is amended. These close Q-05, Q-06, and
+Q-07 in `docs/OPEN_QUESTIONS.md`.
+
+### D-32: taxonomy and execution are separate test markers, and only execution gates CI
+
+Three markers, registered in `backend/pyproject.toml`. `eval` and `contract`
+describe what a test is. `network` describes what it requires. Only `network`
+decides what the default suite collects.
+
+```
+tests/test_contract.py    @pytest.mark.contract  @pytest.mark.network
+tests/test_evals.py       @pytest.mark.eval      @pytest.mark.network
+```
+
+Default CI becomes `pytest -m "not network"`. The on-demand suites are
+`pytest -m eval` and `pytest -m contract`, neither carrying an exclusion clause.
+
+The problem this closes is that no pytest configuration existed and no `eval`
+marker was registered, while the T00B gate had to prove that
+`pytest -m "not eval"` did not collect a network-dependent contract test. Any
+marker other than `eval` left it collected; marking it `eval` would have
+classified a provider contract test as a behavioral evaluation, and would then
+have pulled a network test into the behavioral suite at T24 the first time
+anyone ran `pytest -m eval`. Two candidate designs were tried and each produced
+a different latent T24 failure, which is why this decision fixes the marker
+assignment for every known external suite now rather than leaving it to the task
+that writes each one.
+
+`network` is named for a property of the test rather than for today's policy. A
+name like `nonci` would encode the current CI arrangement into the test and stop
+being true the moment external tests are run deliberately in a protected job.
+
+The correction is not a search and replace of the CI command. Every statement
+equating `eval` with CI exclusion had to move, including the `test_evals.py`
+heading in BUILD_SPEC section 11, or a later reader would conclude that marking
+a test `eval` keeps it out of CI and ship a network test the default gate
+collects.
+
+`backend/pyproject.toml` was created rather than a new `pytest.ini`, because
+BUILD_SPEC section 3 has specified that file since the tree was written and it
+had simply never been created. It carries tool configuration only, with no
+`[build-system]` and no `[project]` table, so it does not make `backend` an
+installable distribution and does not resolve Q-04.
+
+### D-33: the probe creates one throwaway issue per state-sensitive fact
+
+The rule is a property, not a count:
+
+> Each fact that requires uncontaminated initial state creates its own throwaway
+> issue and archives it in a `finally`. Pre-existing workspace issues are never
+> modified.
+
+The T00B prompt authorized "a single throwaway issue". Three are required and
+sharing one would couple the checks. Fact 3 ends with its issue archived, so
+fact 4 would have to unarchive it before running, contaminating the
+archived-exclusion check that fact 4 exists to make. Fact 6 must create an issue
+under a client-supplied id that has never been used, so it cannot reuse one at
+all.
+
+The property is recorded instead of the number because "up to three" would be an
+artifact of today's probe and would break the moment a further state-sensitive
+fact is added, which is the same defect as the original "a single throwaway
+issue".
+
+### D-34: the lint contract is a pinned version, a pinned rule set, and a pinned surface
+
+BUILD_SPEC section 11 has claimed since it was written that CI runs
+`ruff check`. Nothing did. Ruff was absent from `backend/requirements.txt`, no
+repository-owned ruff configuration existed, and ruff 0.16.3 reported 14
+violations under `backend/` on master, every one of them in a file T00B is
+forbidden to touch and two of them in KERNEL files. A gate requiring ruff clean
+over a surface the task may not repair is not satisfiable at any version pin.
+
+All three halves are required:
+
+```
+tool      ruff==0.16.3 in backend/requirements.txt
+policy    select = ["E4", "E7", "E9", "F"] in backend/pyproject.toml
+surface   cd backend && ruff check .
+```
+
+Ruff goes in the single backend pin source because D-14's *mechanism* forbids
+inline pin lists for backend jobs. D-14's stated rationale, about the probe
+proving API facts for versions the application does not install, does not reach
+a linter, and no `requirements-dev.txt` is introduced: this repository
+deliberately established one backend pin source and a second one would reopen
+D-14 for no benefit here.
+
+The rule set is pinned because a version pin alone does not define a contract.
+Ruff resolves configuration by directory hierarchy and can fall back to a
+user-level configuration before its own defaults, so an unconfigured repository
+may enforce a different policy on every machine. Ruff's defaults also widen
+between releases: 0.16.3 enables `I`, `UP`, `BLE`, `FURB`, `RUF`, and `SIM`,
+well beyond the `E4, E7, E9, F` it defaulted to for years.
+
+The surface is pinned because ruff's configuration discovery is
+directory-relative. A bare `ruff check` from the repository root would lint the
+disposable `spike/` tree, which holds 3 of the 22 repository-wide violations and
+is deleted before T12A, and would let throwaway code block a gate.
+
+The selected set is the defect tier rather than the style tier, and `master`
+passes it at exit 0. That is validation, not the reason for the choice; had the
+set needed contorting to fit master, the honest answer would have been to scope
+the gate to T00B-owned files instead. Two naive alternatives were measured and
+are worse: `select = ["E", "F"]` yields 51 `E501` line-too-long violations,
+because ruff's default selects only `E4, E7, E9` and thereby omits `E501`, and
+`["E", "F", "I"]` yields 59.
+
+The 14 baseline findings are deferred lint-adoption debt owned by a future task,
+not violations of this contract and not something to silence. Findings from
+ruff's broader default set are outside the contract and must not become an
+unwritten second gate. T00B voluntarily clears the five in `linear_probe.py` as
+hygiene, and that choice is not a requirement on anything else.
+
+Cleaning all 14 first was considered and rejected on schedule: it adds a task to
+section 12 and edits two KERNEL files for lint, which trips both halves of the
+D-31 gate and would require a named cut while the Linear expansion is already
+unpaid. Option B touches neither `policy.py` nor `idempotency.py`, so it needs
+no re-plan.

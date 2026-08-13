@@ -20,4 +20,5 @@ pydantic-ai-slim[ag-ui]==2.27.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
 python-dotenv==1.2.2
+ruff==0.16.3
 uvicorn[standard]==0.52.1

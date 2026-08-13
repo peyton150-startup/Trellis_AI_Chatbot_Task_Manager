@@ -51,7 +51,7 @@ Construction quality is capped by what came before it, so before scheduling anyt
 | D4 | Idempotency | Repeated tool call with same key and same argument hash returns the stored result and commits exactly one mutation. Domain mutation, audit event, and completed invocation result commit atomically in one transaction. An abandoned `pending` lease has defined behaviour: it expires after `LEASE_TTL_SECONDS` and is stolen once, which is safe because a `pending` row means the transaction never committed. |
 | D5 | Undo | Single-run revert applies compensating mutations, refuses if any row version moved |
 | D6 | Run Inspector | Shows tool calls, attempt status, duration, tokens, cost, and per-attempt deduplication |
-| D7 | Invariant suite | Thirteen deterministic tests, no LLM calls, 100% pass, gating CI. Includes a standing regression test that fabricated client-supplied history is discarded in favour of canonical history from `agent_runs`. |
+| D7 | Invariant suite | Deterministic tests, no LLM calls, 100% pass, gating CI. Includes a standing regression test that fabricated client-supplied history is discarded in favour of canonical history from `agent_runs`. The count is whatever D-29's reconciliation against D-19 concludes at T00L, not a number edited here. D-19 fixed it at thirteen and set the precedent of covering a coordination case in a task gate instead of naming a new invariant; the two Linear divergence refusals are either genuine trust-boundary invariants, in which case T00L records that D-19's count is superseded and why, or they belong in a gate and thirteen stands. CI requires 100 percent of whatever the suite is. |
 | D8 | Behavioral evals | 15 or more outcome-asserted cases with a recorded pass rate |
 | D9 | Demo assets | Seed fixture, reset endpoint, rehearsed script, backup recording |
 | D10 | README | Includes "what I deliberately did not build, and why" |
@@ -286,8 +286,9 @@ The kernel and bulk split is the process already proven on Ratchet and Datum. Th
 | R6 | Scope creep from continued architecture improvement | High | High | Architecture frozen; new ideas filed STRETCH and stay there |
 | R7 | Demo machine or environment failure | Low | High | Daily push, reproducible compose, tested restore, backup recording on a second device |
 | R8 | Invariant tests become slow or flaky and get disabled | Medium | Medium | They must not call the LLM; CI gates on this suite only |
+| R9 | A live external dependency sits in the demo path | Medium | High | Linear is a projected surface, never the authority. The local board renders committed Postgres state independently, so a Linear outage degrades the demo to a narrated projection queue rather than a failure, and no invariant test touches the network. Gate B on 2026-08-13 is the early detection and passed; the fallback if it had failed was to cut Linear and describe the projection design in the README. |
 
-**Actions:** resolve R1 by end of Day 1. Confirm R3 mitigation once 10 real prompts have been run.
+**Actions:** resolve R1 by end of Day 1. Confirm R3 mitigation once 10 real prompts have been run. R9's detection is closed by Gate B; its mitigation stays live through rehearsal, because the projector is what has to degrade gracefully rather than the gate.
 
 **Issues:** none open at baseline.
 

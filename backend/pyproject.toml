@@ -1,0 +1,57 @@
+# Tool configuration for the backend. Specified in BUILD_SPEC section 3 since
+# the file tree was written, and created here because two gates now depend on
+# it. See D-32 and D-34 in docs/DECISIONS.md.
+#
+# Deliberately tool configuration only. There is no [build-system] and no
+# [project] table, because `backend` is not an installable distribution and
+# adding one would change how `app` is imported. That question belongs to Q-04,
+# which is still open and is not resolved here.
+
+# ---------------------------------------------------------------- pytest
+# Two of these markers describe what a test IS, and one describes what it
+# REQUIRES. Keeping those jobs separate is the point: CI does not care whether
+# something is a behavioral evaluation or a provider contract test, only whether
+# it can run without reaching an external service. A single marker doing both
+# jobs is what forced the contract test to be classified as an eval, which would
+# have collected a network test into the behavioral suite at T24.
+#
+# Both known external suites carry a taxonomy marker and the execution marker:
+#
+#   tests/test_contract.py    contract + network
+#   tests/test_evals.py       eval + network
+#
+# Default CI runs `pytest -m "not network"`. The behavioral suite runs
+# `pytest -m eval` and the provider suite runs `pytest -m contract`, neither
+# needing an exclusion clause. `network` names a property of the test rather
+# than today's CI policy, so it stays true if external tests are ever run
+# deliberately in a protected job.
+[tool.pytest.ini_options]
+markers = [
+    "eval: behavioral evaluation of the model, run on demand, never in default CI",
+    "contract: provider contract test against a real external API",
+    "network: requires an external network or service, excluded from default CI",
+]
+
+# ---------------------------------------------------------------- ruff
+# This section exists because "ruff clean" has no fixed meaning without it. Ruff
+# resolves configuration by directory hierarchy and can fall back to a
+# user-level configuration before its own defaults, so an unconfigured
+# repository may enforce a different policy on every machine it runs on. Ruff's
+# built-in defaults also widen between releases: 0.16.3 enables I, UP, BLE,
+# FURB, RUF, and SIM, well beyond the E4, E7, E9, F it defaulted to for years.
+# Pinning the version in requirements.txt without pinning the rule set here
+# would leave the gate tightening silently on every upgrade.
+#
+# The selected set is deliberately the defect tier rather than the style tier.
+# F is pyflakes: undefined names, unused imports and variables, redefinitions.
+# E7 catches bare except, comparison to None and True, and type comparisons.
+# E4 catches import placement. E9 catches syntax and IO errors.
+#
+# origin/master passes this set at exit 0. That is validation, not the reason
+# for the choice. Findings outside this set are deferred lint-adoption debt,
+# recorded in D-34, and are not violations of this contract.
+#
+# No line-length is set: E501 is not selected, so a value here would enforce
+# nothing while implying a limit the gate does not apply.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

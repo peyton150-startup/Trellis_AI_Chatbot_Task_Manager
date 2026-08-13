@@ -12,6 +12,10 @@ Read these before writing any code. They are not style preferences.
 
 1. **Do not invent.** If a name, column, status value, error code, or endpoint is not in this document, it does not exist. If something is genuinely missing, stop and write the question into `docs/OPEN_QUESTIONS.md`. Do not guess and continue.
 2. **Do not redesign.** Do not add ORMs, caching, message queues, background workers, auth, migrations frameworks, or state management libraries. Do not replace psycopg with SQLAlchemy. Do not replace the SQL in section 5 with query-builder calls.
+
+   Two additions are out of bounds regardless of what category they belong to, and being a product integration rather than infrastructure exempts neither: **anything that adds a task to section 12, and anything that edits a KERNEL file.** Both require an explicit re-plan against the schedule in `docs/PROJECT_PLAN.md` and a decision in `docs/DECISIONS.md` naming what was cut to pay for it. The cut order in PROJECT_PLAN is where the payment comes from; a re-plan that pays for new tasks with optimism is not a re-plan. Everything else that is not already in this document waits until after T15 is green, and goes to `docs/OPEN_QUESTIONS.md` as a productionization discussion rather than into an implementation task.
+
+   This gate is about cost and blast radius, not about taxonomy. Do not spend time arguing whether a proposed dependency is infrastructure or a product integration, hosted or self-run. Count the tasks it adds and check whether it reaches a KERNEL file.
 3. **Do not skip the verification step.** Every task in section 12 ends with a command. Run it. If it fails, fix it before starting the next task. Do not batch tasks.
 4. **Do not touch files outside the task's stated file list.**
 5. **Kernel files are transcription only.** Files marked KERNEL in section 3 contain logic specified line by line in sections 6, 7, and 8. Transcribe the specified logic exactly. Do not "improve" it, do not reorder checks, do not collapse branches.
@@ -112,9 +116,11 @@ psycopg[binary,pool]
 pydantic
 pydantic-ai
 python-dotenv
+opentelemetry-sdk
 pytest
 pytest-asyncio
 httpx
+ruff
 ```
 
 Node dependencies (`frontend/package.json`):
@@ -164,6 +170,8 @@ Before any other task, write and run `backend/scripts/api_probe.py`. It must con
 
 Write the findings into `docs/DECISIONS.md` under "API facts confirmed on <date>". If any of the six differs from the expectation above, record the actual behaviour and use it everywhere. Do not proceed until all six are confirmed.
 
+A seventh version-specific API fact, how instrumentation is enabled for T22, was confirmed later against the same pin and is recorded as **D-30** in `docs/DECISIONS.md`. It is deliberately not part of this gate: T00 blocks the build and T22 does not. Any further API fact discovered against a pinned version goes into `docs/DECISIONS.md` the same way, under whichever task confirmed it, and the task that consumes it references the decision rather than restating it here.
+
 ---
 
 ## 3. File tree
@@ -207,6 +215,8 @@ Create exactly this. KERNEL files are **OPUS ONLY**: their logic is specified li
     tests/
       conftest.py
       test_invariants.py      the 13 deterministic tests, no LLM
+      test_models.py          model round-trips, written at T03
+      test_telemetry.py       span assertions at the exporter boundary, T22
       test_evals.py           behavioral, marked, not in CI
       fixtures/
         cases.py
@@ -788,7 +798,9 @@ Boundary coverage on the threshold is explicit: assert 3 does not require approv
 
 Fixtures use round, hand-checkable values. Task titles are `Task A` through `Task K`. Dates are whole days from a fixed `2026-08-17`. No randomness, no `faker`, no current-time dependence except where expiry is under test, where time is injected.
 
-### `tests/test_evals.py`: behavioral, marked `@pytest.mark.eval`, excluded from CI
+### `tests/test_evals.py`: behavioral, marked `@pytest.mark.eval` and `@pytest.mark.network`, excluded from CI
+
+The `network` marker is what excludes this file from the default suite, not `eval`. See the test marker contract below before writing it; marking it `eval` alone would leave it collected by CI.
 
 15 cases in `tests/fixtures/cases.py`. Each case is a dict:
 
@@ -818,7 +830,59 @@ count(tool_invocations WHERE tool_name IN MUTATING_TOOLS AND status='completed')
 
 ### CI
 
-`.github/workflows/ci.yml` runs, in order: `ruff check`, `pytest -m "not eval"`, `npm run build`. The eval suite is not in CI. CI is green or the build is broken; there is no threshold.
+`.github/workflows/ci.yml` runs, in order:
+
+```bash
+cd backend && ruff check .
+cd backend && pytest -m "not network"
+npm run build
+```
+
+The working directory is part of the contract, not an incidental detail. Ruff resolves configuration by directory hierarchy, so `backend/pyproject.toml` governs files under `backend/` and nothing else; a bare `ruff check` from the repository root would lint the disposable `spike/` tree as well, which is deleted before T12A and must never be able to block a gate.
+
+Neither the eval suite nor the provider contract suite is in CI. The `network` marker is what excludes them; see the test marker contract below. CI is green or the build is broken; there is no threshold.
+
+### Test markers: taxonomy and execution are separate
+
+Registered in `backend/pyproject.toml`. Three markers, doing two different jobs.
+
+| Marker | Kind | Meaning |
+|---|---|---|
+| `eval` | taxonomy | A behavioral evaluation of the model |
+| `contract` | taxonomy | A provider contract test against a real external API |
+| `network` | execution | Requires an external network or service |
+
+Only `network` decides what CI collects. The two taxonomy markers say what a test is; they never say where it runs. Both known external suites carry one of each:
+
+```
+tests/test_contract.py    @pytest.mark.contract  @pytest.mark.network
+tests/test_evals.py       @pytest.mark.eval      @pytest.mark.network
+```
+
+```bash
+pytest -m "not network"    # default CI, deterministic only
+pytest -m eval             # the behavioral suite, on demand
+pytest -m contract         # the provider contract suite, on demand
+```
+
+Neither on-demand command needs an exclusion clause, and a future eval that genuinely talks to an external provider composes correctly by carrying both markers.
+
+This separation is not cosmetic. Collapsing it into one marker forces a choice between classifying the Linear contract test as a behavioral eval, which is false, and leaving it collected by the default gate, which breaks CI. An earlier draft did the former and would have made `pytest -m eval` pull a network-dependent contract test into the behavioral suite at T24. `network` is named for a property of the test rather than for today's CI policy, so it remains accurate if external tests are ever run deliberately in a protected job.
+
+### The lint contract
+
+`ruff` is pinned in `backend/requirements.txt` and its rule set is pinned in `backend/pyproject.toml` as:
+
+```toml
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+```
+
+Both halves are required. A version pin alone does not define a lint contract: ruff resolves configuration by directory hierarchy and can fall back to a user-level configuration before its own defaults, so an unconfigured repository may enforce a different policy on every machine. Ruff's own defaults also widen between releases, so an unpinned rule set tightens the gate silently on upgrade.
+
+The selected set is the defect tier rather than the style tier. `F` is pyflakes: undefined names, unused imports and variables, redefinitions. `E7` catches bare `except:`, comparison to `None` and `True`, and type comparisons. `E4` catches import placement. `E9` catches syntax and IO errors.
+
+`origin/master` passes this set at exit 0, which is validation rather than the reason for the choice. Findings from ruff's broader default set are **deferred lint-adoption debt, not violations of this contract**, and they belong to a future lint-adoption task rather than to silence. Do not treat "passes ruff's current defaults" as an unwritten second gate; that would recreate exactly the ambiguity this section removes.
 
 ---
 
@@ -836,6 +900,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T04 | KERNEL errors and policy | **OPUS ONLY** | `errors.py`, `policy.py` | 6 of 13 invariant tests pass |
 | T05 | KERNEL idempotency | **OPUS ONLY** | `idempotency.py` | 3 more invariant tests pass, including lease theft |
 | T06 | Domain services and events | SOL WRITES, OPUS REVIEWS | `domain.py` | Round-trip create, update, read events. Opus checks the transaction boundary. |
+| T00B | Gate B: Linear API probe | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, this table row, `CLAUDE.md` sources-of-truth line | Six facts recorded in `docs/DECISIONS.md`, fixture written, GATE B PASS or FAIL. Runs after T06 and before T07; see section 8 of `docs/LINEAR_INTEGRATION.md` for why. |
 | T07 | KERNEL undo | **OPUS ONLY** | `undo.py` | `test_stale_undo_refused` passes |
 | T08 | Runs and wire contract | **OPUS ONLY** | `runs.py`, `main.py` | 12 of 13 pass; the AG-UI history test unblocks at T12A |
 | T09 | Seed and reset | SOL | `seed.py` | `POST /api/demo/reset` returns 11 tasks |
@@ -844,15 +909,15 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T12A | Integrate the proven AG-UI transport | **OPUS ONLY** | `agent.py`, `main.py` | See T12A proof list below |
 | T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py` | See T12B proof list below |
 | T13 | Board and task card | SOL | `Board.tsx`, `TaskCard.tsx`, `useBoard.ts`, `api.ts`, `types.ts` | Board renders seed data |
-| T14 | Chat | SOL | `Chat.tsx` | Streaming turn visible, board refetches after tool completion |
+| T14 | Chat | SOL | `Chat.tsx` | Streaming turn visible, board refetches after tool completion. See the assistant-ui ownership note below. |
 | T15 | **UGLY DEMO BAR** | either | none | Prompt to committed board update, unstyled |
-| T16 | Approval card | SOL | `ApprovalCard.tsx`, `useRun.ts` | Delete pauses, approve and reject both work |
+| T16 | Approval card | SOL | `ApprovalCard.tsx`, `useRun.ts` | Delete pauses, approve and reject both work. See the assistant-ui ownership note below. |
 | T17 | Clarifying question | SOL WRITES, OPUS REVIEWS | `prompts.py` | "Clear my tasks" asks rather than deletes |
 | T18 | Undo endpoint and button | SOL | `main.py`, `Board.tsx` | Undo restores; refuses after an external edit. `undo.py` is KERNEL, do not edit it here. |
 | T19 | Timeout, retry, degraded state | SOL | `tools.py`, `agent.py`, `Chat.tsx` | Forced timeout shows degraded state, does not hang |
 | T20 | Run Inspector | SOL | `RunInspector.tsx` | Shows attempts, COMMITTED and DEDUPLICATED, usage |
 | T21 | Resume and orphan sweep | SOL WRITES, OPUS REVIEWS | `runs.py`, `main.py` | Killed run marked interrupted at boot, resume works. Opus checks it against lease stealing. |
-| T22 | OTel | SOL | `telemetry.py` | Spans emitted for model and tool operations |
+| T22 | OTel | SOL | `telemetry.py`, `tests/test_telemetry.py`, `requirements.txt` | `pytest tests/test_telemetry.py` passes: at least one `chat` span and at least one `execute_tool` span, captured at the exporter. See the T22 note below and D-30. |
 | T23 | Injection path | SOL WRITES, OPUS REVIEWS | `prompts.py`, `seed.py` | Flag true wrecks the board, flag false does not. Opus checks the startup guard. |
 | T24 | Eval suite | SOL | `test_evals.py`, `fixtures/cases.py` | 15 cases run, pass rate recorded |
 | T25 | Polish, README, restore drill | SOL | `README.md` | Clean clone plus compose up reproduces the app |
@@ -924,6 +989,33 @@ Prove all seven:
 Getting this wrong produces an approval card that displays another actor's task titles to the user, which is a scope leak reached without ever passing the policy layer. The authoritative `check` inside the tool body would catch the mutation but not the disclosure, because the disclosure already happened on screen.
 
 **Failure rule.** The fallback decision was already made at T00A. If Gate A passed and integration nonetheless fights you here, take the fallback rather than debugging a second session: `GET /api/runs/{id}` plus `POST /api/runs/{id}/approvals/{tool_call_id}`, approval card rendered from run state, chat still streaming over AG-UI. All seven proofs above still have to pass against the fallback.
+
+### T13 to T16: what assistant-ui owns
+
+`@assistant-ui/react` and `@assistant-ui/react-ag-ui` are pinned in section 1, and Gate A already proved the transport shape end to end. Compose the surface from them. Do not hand-build a thread list, a composer, message bubbles, streaming text rendering, or a scroll container.
+
+The only product behaviour `Chat.tsx` adds is the board refetch on tool completion. Runtime configuration and transport wiring are expected and are not the subject of this rule.
+
+At T16, D-06 already settles who owns an approval, and this task does not revisit it. The client may render the server record and dispatch approve or deny. It may not independently derive the approval identity, the authorization, the preview contents, the expiry, or the mutation arguments, and it may not treat a rendered card as evidence that an approval exists. Section 10 and the T12B proof list are authoritative for all of it. If a decision about approval behaviour appears to live in `ApprovalCard.tsx`, it is in the wrong file.
+
+Writing a chat system by hand here is the most likely way to lose an evening after the ugly demo bar is already green.
+
+### T22: instrumentation
+
+Do not wrap model calls or tool bodies by hand. Pydantic AI emits GenAI spans already, and hand instrumentation would both duplicate them and put telemetry code inside the five-step tool body specified in section 10.
+
+`telemetry.py` does exactly two things:
+
+1. Builds an OpenTelemetry `TracerProvider` with whatever exporter `APP_ENV` selects, console in dev.
+2. Calls `Agent.instrument_all(InstrumentationSettings(tracer_provider=...))` once at startup, before `agent.py` constructs the agent.
+
+**The exact API is recorded as D-30 in `docs/DECISIONS.md`, confirmed against the pinned `pydantic-ai` 2.27.0. Read it before writing the file.** In particular, `Agent(instrument=...)` is not a constructor argument in this version and raises `TypeError`.
+
+`opentelemetry-api` arrives as a hard dependency of `pydantic-ai-slim`. `opentelemetry-sdk` does not arrive that way, and is present today only transitively. `telemetry.py` imports the SDK directly, so T22 adds `opentelemetry-sdk==1.44.0` to `backend/requirements.txt` and confirms it resolves against the rest of the pinned graph. Per D-14 that file is the single backend pin source, which is why the version lives there and not in section 1.
+
+`tests/test_telemetry.py` asserts at the exporter boundary rather than by scraping console output: build a `TracerProvider` with an `InMemorySpanExporter`, run one turn that calls a tool, and assert at least one span with `gen_ai.operation.name` of `chat` and at least one of `execute_tool`. At least, not exactly. One tool-calling turn emits a `chat` span before the tool and a second one after it, so an exact count fails on a correct run.
+
+If the external trace viewer is cut per the PROJECT_PLAN cut order, T22 is still done. That cut drops the viewer, not the instrumentation.
 
 ---
 

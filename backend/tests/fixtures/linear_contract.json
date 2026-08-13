@@ -1,0 +1,145 @@
+{
+  "captured": "2026-08-13",
+  "endpoint": "https://api.linear.app/graphql",
+  "mutations": {
+    "issueArchive": {
+      "args": {
+        "id": "String!",
+        "trash": "Boolean"
+      },
+      "returns": "IssueArchivePayload!"
+    },
+    "issueCreate": {
+      "args": {
+        "input": "IssueCreateInput!"
+      },
+      "returns": "IssuePayload!"
+    },
+    "issueUnarchive": {
+      "args": {
+        "id": "String!"
+      },
+      "returns": "IssueArchivePayload!"
+    },
+    "issueUpdate": {
+      "args": {
+        "id": "String!",
+        "input": "IssueUpdateInput!"
+      },
+      "returns": "IssuePayload!"
+    }
+  },
+  "note": "The frozen subset of Linear's GraphQL schema that this build depends on. Not Linear's whole schema. Each type lists only the fields this build reads or writes, so a drift failure names something that actually matters here. Regenerate deliberately, never to make tests/test_contract.py pass: a change here means a downstream task's assumptions moved. See the T00B facts and GATE B in docs/DECISIONS.md.",
+  "types": {
+    "Issue": {
+      "fields": {
+        "archivedAt": "DateTime",
+        "assignee": "User",
+        "createdAt": "DateTime!",
+        "description": "String",
+        "dueDate": "TimelessDate",
+        "id": "ID!",
+        "identifier": "String!",
+        "labels": "IssueLabelConnection!",
+        "priority": "Float!",
+        "project": "Project",
+        "state": "WorkflowState!",
+        "team": "Team!",
+        "title": "String!",
+        "updatedAt": "DateTime!",
+        "url": "String!"
+      },
+      "kind": "OBJECT"
+    },
+    "IssueArchivePayload": {
+      "fields": {
+        "entity": "Issue",
+        "lastSyncId": "Float!",
+        "success": "Boolean!"
+      },
+      "kind": "OBJECT"
+    },
+    "IssueCreateInput": {
+      "fields": {
+        "assigneeId": "String",
+        "description": "String",
+        "dueDate": "TimelessDate",
+        "id": "String",
+        "labelIds": "[String!]",
+        "priority": "Int",
+        "projectId": "String",
+        "stateId": "String",
+        "teamId": "String!",
+        "title": "String"
+      },
+      "kind": "INPUT_OBJECT"
+    },
+    "IssueLabel": {
+      "fields": {
+        "id": "ID!",
+        "name": "String!",
+        "team": "Team"
+      },
+      "kind": "OBJECT"
+    },
+    "IssuePayload": {
+      "fields": {
+        "issue": "Issue",
+        "lastSyncId": "Float!",
+        "success": "Boolean!"
+      },
+      "kind": "OBJECT"
+    },
+    "IssueUpdateInput": {
+      "fields": {
+        "assigneeId": "String",
+        "description": "String",
+        "dueDate": "TimelessDate",
+        "labelIds": "[String!]",
+        "priority": "Int",
+        "projectId": "String",
+        "stateId": "String",
+        "teamId": "String",
+        "title": "String"
+      },
+      "kind": "INPUT_OBJECT"
+    },
+    "Project": {
+      "deprecated": [
+        "state"
+      ],
+      "fields": {
+        "id": "ID!",
+        "name": "String!",
+        "state": "String!"
+      },
+      "kind": "OBJECT"
+    },
+    "Team": {
+      "fields": {
+        "id": "ID!",
+        "key": "String!",
+        "name": "String!"
+      },
+      "kind": "OBJECT"
+    },
+    "User": {
+      "fields": {
+        "active": "Boolean!",
+        "email": "String!",
+        "id": "ID!",
+        "name": "String!"
+      },
+      "kind": "OBJECT"
+    },
+    "WorkflowState": {
+      "fields": {
+        "id": "ID!",
+        "name": "String!",
+        "position": "Float!",
+        "type": "String!"
+      },
+      "kind": "OBJECT"
+    }
+  }
+}
