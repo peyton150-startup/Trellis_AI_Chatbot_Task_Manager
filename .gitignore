@@ -1,0 +1,4 @@
+# Local Python virtual environments. Created by the setup command in CLAUDE.md
+# and by any task that installs backend dependencies, so it appears in every
+# worktree and would otherwise be committed by a careless `git add -A`.
+.venv/
