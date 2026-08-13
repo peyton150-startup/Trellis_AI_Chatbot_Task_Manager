@@ -773,3 +773,66 @@ handing it back. That edit to Sol-owned files is a T06-only routing exception.
 Sol read the applied code against this decision and the build contracts,
 reproduced the extended PostgreSQL gate, and accepted ownership of the result.
 The exception does not change the routing of any later task.
+---
+
+## Spec clarifications recorded at T06
+
+D-24 through D-29 are reserved by `docs/LINEAR_INTEGRATION.md` section 3 and are
+not yet appended to this file. The next free number after that reserved block is
+D-30, and this decision takes it. Do not reuse a reserved number.
+
+### D-30: T22 uses Pydantic AI's own instrumentation, and the working API is version-specific
+
+T22 asks for spans on model and tool operations. Pydantic AI emits them already,
+so `telemetry.py` configures a tracer provider and turns instrumentation on. It
+does not wrap model calls or tool bodies. Hand instrumentation would duplicate
+the framework spans and would put telemetry code inside the five-step tool body
+that section 10 specifies, which is the one place in the build where an extra
+line is expensive.
+
+Confirmed on 2026-08-13 against the pinned `pydantic-ai` 2.27.0, by running an
+agent with an in-memory span exporter and reading the finished spans.
+
+| # | Fact | Confirmed value |
+|---|---|---|
+| 1 | How instrumentation is enabled | `Agent.instrument_all(InstrumentationSettings(tracer_provider=...))`, imported from `pydantic_ai`. `Agent(instrument=...)` is not a constructor argument in this version and raises `TypeError`. |
+| 2 | Spans emitted by one tool-calling turn | `invoke_agent`, one `chat` per model request, and `execute_tool <name>` per tool call, carrying `gen_ai.operation.name` values of `invoke_agent`, `chat`, and `execute_tool`, and `gen_ai.tool.name` on the tool span. |
+| 3 | Span counts | A single tool-calling turn emits **two** `chat` spans, one before the tool call and one after. `tests/test_telemetry.py` therefore asserts at least one span of each class and never an exact total. |
+| 4 | Packages | `opentelemetry-api` is a hard dependency of `pydantic-ai-slim` at `>=1.28.0`. `opentelemetry-sdk` is not a declared dependency and is present today only transitively, through the `logfire` extra that `pydantic-ai` pulls in. `telemetry.py` imports the SDK directly, so T22 pins `opentelemetry-sdk==1.44.0` in `backend/requirements.txt` per D-14. |
+
+Recorded because the obvious spelling fails. A model writing `telemetry.py` from
+memory reaches for the constructor argument first, and against this pin that
+raises a `TypeError` which reads like a typo rather than a version difference.
+The cost of finding this at T22 is an hour of the wrong kind of debugging; the
+cost of reading it here is a minute.
+
+### D-31: new tasks and kernel edits are gated on an explicit re-plan
+
+Rule 0.2 previously banned a list of implementation categories: ORMs, caching,
+message queues, background workers, auth, migration frameworks, state management
+libraries. The list is still correct and still binding, but it turned out to be
+the wrong shape for the question that actually arrives, which is whether some
+proposed addition counts as one of the banned categories at all. That question is
+arguable, and arguing it is not work.
+
+Rule 0.2 now carries a second gate that does not depend on categories. Anything
+that adds a task to section 12, and anything that edits a KERNEL file, requires
+an explicit re-plan against `docs/PROJECT_PLAN.md` and a decision here naming
+what was cut to pay for it. Everything else that is not already in
+`docs/BUILD_SPEC.md` waits until after T15 is green and goes to
+`docs/OPEN_QUESTIONS.md`.
+
+The gate is deliberately indifferent to whether an addition is hosted or
+self-run, and to whether it is infrastructure or a product integration behind the
+tool and policy boundary. Those distinctions do not predict cost. Task count and
+kernel reach do.
+
+This is recorded rather than left implicit because the Linear integration in
+`docs/LINEAR_INTEGRATION.md` is exactly the shape the gate is meant to catch: it
+adds six tasks (T00B, T00L, T26 through T29), two of them OPUS ONLY, it
+introduces a background projector worker draining an outbox table, and it edits
+KERNEL `undo.py` to add the `EXTERNALLY_MODIFIED` precheck. Two of those, the
+worker and the outbox, are named in the first sentence of rule 0.2. The
+integration may still be the right call, and this decision does not reverse it.
+What it does is require that the schedule cost be stated and paid rather than
+absorbed, and the payment is still outstanding.
