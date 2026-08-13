@@ -19,6 +19,57 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Not a task gate, so it deliberately does not carry a T## name. BUILD_SPEC
+  # section 11 has claimed since it was written that CI runs `ruff check`, and
+  # until now nothing did. The working directory is part of the contract: ruff
+  # resolves configuration by directory hierarchy, so running from backend/ is
+  # what makes backend/pyproject.toml govern the run, and what keeps the
+  # disposable spike/ tree out of it.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Per D-14 the pin source is backend/requirements.txt, which is why ruff
+      # is pinned there rather than installed inline here.
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Verify the ruff rule set is the one the contract pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import tomllib
+
+          with open("backend/pyproject.toml", "rb") as handle:
+              config = tomllib.load(handle)
+
+          selected = config["tool"]["ruff"]["lint"]["select"]
+          expected = ["E4", "E7", "E9", "F"]
+          if selected != expected:
+              raise SystemExit(
+                  f"backend/pyproject.toml selects {selected}, and the lint contract in "
+                  f"BUILD_SPEC section 11 pins {expected}. A silent widening or narrowing "
+                  "of the rule set changes what every later gate means."
+              )
+          print(f"PASS the lint contract selects {selected}")
+          PY
+
+      - name: Run ruff
+        working-directory: backend
+        run: ruff check .
+
   t00-api-probe:
     name: T00 API probe
     runs-on: ubuntu-latest

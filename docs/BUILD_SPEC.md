@@ -120,6 +120,7 @@ opentelemetry-sdk
 pytest
 pytest-asyncio
 httpx
+ruff
 ```
 
 Node dependencies (`frontend/package.json`):
@@ -797,7 +798,9 @@ Boundary coverage on the threshold is explicit: assert 3 does not require approv
 
 Fixtures use round, hand-checkable values. Task titles are `Task A` through `Task K`. Dates are whole days from a fixed `2026-08-17`. No randomness, no `faker`, no current-time dependence except where expiry is under test, where time is injected.
 
-### `tests/test_evals.py`: behavioral, marked `@pytest.mark.eval`, excluded from CI
+### `tests/test_evals.py`: behavioral, marked `@pytest.mark.eval` and `@pytest.mark.network`, excluded from CI
+
+The `network` marker is what excludes this file from the default suite, not `eval`. See the test marker contract below before writing it; marking it `eval` alone would leave it collected by CI.
 
 15 cases in `tests/fixtures/cases.py`. Each case is a dict:
 
@@ -827,7 +830,59 @@ count(tool_invocations WHERE tool_name IN MUTATING_TOOLS AND status='completed')
 
 ### CI
 
-`.github/workflows/ci.yml` runs, in order: `ruff check`, `pytest -m "not eval"`, `npm run build`. The eval suite is not in CI. CI is green or the build is broken; there is no threshold.
+`.github/workflows/ci.yml` runs, in order:
+
+```bash
+cd backend && ruff check .
+cd backend && pytest -m "not network"
+npm run build
+```
+
+The working directory is part of the contract, not an incidental detail. Ruff resolves configuration by directory hierarchy, so `backend/pyproject.toml` governs files under `backend/` and nothing else; a bare `ruff check` from the repository root would lint the disposable `spike/` tree as well, which is deleted before T12A and must never be able to block a gate.
+
+Neither the eval suite nor the provider contract suite is in CI. The `network` marker is what excludes them; see the test marker contract below. CI is green or the build is broken; there is no threshold.
+
+### Test markers: taxonomy and execution are separate
+
+Registered in `backend/pyproject.toml`. Three markers, doing two different jobs.
+
+| Marker | Kind | Meaning |
+|---|---|---|
+| `eval` | taxonomy | A behavioral evaluation of the model |
+| `contract` | taxonomy | A provider contract test against a real external API |
+| `network` | execution | Requires an external network or service |
+
+Only `network` decides what CI collects. The two taxonomy markers say what a test is; they never say where it runs. Both known external suites carry one of each:
+
+```
+tests/test_contract.py    @pytest.mark.contract  @pytest.mark.network
+tests/test_evals.py       @pytest.mark.eval      @pytest.mark.network
+```
+
+```bash
+pytest -m "not network"    # default CI, deterministic only
+pytest -m eval             # the behavioral suite, on demand
+pytest -m contract         # the provider contract suite, on demand
+```
+
+Neither on-demand command needs an exclusion clause, and a future eval that genuinely talks to an external provider composes correctly by carrying both markers.
+
+This separation is not cosmetic. Collapsing it into one marker forces a choice between classifying the Linear contract test as a behavioral eval, which is false, and leaving it collected by the default gate, which breaks CI. An earlier draft did the former and would have made `pytest -m eval` pull a network-dependent contract test into the behavioral suite at T24. `network` is named for a property of the test rather than for today's CI policy, so it remains accurate if external tests are ever run deliberately in a protected job.
+
+### The lint contract
+
+`ruff` is pinned in `backend/requirements.txt` and its rule set is pinned in `backend/pyproject.toml` as:
+
+```toml
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+```
+
+Both halves are required. A version pin alone does not define a lint contract: ruff resolves configuration by directory hierarchy and can fall back to a user-level configuration before its own defaults, so an unconfigured repository may enforce a different policy on every machine. Ruff's own defaults also widen between releases, so an unpinned rule set tightens the gate silently on upgrade.
+
+The selected set is the defect tier rather than the style tier. `F` is pyflakes: undefined names, unused imports and variables, redefinitions. `E7` catches bare `except:`, comparison to `None` and `True`, and type comparisons. `E4` catches import placement. `E9` catches syntax and IO errors.
+
+`origin/master` passes this set at exit 0, which is validation rather than the reason for the choice. Findings from ruff's broader default set are **deferred lint-adoption debt, not violations of this contract**, and they belong to a future lint-adoption task rather than to silence. Do not treat "passes ruff's current defaults" as an unwritten second gate; that would recreate exactly the ambiguity this section removes.
 
 ---
 

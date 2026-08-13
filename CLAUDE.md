@@ -54,12 +54,15 @@ The required checks are named `T00 API probe`, `T00A spike build`, `T00R probe h
 - Full CI commands, once the application scaffold exists, run in this order:
 
 ```text
-ruff check
-pytest -m "not eval"
+cd backend && ruff check .
+cd backend && pytest -m "not network"
 npm run build
 ```
 
-- Run behavioral evals only on demand. They are excluded from CI.
+The working directory is part of the contract. Ruff resolves configuration by directory hierarchy, so `backend/pyproject.toml` governs `backend/` and nothing else, and a bare `ruff check` from the repository root would also lint the disposable `spike/` tree.
+
+- Three test markers, registered in `backend/pyproject.toml`. `eval` and `contract` are taxonomy, describing what a test is. `network` is an execution property and is the only one that decides what CI collects. Both external suites carry one of each: `test_evals.py` is `eval` plus `network`, and `test_contract.py` is `contract` plus `network`. Run them on demand with `pytest -m eval` and `pytest -m contract`. See the test marker contract in `docs/BUILD_SPEC.md` section 11.
+- Ruff's rule set is pinned as `select = ["E4", "E7", "E9", "F"]`. Findings outside it are deferred lint-adoption debt, not violations, and "passes ruff's current defaults" is not a second gate.
 - Keep GitHub Actions permissions at least privilege and pin third-party actions to immutable commit SHAs.
 - Use the task-specific verification command in `docs/BUILD_SPEC.md` before starting the next task.
 
