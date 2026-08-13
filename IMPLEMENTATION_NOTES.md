@@ -209,3 +209,61 @@ user's direction Opus applied the fixes to the uncommitted worktree; D-23 record
 that T06-only routing exception. Sol reviewed the code and reproduced the gate
 before accepting ownership. No T07 code, endpoint, tool, or invariant-test count
 changes in T06.
+
+## Linear integration specification, revision 01
+
+**Local role:** Adds `docs/LINEAR_INTEGRATION.md`, the single authoritative
+description of how this build reaches Linear. It carries the six Linear
+decisions, D-24 through D-29, the schema delta for `002_linear.sql`, the deltas
+for BUILD_SPEC, ARCHITECTURE, and PROJECT_PLAN, and the corrected task sequence
+T00B, T00L, T07, then T26 through T29. It implements nothing and changes no
+behaviour; it is the plan the six tasks after it build against.
+
+**Whole-system role:** It settles where an external system attaches without
+breaking what the architecture exists to prove. A Linear GraphQL mutation cannot
+join the Postgres transaction BUILD_SPEC section 7 calls non-negotiable, so
+calling Linear inside a tool body would leave a window where Linear mutated and
+the idempotency lease was still pending, and lease stealing would re-execute work
+that had already landed externally. That is the 8:00 demo moment asserting
+something false. The document fixes Linear as an asynchronously projected surface
+written only after the local transaction commits, which keeps the invariant suite
+offline, keeps `undo.py` ignorant of Linear, and makes the failure mode when
+Linear is unreachable a queue that drains rather than a half-applied change.
+
+**Inputs and dependencies:** BUILD_SPEC sections 4, 5, 6, 7, 8, 10, 11, and 12;
+D-02, D-04, D-09, D-10, D-18, D-19, and D-22; the T06 domain layer, whose
+`SELECT *` into a model that forbids extra fields decided the schema shape; and
+the merged migration `001_init.sql`, which cannot be edited.
+
+**Outputs and consumers:** D-24 through D-29. T00B consumes the six Gate B facts
+and the contract fixture requirement. T00L consumes the schema delta, the
+`EXTERNAL_DIVERGENCE` code, the `policy.check` divergence step, and the invariant
+count reconciliation. T07 consumes the `EXTERNALLY_MODIFIED` precheck. T26
+through T29 consume the client surface, projector coordination, reconciler
+safeguards, and the fenced reset. Each documentation delta names its owning task,
+so no block is unassigned.
+
+**Verification:** Documentation only, so the evidence is that the design survives
+execution rather than that code passes. An Opus review ran the proposed
+`002_linear.sql` against live PostgreSQL 16 and reverted it. Six claims were
+checked. Adding three columns to `tasks` raised `ValidationError: 3 validation
+errors for Task`, which moved integration state into `linear_task_state`. A
+`restored` event enqueued `update`, which added `unarchive` to the operation
+mapping. `ON DELETE CASCADE` destroyed the `external_id` the archive projection
+needs, which made the side table a tombstone with no foreign key. The tombstone
+preserved that id past a delete and a restored task rejoined its state by
+original id. All nine established gates pass on this pull request unchanged,
+since no code is touched.
+
+**Limitations and review status:** Two safeguards, the reconciler skipping
+pending projections and excluding archived issues, are design conclusions that
+cannot be executed without a live Linear workspace, and their external
+assumptions are Gate B facts 4 and 6 rather than proven behaviour. D-28 fixes the
+fencing and per-task ordering semantics but deliberately leaves the mechanism to
+T27. D-29 defers the invariant count to T00L's reconciliation against D-19 rather
+than choosing a number here. The blind Sonnet review that CLAUDE.md requires for
+Opus-produced pull requests was waived at the user's direction because this
+change is documentation with no code, no CI gate, and no behavioural effect; the
+waiver is recorded in the pull request. This entry exists because CLAUDE.md names
+`IMPLEMENTATION_NOTES.md` a required companion file, even though this pull
+request is not a numbered task.
