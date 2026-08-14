@@ -302,6 +302,8 @@ M1 — Domain and boundary (Day 2)
 
 M2 — Human control (Day 3)
   TAD-13  Approval interrupt integration (T12B) + diff preview UI
+  R2      Same-SHA blind review + fresh-sandbox T12A/T12B execution
+          + ruff + deterministic tests + production build [before T13]
   TAD-14  Reject path
   TAD-15  Clarifying question on ambiguity
   TAD-16  UGLY DEMO GATE: prompt to committed board update
@@ -319,7 +321,19 @@ M4 — Proof and polish (Days 5 to 6)
   TAD-23  Deterministic invariant suite, CI, 100%
   TAD-24  Behavioral eval suite, on demand, threshold
   TAD-25  Visual polish, README + "what I did not build", backup recording
+
+M5 - Optional Linear expansion (after T25 only)
+  T00L    Linear boundary retrofit, including merged undo.py
+  T26     Linear client and name-to-id resolution
+  T27     Projector worker
+  T28     Reconciler
+  T29     Linear-aware reset
 ```
+
+T00B remains complete in its original position after T06 and is not repeated in
+M5. R2 must pass against one immutable SHA before T13 starts. For R2, failure to
+provision or execute the fresh Vercel Sandbox is a BLOCK rather than a reason to
+substitute a host or clone result.
 
 Label every ticket `CORE` or `STRETCH`. Anything proposed after Day 2 that is not on this list is filed `STRETCH` and stays there.
 

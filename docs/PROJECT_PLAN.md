@@ -178,18 +178,17 @@ Effort in days. Solo project, so nearly everything is serial and the critical pa
 **AD is one priced activity, not six.** The 1.50 figure is the aggregate already
 recorded in `docs/LINEAR_INTEGRATION.md`, and no per-task estimate was ever
 recorded. Splitting it into six equal quarters would put a convenient division
-into the plan and claim a precision nobody measured, so it is not done here. The
-internal sequence and its dependencies are authoritative in
-`docs/LINEAR_INTEGRATION.md` section 8: T00B and T00L before T07, T26 after T08,
-and T27 through T29 after T21 targeting end of day five. T27 and T28 carry the
-highest overrun risk, T27 for the projector ordering, serialization, retry, and
-atomic writeback, and T28 for reconciliation and divergence detection. T00B is
-delivered, so 0.25 of the 1.50 is already spent.
+into the plan and claim a precision nobody measured, so it is not done here.
+T00B is delivered in its completed position after T06, so 0.25 of the 1.50 is
+already spent. The remaining optional sequence starts only after T25 and is
+`T00L -> T26 -> T27 -> T28 -> T29`. T27 and T28 carry the highest overrun risk,
+T27 for the projector ordering, serialization, retry, and atomic writeback, and
+T28 for reconciliation and divergence detection.
 
-The `EXTERNALLY_MODIFIED` precheck that Linear adds to `undo.py` is incremental
-scope inside activity O, not a separate activity. It carries no additional
-scheduled effort and a real increase in kernel blast radius, which D-36 records
-and answers with a focused review of the delta rather than a schedule change.
+The `EXTERNALLY_MODIFIED` precheck that Linear adds to `undo.py` is a T00L
+retrofit to the merged T07 kernel, not part of activity O. Its effort remains
+inside activity AD's aggregate, and its second edit to a KERNEL file receives
+focused review under the immutable-SHA rule for Linear boundary changes.
 
 **Delivery spine.** The formal forward and backward pass is not worth running on a solo seven-day build, and an earlier version of this line stated a path that did not match its own dependency table. What matters is the order that cannot be resequenced:
 
@@ -200,7 +199,9 @@ Gate A spike (disposable)
   → typed tools
   → policy layer
   → wire contract
-  → approval and reject
+  → approval path
+  → R2 same-SHA review + fresh-sandbox execution
+  → board, chat, and reject UI
   → UGLY DEMO GATE
   → idempotency
   → Run Inspector
@@ -286,7 +287,7 @@ Cutting item 6 costs a demo beat, so it is last. Cutting item 3 shortens the hum
 
 **Already taken, on 2026-08-13, to fund the Linear expansion:** items 1, 2, 4, and 5. The ledger and the credit each one actually earns are in D-36; items 1 and 5 credit zero and are recorded as scope reductions rather than schedule savings. Item 3, undo, is deliberately not cut and would be incoherent to cut, because the Linear expansion adds kernel logic to `undo.py`.
 
-**Linear-specific contingency.** If schedule pressure requires another reduction after T15 is green, T28, the reconciler, is cut before anything on the never-cut list and before any further reduction of the core demo. The reconciliation and divergence design stays documented as designed but not built. This is defensible because Linear is a projected surface and never the authority, so the outbound projection path stands without it. No schedule credit is claimed for this in advance, because the 1.50 day figure is an aggregate and T28 has no recorded individual estimate. The credit is recorded when T28 is estimated or cut, not before.
+**Linear-specific contingency.** If schedule pressure requires another reduction after T25 is green, T28, the reconciler, is cut before anything on the never-cut list and before any further reduction of the core demo. The reconciliation and divergence design stays documented as designed but not built. This is defensible because Linear is a projected surface and never the authority, so the outbound projection path stands without it. No schedule credit is claimed for this in advance, because the 1.50 day figure is an aggregate and T28 has no recorded individual estimate. The credit is recorded when T28 is estimated or cut, not before.
 
 ### Compression options if Day 2 slips
 
@@ -297,7 +298,7 @@ Adding people is not available and would not help on work this coupled. The avai
 The original review cadence assumed every review-tagged task received a dedicated blind read before it was marked done. Under the active schedule pressure, keep task implementation, commits, and verification separate, but batch dedicated model review at the two boundaries where a subtle defect can invalidate the demo:
 
 1. **After T08:** review T07 undo and T08 wire contract together. T08 is mandatory; T07 may receive a lightweight read.
-2. **After T12B:** review the T10 reference tool and transaction shape, T12A transport and trust boundary, and T12B approval path. T12B is the highest remaining review priority.
+2. **After T12B, R2:** review the T10 reference tool and transaction shape, T11 prompts, T12A transport and trust boundary, and T12B approval path. Pin the blind review to an immutable SHA, execute that exact SHA through the T12A/T12B path in a fresh Vercel Sandbox, and require `cd backend && ruff check .`, `cd backend && pytest -m "not network"`, and `npm run build`. Any unresolved BLOCK, sandbox failure, lint failure, test failure, or production-build failure blocks T13. Any fix that changes the SHA restarts all of R2.
 3. **At T15:** run the full ugly-demo smoke path and inspect it manually. Once this is green, reduce review depth and finish, test, make reproducible, and rehearse the demonstrable system.
 
 Remaining review budget is allocated in this order: **T12B > T08 > T12A > T07 > T10 > everything else.** Seed/reset, prompts, board, chat, approval UI, undo UI, timeout handling, Run Inspector, OTel, evals, and polish use their specified verification, functional, visual, or rehearsal checks rather than dedicated blind reviews. T17 may be reviewed with T23 if that work is reached. T23 receives a security review only if time remains after T15 is green.

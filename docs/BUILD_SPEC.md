@@ -115,8 +115,8 @@ T11
 T12A
 T12B
  |
-REVIEW CHECKPOINT 2
-tools + transport + APPROVAL PATH
+R2 REVIEW + EXECUTION CHECKPOINT
+tools + transport + APPROVAL PATH + fresh sandbox
 
 T13
 T14
@@ -126,7 +126,7 @@ T15 UGLY DEMO
 SMOKE / MANUAL REVIEW
 ```
 
-The second checkpoint must pass before UI work continues past the ugly-demo bar. After T15 is green, reduce review depth and prioritize a finished, tested, reproducible, and rehearsed demo.
+R2 must pass before T13 starts. After T15 is green, reduce review depth and prioritize a finished, tested, reproducible, and rehearsed demo.
 
 | Task | Dedicated review | Required treatment |
 |---|---|---|
@@ -983,7 +983,6 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T05 | KERNEL idempotency | **OPUS ONLY** | `idempotency.py` | 3 more invariant tests pass, including lease theft |
 | T06 | Domain services and events | SOL WRITES, OPUS REVIEWS | `domain.py` | Round-trip create, update, read events. Opus checks the transaction boundary. |
 | T00B | Gate B: Linear API probe | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, this table row, `CLAUDE.md` sources-of-truth line | Six facts recorded in `docs/DECISIONS.md`, fixture written, GATE B PASS or FAIL. Runs after T06 and before T07; see section 8 of `docs/LINEAR_INTEGRATION.md` for why. |
-| T00L | Linear boundary retrofit | **OPUS ONLY** | `migrations/002_linear.sql`, `errors.py`, `policy.py`, `sql.py`, `models.py` if needed, `tests/test_invariants.py`, this table row, BUILD_SPEC sections 3, 4, 6, 11, `docs/ARCHITECTURE.md` parts 2 and 4 | Invariant suite passes at whatever count D-29 concludes, no network. `docs/LINEAR_INTEGRATION.md` section 8 sequences this before T07; it is not a T07 prerequisite, and the `EXTERNALLY_MODIFIED` precheck it adds to KERNEL `undo.py` is a retrofit to a merged file rather than part of T07. |
 | T07 | KERNEL undo | **OPUS ONLY** | `undo.py` | `test_stale_undo_refused` passes |
 | T08 | Runs and wire contract | **OPUS ONLY** | `runs.py`, `main.py`, `sql.py`, `tests/test_invariants.py`, this table's T08, T09, and T12B rows, BUILD_SPEC sections 9 and 10 | 12 of 13 pass; the AG-UI history test unblocks at T12A. File list expanded under D-42: `RunDetail.steps` needs a run-scoped invocation read that `sql.py` did not have, and the two remaining testable invariants did not exist. |
 | T09 | Seed and reset | SOL | `seed.py`, `main.py` | `POST /api/demo/reset` returns 11 tasks. `main.py` is in the list under D-44 because the done-when is an HTTP response and `seed.py` alone cannot produce one; T08 deliberately did not create this route. |
@@ -991,6 +990,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T11 | Prompts | **OPUS ONLY** | `prompts.py` | `render_task_block` output inspected both ways |
 | T12A | Integrate the proven AG-UI transport | **OPUS ONLY** | `agent.py`, `main.py` | See T12A proof list below |
 | T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py`, `runs.py`, `sql.py` | See T12B proof list below. Owns `POST /api/runs/{id}/approvals/{tool_call_id}`, approval creation and decision, and `RunDetail.pending_approval`, which is null until here under D-45. Must also settle what that field means when one turn produces more than one approval-required call, and the invalid-run-state error code D-45 records as missing. |
+| R2 | Blind review and execution checkpoint 2 | NON-AUTHORING MODEL + HUMAN | T10 reference tool, T11, and T12A/T12B boundary changes | See the R2 review and execution gate below. The same immutable SHA passes review, fresh-sandbox execution, lint, deterministic tests, and the production build before T13. |
 | T13 | Board and task card | SOL | `Board.tsx`, `TaskCard.tsx`, `useBoard.ts`, `api.ts`, `types.ts` | Board renders seed data |
 | T14 | Chat | SOL | `Chat.tsx` | Streaming turn visible, board refetches after tool completion. See the assistant-ui ownership note below. |
 | T15 | **UGLY DEMO BAR** | either | none | Prompt to committed board update, unstyled |
@@ -1004,6 +1004,20 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T23 | Injection path | SOL | `prompts.py`, `seed.py` | Flag true wrecks the board, flag false does not. Opus reviews the startup guard only if time remains after T15 is green. |
 | T24 | Eval suite | SOL | `test_evals.py`, `fixtures/cases.py` | 15 cases run, pass rate recorded |
 | T25 | Polish, README, restore drill | SOL | `README.md` | Clean clone plus compose up reproduces the app |
+
+### Optional Linear expansion: after T25 only
+
+T00B remains in its completed position after T06. It is the prerequisite probe for the optional Linear expansion, not a task to repeat. If the expansion is taken, continue after T25 in this order:
+
+| ID | Task | Model | Files | Done when |
+|---|---|---|---|---|
+| T00L | Linear boundary retrofit | **OPUS ONLY** | `migrations/002_linear.sql`, `errors.py`, `policy.py`, `sql.py`, `undo.py`, `models.py` if needed, `tests/test_invariants.py`, BUILD_SPEC sections 3, 4, 6, and 11, `docs/ARCHITECTURE.md` parts 2 and 4 | The T00L offline gate in `docs/LINEAR_INTEGRATION.md` passes at whatever invariant count D-29 concludes; no network dependency. |
+| T26 | Linear client and name-to-id resolution | SOL | `linear.py`, `config.py`, BUILD_SPEC section 10, `docs/ARCHITECTURE.md` part 5 | Enums build from the live workspace; `FakeTracker` satisfies the same contract. |
+| T27 | Projector worker | SOL | `projector.py`, `docs/ARCHITECTURE.md` part 8 | Outbox drains in order, serialized per task; remote id is written back atomically with completion; unmapped updates complete without a remote call; retry uses backoff. |
+| T28 | Reconciler | SOL WRITES, OPUS REVIEWS | `reconciler.py`, `docs/ARCHITECTURE.md` parts 10 and 11 | External edit sets `diverged`; archived issues are excluded; pending projection does not cause divergence; an issue created in Linear imports. |
+| T29 | Linear-aware reset | SOL | `seed.py`, `main.py`, `docs/ARCHITECTURE.md` part 6 | Reset fences the projector, archives the team, clears tombstones, and recreates eleven tasks on both sides. |
+
+The visible optional sequence is `T25 -> T00L -> T26 -> T27 -> T28 -> T29`. If the Linear expansion is cut, none of T00L or T26 through T29 runs. This sequence supersedes the earlier pre-T07 sequencing proposal in `docs/LINEAR_INTEGRATION.md`; that document's detailed task definitions remain authoritative.
 
 ### T00A: disposable AG-UI spike (Gate A, Day 1)
 
@@ -1072,6 +1086,26 @@ Prove all seven:
 Getting this wrong produces an approval card that displays another actor's task titles to the user, which is a scope leak reached without ever passing the policy layer. The authoritative `check` inside the tool body would catch the mutation but not the disclosure, because the disclosure already happened on screen.
 
 **Failure rule.** The fallback decision was already made at T00A. If Gate A passed and integration nonetheless fights you here, take the fallback rather than debugging a second session: `GET /api/runs/{id}` plus `POST /api/runs/{id}/approvals/{tool_call_id}`, approval card rendered from run state, chat still streaming over AG-UI. All seven proofs above still have to pass against the fallback.
+
+### R2 review and execution gate
+
+After T12B, pin the R2 blind review to an immutable commit SHA. Review the T10 reference tool, T11 prompts, and the T12A/T12B transport, trust-boundary, and approval-path changes. The review follows the repository's neutral, blind, read-only reviewer rules.
+
+R2 is not a static review only. Execute that same SHA in a fresh Vercel Sandbox. Install dependencies from the repository's declared dependency and lock files, provide required secrets through the sandbox environment only, boot the components required by the T12A/T12B path, and execute the T12A/T12B verification path against the sandboxed code.
+
+Do not commit secrets or sandbox-specific configuration.
+
+R2 passes only when all of the following are true for the same immutable SHA:
+
+1. The blind review has no unresolved BLOCK findings.
+2. The reviewed SHA boots and the T12A/T12B path executes successfully in a fresh Vercel Sandbox.
+3. `cd backend && ruff check .` passes.
+4. `cd backend && pytest -m "not network"` passes.
+5. `npm run build` passes.
+
+A blind-review BLOCK, Vercel Sandbox provisioning or execution failure, lint failure, test failure, or production-build failure is an R2 BLOCK.
+
+If any fix changes the reviewed SHA, the prior R2 result is stale. Rerun the blind review, fresh Vercel Sandbox execution, and all three deterministic gates against the new SHA before starting T13.
 
 ### T13 to T16: what assistant-ui owns
 

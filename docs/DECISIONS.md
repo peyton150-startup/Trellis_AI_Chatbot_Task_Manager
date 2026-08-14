@@ -1596,3 +1596,45 @@ T08 does not invent a first-row-wins rule. **Resolve at T12B**, which gains
 **Resolve before T20.**
 
 **Concurrent undo eligibility.** See D-44. **Resolve at T18.**
+
+---
+
+## Schedule and review decisions recorded on 2026-08-14
+
+### D-46: T00B stays after T06 and the remaining Linear expansion moves after T25
+
+T00B is complete and remains in its executed position after T06 and before T07.
+It is not repeated. Its GATE B PASS remains the prerequisite for every remaining
+Linear task.
+
+The optional Linear expansion now runs only after the core sequence reaches T25.
+Its exact order is `T25 -> T00L -> T26 -> T27 -> T28 -> T29`. If the expansion
+is cut, none of T00L or T26 through T29 runs.
+
+This decision supersedes the earlier sequencing portions of D-36 and D-37 and
+the pre-T07 proposal that formerly appeared in `docs/LINEAR_INTEGRATION.md`
+section 8. It does not change D-36's 1.50d aggregate estimate, recorded funding,
+or contingency order. Because the remaining expansion starts after T25, the
+T28 contingency is evaluated after T25 rather than after T15. T00L now owns the
+`EXTERNALLY_MODIFIED` retrofit to the already merged KERNEL `undo.py`, so
+`undo.py` is in T00L's authorized file list.
+
+### D-47: R2 is a same-SHA review and execution gate before T13
+
+After T12B, the R2 blind review is pinned to an immutable commit SHA and covers
+the T10 reference tool, T11 prompts, and the T12A/T12B transport, trust boundary,
+and approval path. That exact SHA is then executed through the T12A/T12B
+verification path in a fresh Vercel Sandbox with dependencies installed from the
+repository's declared dependency and lock files and secrets provided through the
+sandbox environment only.
+
+R2 passes only when the blind review has no unresolved BLOCK findings, the fresh
+sandbox boots and completes the T12A/T12B path, `cd backend && ruff check .`
+passes, `cd backend && pytest -m "not network"` passes, and `npm run build`
+passes. A sandbox provisioning or execution failure is an R2 BLOCK. The general
+pinned-clone fallback for a review whose sandbox cannot be provisioned does not
+apply to R2.
+
+Any fix that changes the reviewed SHA invalidates the entire R2 result. The blind
+review, fresh-sandbox execution, and all three deterministic gates rerun against
+the new SHA before T13 starts.

@@ -771,18 +771,17 @@ or a deduplicated retry.
 
 ---
 
-## 8. Task sequence, corrected
+## 8. Task sequence, ratified
 
 Earlier in this session the schema delta was placed in T01 and the policy change
-in T04. That was wrong, and the correction matters. T01, T04, and T05 are
-merged. T06 is in flight on `codex/t06-domain-services`. Nothing already merged
-can be edited, so the delta ships as new work.
+in T04. That was wrong, and the correction matters. T00B later completed after
+T06 and before T07. The core sequence through T25 now finishes before the
+remaining Linear expansion begins, so the delta ships as optional post-T25 work.
 
 | ID | Task | Model | Files | Done when |
 |---|---|---|---|---|
-| T00B | Gate B: Linear API probe | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, BUILD_SPEC section 12 row, `CLAUDE.md` sources-of-truth line | Six facts recorded, fixture written, GATE B PASS or FAIL |
-| T00L | Linear boundary retrofit | **OPUS ONLY** | `migrations/002_linear.sql`, `errors.py`, `policy.py`, `sql.py`, `models.py` if needed, `tests/test_invariants.py`, BUILD_SPEC sections 3, 4, 6, 11, `docs/ARCHITECTURE.md` parts 2 and 4 | Invariant suite passes at whatever count D-29 concludes, no network |
-| T07 | KERNEL undo, including the `EXTERNALLY_MODIFIED` precheck | **OPUS ONLY** | `undo.py` | As specified, plus the diverged refusal |
+| T00B | Gate B: Linear API probe, completed after T06 | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, BUILD_SPEC section 12 row, `CLAUDE.md` sources-of-truth line | Six facts recorded, fixture written, GATE B PASS |
+| T00L | Linear boundary retrofit, after T25 | **OPUS ONLY** | `migrations/002_linear.sql`, `errors.py`, `policy.py`, `sql.py`, `undo.py`, `models.py` if needed, `tests/test_invariants.py`, BUILD_SPEC sections 3, 4, 6, 11, `docs/ARCHITECTURE.md` parts 2 and 4 | Invariant suite passes at whatever count D-29 concludes, no network |
 | T26 | Linear client and name to id resolution | SOL | `linear.py`, `config.py`, BUILD_SPEC section 10, `docs/ARCHITECTURE.md` part 5 | Enums build from the live workspace; `FakeTracker` satisfies the same contract |
 | T27 | Projector worker | SOL | `projector.py`, `docs/ARCHITECTURE.md` part 8 | Outbox drains in order, serialized per task, remote id written back atomically with completion, unmapped updates completed without a remote call, retry with backoff |
 | T28 | Reconciler | SOL WRITES, OPUS REVIEWS | `reconciler.py`, `docs/ARCHITECTURE.md` parts 10 and 11 | External edit sets `diverged`; archived issues excluded; a pending projection does not cause divergence; an issue created in Linear imports |
@@ -797,23 +796,19 @@ documentation block is not done.
 
 Ordering, with reasons.
 
-**T00B next, immediately after T06 merges, before T07.** It was meant to run on
-day one alongside T00A and did not exist yet, so it is overdue. It writes almost
-no code and it can invalidate design assumptions, which is the definition of
-something that should not wait. If Gate B fails, T00L and T26 through T29 never
-get written and two days are saved.
+**T00B remains where it completed, after T06 and before T07.** Its GATE B PASS is
+the prerequisite for every remaining Linear task. It is not rerun merely because
+the optional expansion starts later.
 
-**T00L before T07.** T07 writes `undo.py`, and the precheck clause is much
-cheaper to write once than to retrofit into a merged kernel file. T00L also
-carries the migration, which everything downstream needs.
+**T00L and T26 through T29 run after T25 only.** The exact order is
+`T25 -> T00L -> T26 -> T27 -> T28 -> T29`. T00L carries the migration and the
+boundary retrofit, including the explicit second edit to merged KERNEL
+`undo.py`. T26 consumes that foundation, T27 consumes the client, T28 consumes
+projected state, and T29 resets the complete integration.
 
-**T26 after T08.** It needs config and the domain layer, both of which exist by
-then. It is off the critical path to the T15 ugly demo bar, and starting it
-earlier competes with Gate C.
-
-**T27 through T29 after T21, targeting end of day five.** Days six and seven are
-rehearsal. Landing a live external integration on day seven with no rehearsals
-is the single most reliable way to convert a working demo into a broken one.
+The core Trellis demo therefore reaches its clean-clone and rehearsal bar before
+optional external integration work begins. If the Linear expansion is cut, none
+of T00L or T26 through T29 runs.
 
 Estimated cost for T00B, T00L, and T26 through T29 together: about a day and a
 half. Paid for from the STRETCH items first, then cut order item 1, the external

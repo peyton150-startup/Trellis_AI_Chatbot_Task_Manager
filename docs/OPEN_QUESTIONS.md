@@ -341,14 +341,14 @@ Note:      Because nothing in option B touches `policy.py` or `idempotency.py`,
 Task:      T07
 Blocking:  yes
 Status:    RESOLVED by D-37, agreed with the user on 2026-08-13
-Context:   `CLAUDE.md` names both documents as sources of truth. Section 12 of
-           `docs/BUILD_SPEC.md` describes T07 as `undo.py` "as specified" and
-           lists no T00L row. Section 8 of `docs/LINEAR_INTEGRATION.md`
-           sequences T00L before T07 and gives T07's done-when as "As specified,
-           plus the diverged refusal", meaning the `EXTERNALLY_MODIFIED`
-           precheck from its section 4.4. Section 12 absorbed the T00B row when
-           T00B landed and absorbed nothing else, so the two tables have been
-           out of step since the Linear specification merged.
+Context:   At the time of Q-08, `CLAUDE.md` named both documents as sources of
+           truth. Section 12 of `docs/BUILD_SPEC.md` described T07 as `undo.py`
+           "as specified" and listed no T00L row. Section 8 of
+           `docs/LINEAR_INTEGRATION.md` sequenced T00L before T07 and gave T07's
+           done-when as "As specified, plus the diverged refusal", meaning the
+           `EXTERNALLY_MODIFIED` precheck from its section 4.4. Section 12 had
+           absorbed the T00B row when T00B landed and nothing else, so the two
+           tables were out of step.
            This is a contradiction rather than a gap, which is the case rule 0.1
            exists for. D-36, merged while T07 was being scoped, compounds it: it
            states that "T00L and T07 add EXTERNALLY_MODIFIED logic to KERNEL
@@ -364,7 +364,10 @@ Options:   A. BUILD_SPEC governs. T07 implements section 8 as written and the
            C. Cut the Linear expansion, making the contradiction moot.
 Resolution: A, agreed with the user on 2026-08-13. Recorded as D-37, which also
            demotes the LINEAR_INTEGRATION section 8 sequencing to proposed and
-           re-aims D-36's review commitment at something that exists.
+           re-aims D-36's review commitment at something that exists. D-46 later
+           ratifies the final schedule: T00B stays after T06, while T00L and T26
+           through T29 run after T25. Section 8 now matches BUILD_SPEC, so the
+           original contradiction is no longer present.
 
 ## Q-09  Section 8's precheck is unimplementable for a run that touched one task twice
 Task:      T07
