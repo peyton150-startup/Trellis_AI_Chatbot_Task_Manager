@@ -215,9 +215,9 @@ changes in T06.
 **Local role:** Adds `docs/LINEAR_INTEGRATION.md`, the single authoritative
 description of how this build reaches Linear. It carries the six Linear
 decisions, D-24 through D-29, the schema delta for `002_linear.sql`, the deltas
-for BUILD_SPEC, ARCHITECTURE, and PROJECT_PLAN, and the corrected task sequence
-T00B, T00L, T07, then T26 through T29. It implements nothing and changes no
-behaviour; it is the plan the six tasks after it build against.
+for BUILD_SPEC, ARCHITECTURE, and PROJECT_PLAN, and the then-proposed task
+sequence T00B, T00L, T07, then T26 through T29. It implements nothing and
+changes no behaviour. Revision 02 below supersedes only that sequence.
 
 **Whole-system role:** It settles where an external system attaches without
 breaking what the architecture exists to prove. A Linear GraphQL mutation cannot
@@ -238,10 +238,11 @@ the merged migration `001_init.sql`, which cannot be edited.
 **Outputs and consumers:** D-24 through D-29. T00B consumes the six Gate B facts
 and the contract fixture requirement. T00L consumes the schema delta, the
 `EXTERNAL_DIVERGENCE` code, the `policy.check` divergence step, and the invariant
-count reconciliation. T07 consumes the `EXTERNALLY_MODIFIED` precheck. T26
-through T29 consume the client surface, projector coordination, reconciler
-safeguards, and the fenced reset. Each documentation delta names its owning task,
-so no block is unassigned.
+count reconciliation. Revision 01 proposed that T07 consume the
+`EXTERNALLY_MODIFIED` precheck; D-37 deferred it and D-46 assigns the retrofit to
+T00L. T26 through T29 consume the client surface, projector coordination,
+reconciler safeguards, and the fenced reset. Each documentation delta names its
+owning task, so no block is unassigned.
 
 **Verification:** Documentation only, so the evidence is that the design survives
 execution rather than that code passes. An Opus review ran the proposed
@@ -293,13 +294,13 @@ where the write path terminates.
 
 Four downstream tasks consume these facts. **T00L** takes the workspace object
 shapes and the divergence semantics into `migrations/002_linear.sql`, the
-`EXTERNAL_DIVERGENCE` code, and the `policy.check` divergence step. **T26** builds
+`EXTERNAL_DIVERGENCE` code, the `policy.check` divergence step, and the
+`EXTERNALLY_MODIFIED` retrofit to merged `undo.py`. **T26** builds
 tool argument enums at startup from fact 2's enumeration and resolves name to id
 using fact 2's uniqueness result. **T27** delivers mutations using fact 3's input
 shapes and must handle fact 6's finding that a replayed create conflicts rather
 than replaying. **T28** polls with fact 4's filter, cursor, and archived
-exclusion. T07 also gains its `EXTERNALLY_MODIFIED` precheck from the same
-design. If Gate B had failed, none of those would have been written.
+exclusion. If Gate B had failed, none of those would have been written.
 
 **Inputs and dependencies:** `docs/LINEAR_INTEGRATION.md` at revision 01, which
 landed separately as PR #10 and is the authoritative specification for this task
@@ -624,3 +625,36 @@ on GitHub's own runners, `npm run build`, or the branch protection configuration
 It did not examine the mutation claim, which is what left the gap above
 unreported: an unrecorded mutation table is invisible to every passing gate, the
 same class of defect the T00B review found by reading rather than by running.
+
+## Documentation schedule reconciliation, revision 02
+
+**Local role:** Reconciles the governing documents with BUILD_SPEC section 12.
+T00B remains complete after T06. T00L and T26 through T29 become an optional
+post-T25 sequence, and R2 becomes an explicit same-SHA review and execution gate
+between T12B and T13.
+
+**Whole-system role:** The schedule now protects the core interview artifact
+from optional integration work and makes the approval boundary executable in a
+fresh sandbox before UI work depends on it. The R2 rule prevents a static review,
+host result, or result from a different commit from being treated as proof of the
+T12A/T12B trust boundary.
+
+**Inputs and dependencies:** BUILD_SPEC section 1A, section 11's marker and lint
+contracts, section 12's task order, D-35 through D-37, the completed T00B GATE B
+PASS, and the detailed Linear contracts in `docs/LINEAR_INTEGRATION.md`.
+
+**Outputs and consumers:** D-46 records the final Linear order and assigns the
+merged `undo.py` retrofit to T00L. D-47 records the R2 same-SHA gate.
+`CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/PROJECT_PLAN.md`,
+`docs/LINEAR_INTEGRATION.md`, and Q-08 now direct later tasks to the same order
+and stopping conditions.
+
+**Verification:** Documentation-only checks compare every authoritative T00L,
+T26 through T29, and R2 reference against BUILD_SPEC; verify the exact lint,
+test, and build commands; check task order and table structure; scan changed
+lines for em dashes; and run `git diff --check`.
+
+**Limitations and review status:** No application code, CI workflow, dependency,
+database, or external system changes here. The 1.50d Linear estimate and D-36's
+funding ledger remain unchanged. R2 has not run; this change defines the gate
+that must run after T12B.
