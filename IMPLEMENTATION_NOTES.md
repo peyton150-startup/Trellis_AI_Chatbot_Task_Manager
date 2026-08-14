@@ -840,3 +840,60 @@ raise `ApprovalRequired` if the framework does not resend approval. None is
 silently closed here. T10 receives no standalone reviewer; D-35 and D-47 place
 its read-only review and execution at the immutable same-SHA R2 checkpoint
 after T12B.
+
+## T11: Prompts
+
+**Local role:** `prompts.py` owns the Trellis system instructions and the one
+function permitted to place task titles and notes into model input. The system
+prompt identifies the Trellis AI Agent, frames the authoritative todo list and
+requested changes as production responsibilities, describes the purpose and
+typed boundary of all six tools, and requires a clarifying question rather than
+a guess when one request could produce several outcomes. `render_task_block`
+implements the specified safe data envelope and the deliberately unsafe demo
+rendering without reading environment state.
+
+**Whole-system role:** The renderer establishes the provenance boundary between
+model instructions and untrusted Postgres task data. Normal operation preserves
+task content inside an explicit `<untrusted_data>` block that says the content
+is data and forbids following embedded directives. Demo unsafe mode exposes the
+same content as raw `title: notes` lines so T23 can demonstrate the protection
+failing. Keeping both behaviors behind one function gives T12A a single prompt
+assembly path and prevents later callers from inventing an unreviewed route for
+task content.
+
+**Inputs and dependencies:** T03 supplies the typed `Task` model and its
+`model_dump` serialization. T09 supplies the fixed Task K prompt-injection
+fixture. BUILD_SPEC section 10 fixes the function signature and both return
+shapes. The startup guard already owned by `config.py` restricts the unsafe flag
+to `APP_ENV=demo`; this module consumes only the `trust` decision passed by its
+caller and does not read `DEMO_UNSAFE_PROMPT_MODE` itself.
+
+**Outputs and consumers:** The module exports `SYSTEM_PROMPT` and
+`render_task_block`. T12A will register the six T10 tools, build model input from
+the system instructions, and pass authoritative task rows through this renderer.
+T17 relies on the clarification rule, while T23 relies on the paired safe and
+unsafe outputs for the injection demonstration. The stable `T11 prompts` CI
+check protects these contracts on every pull request.
+
+**Verification:** The permanent CI probe was written before `prompts.py`. Its
+red run failed with `ModuleNotFoundError: No module named 'app.prompts'`. After
+implementation, the same proof checks the role, all six tool names,
+clarification instead of guessing, exact safe JSON rendering, exact unsafe line
+rendering, and the Task K injection payload in both modes.
+
+```
+T11 prompts inline gate                         PASS T11
+cd backend && ruff check .                      All checks passed!
+cd backend && pytest -m "not network"           39 passed, 13 deselected
+```
+
+The local pytest run also reported one sandbox filesystem warning because it
+could not write `.pytest_cache`; test collection and all selected tests still
+completed successfully.
+
+**Limitations and review status:** T11 defines prompt text and task rendering
+only. T12A owns framework integration and the exact location where the guarded
+configuration value becomes the renderer's `trust` argument. T17 owns later
+behavioral proof of clarification, and T23 owns the end-to-end injection demo.
+No standalone review is allocated. D-35 and D-47 place T11 inspection in the
+immutable same-SHA R2 checkpoint after T12B.
