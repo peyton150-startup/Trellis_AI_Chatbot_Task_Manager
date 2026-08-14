@@ -204,6 +204,7 @@ Environment variables, `.env.example`:
 DATABASE_URL=postgresql://trellis:trellis@localhost:55432/trellis
 MODEL_ID=<set from the Day 4 bakeoff; provisional default on Day 1>
 ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
 ACTOR_ID=00000000-0000-0000-0000-000000000001
 DEMO_UNSAFE_PROMPT_MODE=false
 APP_ENV=dev
@@ -216,6 +217,20 @@ LEASE_TTL_SECONDS=120
 ```
 
 `MODEL_ID` is the only place a model is named. No model string appears anywhere else in the codebase.
+
+The runtime supports both `anthropic:<model>` with `ANTHROPIC_API_KEY` and
+`openai:<model>` with `OPENAI_API_KEY`. The provider prefix is part of
+`MODEL_ID`, not a second selector. When `agent.py` is built, construct the
+Pydantic AI agent directly from the configured value:
+
+```python
+agent = Agent(settings.model_id)
+```
+
+Do not branch on the provider in `agent.py`. Pydantic AI resolves the provider
+from the `MODEL_ID` prefix and reads the matching credential from the
+environment. Do not add a provider SDK pin unless the installed `pydantic-ai`
+version requires one; its dependency graph is authoritative.
 
 ---
 
