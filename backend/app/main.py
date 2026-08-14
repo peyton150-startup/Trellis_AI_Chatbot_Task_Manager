@@ -13,6 +13,8 @@ what each one costs in code:
    smuggled key reaches a handler at all. The handler for
    `RequestValidationError` below turns that into the section 6 error envelope
    with code VALIDATION_ERROR, matching the 422 that section 6 assigns.
+   D-48 adds the one bodyless POST present at T09: zero bytes continue and any
+   bytes raise the same error before reset opens a database transaction.
 
 3. The server never reads message history, tool calls, approvals, or run state
    from a request body. `CreateRunRequest` declares one field, `user_message`.
@@ -25,7 +27,7 @@ what each one costs in code:
    Missing and not-yours are the same rejection, so the API cannot be used to
    discover which run ids exist.
 
-Section 9's table lists eight endpoints. Three are here. The rest belong to the
+Section 9's table lists seven endpoints. Four are here. The rest belong to the
 tasks that own their behavior, under D-44: `/api/demo/reset` to T09 with the
 fixture, `/api/agui` to T12A, the approvals decision to T12B with the approval
 bridge, and undo to T18. `/api/runs/{id}/resume` is not here and is not coming,
@@ -40,11 +42,11 @@ identity later is a change of where `actor_id` comes from and nothing else.
 
 from uuid import UUID
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app import domain, runs
+from app import domain, runs, seed
 from app.config import settings
 from app.db import pool
 from app.errors import PolicyError, ValidationFailedError
@@ -58,6 +60,12 @@ from app.models import (
 
 
 app = FastAPI(title="Trellis", version="0.1.0")
+
+
+async def _require_no_body(request: Request) -> None:
+    """D-48: bodyless means zero bytes, and rejection precedes mutation."""
+    if await request.body():
+        raise ValidationFailedError("request body must be empty")
 
 
 def _envelope(code: str, message: str) -> dict:
@@ -144,3 +152,16 @@ def get_run(run_id: UUID) -> RunDetail:
     run, or names another actor's run, is the 403 that `runs.load` raises.
     """
     return runs.detail(run_id, settings.actor_id)
+
+
+@app.post(
+    "/api/demo/reset",
+    response_model=TasksResponse,
+    dependencies=[Depends(_require_no_body)],
+)
+def post_demo_reset() -> TasksResponse:
+    """Atomically replace all demo state with the fixed eleven-task fixture."""
+    with pool.connection() as conn:
+        tasks = seed.reset(settings.actor_id, conn=conn)
+        conn.commit()
+    return TasksResponse(tasks=tasks)

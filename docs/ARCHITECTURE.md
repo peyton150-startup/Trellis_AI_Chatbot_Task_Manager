@@ -266,7 +266,8 @@ TRUST / POLICY BOUNDARY
   actor scope | provenance | blast radius | approvals
   idempotency | optimistic concurrency
         │
-Domain services (only writer)
+Domain services (only normal application writer)
+  seed.py is the sole administrative exception, inside demo reset only
         │
 Postgres: tasks | task_events | agent_runs | tool_invocations | approvals
 ```

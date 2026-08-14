@@ -1638,3 +1638,71 @@ apply to R2.
 Any fix that changes the reviewed SHA invalidates the entire R2 result. The blind
 review, fresh-sandbox execution, and all three deterministic gates rerun against
 the new SHA before T13 starts.
+
+## Seed and reset decisions recorded at T09
+
+Recorded on 2026-08-14 after the missing route produced the expected 404 red
+probe and before any T09 production code was written.
+
+### D-48: reset is a narrow administrative writer with fixed data and a reviewed routing exception
+
+**Sol may author all of T09, including the bodyless-request guard.** The user
+granted a T09-only routing exception on 2026-08-14. It covers exactly one wire
+rule: zero request-body bytes continue, and any request-body bytes raise
+`VALIDATION_ERROR` with HTTP 422 before handler mutation. It authorizes no other
+wire-contract change. T11, T12A, and T12B keep their OPUS ONLY routing. The
+routing exception does not create a standalone T09 review. Per the user's
+2026-08-14 clarification, review remains batched at checkpoint 2 after T12B.
+That checkpoint receives the final T09 SHA; any later T09 fix changes the SHA
+reviewed there.
+
+**T09's implementation file list expands to `seed.py`, `main.py`, and `sql.py`.**
+D-44 already put `main.py` in T09. This decision adds `sql.py` for one narrow
+administrative insert and adds `docs/ARCHITECTURE.md`, `docs/BUILD_SPEC.md`,
+`docs/DECISIONS.md`, and `docs/OPEN_QUESTIONS.md` so the exception and the
+closed fixture choices travel with the code. CLAUDE.md's CI and implementation
+note companions remain implicit task files.
+
+**`seed.py` is the sole administrative exception to normal writer ownership.**
+`domain.py` remains the only writer of task business state during normal
+application operation. Reset is not an agent or domain mutation: it destroys
+all demo state and reconstructs a baseline in one transaction. `seed.py` may
+execute only `TRUNCATE_ALL_STATE` and `INSERT_SEED_TASK` as that reset
+orchestration. It writes no `task_events`, run, invocation, or approval rows and
+does not commit. The route owns the connection and commits only after all eleven
+inserts return. Any failure rolls the whole operation back.
+
+**`INSERT_SEED_TASK` has minimum authority.** The caller supplies `id`,
+`owner_id`, `title`, `notes`, `due_date`, `priority`, and `blocked_by`. SQL does
+not accept caller-controlled status, version, or timestamps. The schema fixes
+status to `open`, version to 1, and both timestamps to database values. The
+statement stays separate from `INSERT_TASK_RESTORED`, whose compensation path
+legitimately needs caller-controlled historical state.
+
+**The fixture identity and calendar are frozen.** The namespace literal is
+`8367986a-6f6a-5895-a6ac-41a894ffdb5c`. It was derived once as UUID5 of URL
+namespace name `https://trellis.local/demo-fixture/v1`; the literal is the
+runtime contract. Task ids are UUID5 of that namespace with names `task:A`
+through `task:K`. Dates are literal data, not calculated from the process clock:
+
+```text
+today       2026-08-17
+Friday      2026-08-21
+overdue 2   2026-08-15
+overdue 5   2026-08-12
+next week   2026-08-24
+```
+
+The BUILD_SPEC section 13 Note column is literal task data. Task B's note is
+`interview` and its separate `blocked_by` value is Task A's deterministic id.
+Task timestamps and response ordering are not deterministic fixture fields.
+
+**Reset produces baseline state, not historical activity.** After a successful
+reset, `tasks` contains exactly the eleven fixture rows and `task_events`,
+`agent_runs`, `tool_invocations`, and `approvals` contain no rows. Two resets
+produce the same task ids and semantic fixture fields. Atomicity is proved
+through the production route and writer: a test-only copy of the fixture gives
+a late row an already-used deterministic id, the real primary-key constraint
+aborts the reset, and every row in the pre-reset closed baseline plus the
+complete owner task list remains identical. No production fault switch or
+fixture-injection API is added.

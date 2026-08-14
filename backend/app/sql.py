@@ -76,6 +76,24 @@ VALUES (
 RETURNING *;
 """
 
+# The T09 administrative fixture insert, under D-48. It accepts exactly the
+# identity and semantic fields the fixed seed owns. Status, version, and both
+# timestamps remain schema-owned, unlike INSERT_TASK_RESTORED, whose undo path
+# legitimately carries historical values across a compensation.
+INSERT_SEED_TASK = """
+INSERT INTO tasks (id, owner_id, title, notes, due_date, priority, blocked_by)
+VALUES (
+  %(id)s::uuid,
+  %(owner_id)s::uuid,
+  %(title)s,
+  %(notes)s,
+  %(due_date)s::date,
+  %(priority)s::task_priority,
+  %(blocked_by)s::uuid
+)
+RETURNING *;
+"""
+
 UPDATE_TASK_GUARDED = """
 UPDATE tasks
    SET title = COALESCE(%(title)s, title),

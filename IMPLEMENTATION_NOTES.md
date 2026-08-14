@@ -658,3 +658,79 @@ lines for em dashes; and run `git diff --check`.
 database, or external system changes here. The 1.50d Linear estimate and D-36's
 funding ledger remain unchanged. R2 has not run; this change defines the gate
 that must run after T12B.
+
+## T09: Seed and reset
+
+**Local role:** `seed.py` owns the fixed eleven-task demo baseline and is the
+sole administrative exception to the normal rule that task writes go through
+`domain.py`. `POST /api/demo/reset` accepts exactly zero body bytes, truncates
+all five demo-state tables, inserts the complete fixture, and commits only after
+the last insert succeeds. The reusable body guard rejects any body bytes with
+the standard 422 `VALIDATION_ERROR` envelope before a database connection is
+opened.
+
+**Whole-system role:** Reset gives every demo and evaluation run the same
+semantic starting state while preserving PostgreSQL as the sole authority. The
+fixture includes the blocked interview pair, Friday and overdue cohorts, two
+negative controls, and the prompt-injection task that later policy, prompting,
+agent, and evaluation tasks consume. Stable task identifiers make observations
+comparable across resets. One transaction across truncation and all inserts
+prevents a failed reset from erasing or partially replacing authoritative state.
+
+**Inputs and dependencies:** The five-table schema and `TRUNCATE_ALL_STATE` from
+T01, pooled PostgreSQL connections from T02, and the `Task`, `TaskPriority`, and
+`TasksResponse` models from T03. D-48 fixes the UUID namespace, UUID5 naming
+scheme, semantic dates, literal titles and notes, administrative writer
+exception, strict bodyless contract, and T09 routing exception. `sql.py` remains
+the only SQL authority; `INSERT_SEED_TASK` accepts only fixture-owned identity
+and semantic fields, leaving status, version, and timestamps to schema defaults.
+
+**Outputs and consumers:** `SEED_FIXTURE` and `seed.reset` produce eleven open,
+version-one tasks owned by the configured demo actor. The reset response returns
+those tasks through the existing typed response model. T10 through T12B consume
+the fixture as the deterministic agent baseline; later demo and evaluation work
+depends on its stable identifiers and semantic cohorts. The bodyless guard is
+intentionally reusable by T18's undo endpoint, but T09 does not add that route.
+
+**Verification:**
+
+```
+cd backend && ruff check .                    All checks passed!
+cd backend && pytest -m "not network"         39 passed, 13 deselected
+T09 seed and reset inline gate                PASS T09
+```
+
+The red probe preceded implementation: zero-byte `POST /api/demo/reset`
+returned 404 instead of the required 200. The permanent `T09 seed and reset` CI
+job runs all earlier gates and then proves the namespace provenance, every
+literal fixture field, the B-to-A dependency, stable identifiers across two
+successful resets, and rejection of JSON, `null`, whitespace, and other body
+bytes before mutation. It also proves that a successful reset clears the closed
+baseline's keyed evidence from tasks, events, runs, leases, and approvals. The
+reset implementation has no history-writing path, so the fixture insertion
+creates task rows only.
+
+For rollback, the gate constructs the entire pre-reset baseline after
+truncation, including rows in all five tables, and fingerprints every baseline
+row through existing production reads. It replaces only the in-process fixture
+constant so the final seed row reuses the first row's deterministic identifier,
+then invokes the production route. The resulting real PostgreSQL primary-key
+failure occurs after truncation and ten successful inserts. The route returns
+500, and every pre-reset row plus the complete task list remains identical after
+rollback. No production fixture-injection interface or test-only dump SQL was
+added.
+
+**Limitations and review status:** Determinism covers identifiers and semantic
+fields. Database timestamps and response ordering are explicitly not fixture
+contracts. Reset is deliberately destructive on success and is suitable only
+for this single-actor demo environment. The administrative writer exception is
+limited to this fixed reset and does not authorize general task mutation outside
+`domain.py`.
+
+Under the user-approved D-48 routing exception, Sol authored all of T09,
+including the narrow no-body guard. This preserves Opus capacity for T11 and
+T12A/T12B. The exception authorizes only `0 body bytes -> continue; any body
+bytes -> 422 before mutation` and no broader wire-contract change. This
+exception does not spend a standalone review. Per the user's 2026-08-14 timing
+clarification, T09 review remains batched at checkpoint 2 after T12B, where the
+reviewed SHA and any findings or dispositions will be recorded.
