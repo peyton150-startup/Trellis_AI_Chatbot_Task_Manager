@@ -1650,11 +1650,11 @@ probe and before any T09 production code was written.
 granted a T09-only routing exception on 2026-08-14. It covers exactly one wire
 rule: zero request-body bytes continue, and any request-body bytes raise
 `VALIDATION_ERROR` with HTTP 422 before handler mutation. It authorizes no other
-wire-contract change. T11, T12A, and T12B keep their OPUS ONLY routing. The
-routing exception does not create a standalone T09 review. Per the user's
-2026-08-14 clarification, review remains batched at checkpoint 2 after T12B.
-That checkpoint receives the final T09 SHA; any later T09 fix changes the SHA
-reviewed there.
+wire-contract change. D-49 later reassigns T11 to Sol; T12A and T12B keep their
+OPUS ONLY routing. The routing exception does not create a standalone T09
+review. Per the user's 2026-08-14 clarification, review remains batched at
+checkpoint 2 after T12B. That checkpoint receives the final T09 SHA; any later
+T09 fix changes the SHA reviewed there.
 
 **T09's implementation file list expands to `seed.py`, `main.py`, and `sql.py`.**
 D-44 already put `main.py` in T09. This decision adds `sql.py` for one narrow
@@ -1706,3 +1706,35 @@ a late row an already-used deterministic id, the real primary-key constraint
 aborts the reset, and every row in the pre-reset closed baseline plus the
 complete owner task list remains identical. No production fault switch or
 fixture-injection API is added.
+
+## Model allocation decision recorded on 2026-08-14
+
+### D-49: T09 through T12B use the original mixed T10 split, with boundary-first Opus triage
+
+The active authoring allocation is:
+
+```text
+T09   Sol
+T10   Opus: create_task only
+      Sol: remaining five tools
+T11   Sol
+T12A  Opus
+T12B  Opus
+```
+
+For T10, Opus authors only the complete `create_task` reference implementation,
+including policy, idempotency lease, domain mutation and event, and invocation
+completion in one transaction. Sol transcribes the other five tools against
+that exact structure without redesigning the reference.
+
+This preferred split consumes Opus capacity beyond the two substantial T12A and
+T12B passes. If only two substantial Opus authoring passes actually remain,
+both go to T12A and T12B and Sol writes all six T10 tools from BUILD_SPEC section
+10. That fallback is authorized for T10 only. T11 is Sol work in either case.
+
+The final T10 result receives non-authoring, read-only review only after all six
+tools exist and T10 verification passes. D-35's compressed cadence remains in
+force: this review occurs inside R2, against R2's immutable same SHA, and focuses
+on `create_task` as the reference plus the shared transaction shape. This
+decision adds no intermediate review checkpoint. A T10 change after review
+invalidates the R2 result under D-47.
