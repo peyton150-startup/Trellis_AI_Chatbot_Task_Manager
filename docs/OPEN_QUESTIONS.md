@@ -421,3 +421,22 @@ Options:   A. Expand the file list with recorded decisions, as T04 and T05 did.
 Resolution: A. D-39 covers the three statements and the two domain entry points,
            D-40 the test-authorship exception and why the thirteen test names do
            not grow, D-41 the orchestration and cascade-event boundary.
+
+## Q-11  How does T09 insert deterministic baseline ids without breaking writer ownership, and what exactly is fixed?
+Task:      T09
+Blocking:  yes
+Status:    RESOLVED by D-48, authorized by the user on 2026-08-14
+Context:   Section 13 requires ids from a fixed namespace but gives no namespace
+           value, calls two dates only `next week`, and does not say whether
+           reinsertion creates audit history. `domain.create_task` cannot accept
+           deterministic ids. A bodyless FastAPI route also accepts arbitrary
+           request bytes unless T09 adds enforcement from section 9's OPUS ONLY
+           block, while T09 is routed to Sol.
+Options:   A. Add an unaudited administrative entry point to `domain.py`.
+           B. Make `seed.py` the sole reset-only writer exception, add a narrow
+              `INSERT_SEED_TASK`, freeze the namespace and dates, create no
+              history, and grant Sol the exact body-guard exception needed here.
+Resolution: B. D-48 records the file expansion, minimum-authority SQL,
+           namespace, dates, literal notes, zero-history baseline, transaction
+           proof, and checkpoint-2 review after T12B. The Sol exception is
+           T09-only and does not change T11, T12A, or T12B routing.
