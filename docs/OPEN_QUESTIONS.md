@@ -441,3 +441,50 @@ Resolution: B. D-48 records the file expansion, minimum-authority SQL,
            proof, and checkpoint-2 review after T12B. The Sol exception itself
            is T09-only and does not change T12A or T12B routing. D-49 later
            reassigns T11 to Sol.
+
+## Q-12  The frozen tool order prevents replay after a committed delete
+Task:      T10
+Blocking:  yes
+Status:    OPEN, reproduced on 2026-08-14
+Context:   BUILD_SPEC section 10 and the Opus `create_task` reference require
+           every tool to run `policy.check` before `idempotency.acquire`, and
+           the reference explains why: a refused call must take no lease.
+           Section 7 and section 14 also require a repeated completed call to
+           return its stored result without re-executing the mutation.
+
+           Those requirements conflict for `delete_tasks`. A successful first
+           call removes the target row. On the identical second call,
+           `policy.check` performs its mandatory scope load, observes that the
+           target is missing, and raises the same `OUT_OF_SCOPE` used for a
+           foreign row. Execution never reaches `idempotency.acquire`, so the
+           completed lease cannot return its stored result.
+
+           This was reproduced against PostgreSQL 16 with the fixed Task A
+           fixture. The owned-row lookup returned Task A with the configured
+           actor before execution. The approved first call committed the
+           deletion and its cascade event. The identical second call raised
+           `OUT_OF_SCOPE` at `policy.py` step 1 before reading the completed
+           lease. The same probe passes for Opus's `create_task`, because that
+           tool has no target ids, and for updates, because their target rows
+           survive the mutation.
+Options:   A. Add an Opus-owned, read-only completed-replay preflight before
+              policy. It returns only a completed, same-hash result and never
+              creates or reacquires a lease. This preserves the rule that a
+              refused new call takes no lease, but it edits the idempotency
+              kernel and the frozen order, so D-31 requires a re-plan and a
+              recorded decision.
+           B. Permit `delete_tasks` to catch `OUT_OF_SCOPE` and inspect the
+              lease in `tools.py`. This keeps the ordinary order but duplicates
+              kernel lease interpretation outside `idempotency.py` and makes
+              policy refusal conditional on persistence internals. Rejected as
+              an unrecorded workaround.
+           C. Reorder acquire ahead of policy for every tool. This makes replay
+              reachable but causes a refused new call to insert a pending
+              lease, directly violating the reference implementation and the
+              stated reason for its order.
+           D. Declare committed delete replay unsupported. This preserves the
+              printed order but weakens the task-boundary resumability and
+              duplicate-call claims without a recorded architecture decision.
+Resolution: Pending. Option A is the narrowest design that preserves both
+           security and replay semantics, but it requires Opus-owned kernel
+           work and explicit authorization before T10 can continue.

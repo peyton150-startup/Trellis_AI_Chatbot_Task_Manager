@@ -770,3 +770,73 @@ five-step contract; scan changed lines for em dashes; and run
 database, task estimate, or task order changes here. The fallback is conditional
 on actual remaining Opus capacity. R2 has not run; it remains the non-authoring,
 read-only review and execution gate after T12B.
+
+## T10: Tools
+
+**Local role:** `tools.py` exposes the six directly callable typed operations
+and owns their shared orchestration boundary. Every body canonicalizes its
+arguments with `_payload`, computes the argument hash, performs the actor-bound
+completed-replay preflight, classifies approval with a mutation-only blast
+radius, rechecks policy, acquires the idempotency lease, and completes the call
+inside the transaction that owns its domain work. `list_tasks` tracks a bounded
+read. `create_task`, `update_task`, `bulk_update_tasks`, and `delete_tasks` write
+domain events with their mutations. `propose_plan` returns one display plan and
+completes a lease while writing no task state or task event.
+
+**Whole-system role:** T10 is the single path from a validated model tool call
+to authoritative Postgres state. A browser-supplied run id cannot grant access,
+because every tool resolves run ownership in the replay preflight before any
+other work. New calls still pass actor scope and stored approval before taking a
+lease. Completed calls return the stored JSON result without repeating domain
+work, including after a delete or later mutation removes the original target.
+Mutation, audit evidence, and lease completion remain one atomic commit, which
+preserves the proof that an expired pending lease can only represent work that
+did not land. Separating ownership targets from the mutation count keeps a
+checked `blocked_by` relationship from inflating conditional approval.
+
+**Inputs and dependencies:** T03 supplies the six Pydantic argument models,
+tool names, lease actions, and JSON-safe task snapshots. T04 supplies canonical
+hashing, actor scope, approval verification, and classification. T05 supplies
+lease acquisition, failure, completion, and the corrected actor-, tool-, and
+hash-bound completed replay preflight. T06 supplies all domain reads, writes,
+and pending events. T08 supplies the server-owned run and approval readers.
+D-12, D-15, D-18, D-42, and D-49 constrain the shared body, while the corrected
+`create_task` reference fixes the preflight order and separate blast-radius
+count transcribed by the other five tools.
+
+**Outputs and consumers:** The module exports `ToolContext`, `list_tasks`,
+`create_task`, `update_task`, `bulk_update_tasks`, `delete_tasks`,
+`propose_plan`, and the four-name `MUTATING_TOOLS` set used by later evaluation
+invariants. T11 names these operations in the system prompt. T12A adapts the
+framework run context into `ToolContext` and registers the functions. T12B
+provides the approval rows that destructive and over-threshold bodies verify.
+T19 later wraps this path with timeouts, while T20 renders its durable lease
+attempts. The stable `T10 tools` CI check reruns every established gate plus a
+real PostgreSQL probe of the complete six-tool boundary.
+
+**Verification:** The permanent T10 probe was written before the remaining
+tool changes. Its red run failed on the first expected defect:
+`list_tasks did not refuse the foreign run first: did not raise
+OutOfScopeError`. After transcription, the same probe passes 53 database-backed
+scenarios. For every tool it proves foreign and missing run refusal before
+work, normal execution without a prior lease, exact completed replay without a
+write, expired-pending and failed fallthrough to guarded attempt 2, tool-name
+and argument-hash conflict, and no lease on refusal. It also proves that three
+bulk targets plus one checked blocker do not require approval.
+
+```
+cd backend && ruff check .                    All checks passed!
+cd backend && pytest -m "not network"         39 passed, 13 deselected
+T10 tools inline PostgreSQL gate              PASS T10
+```
+
+**Limitations and review status:** The handoff leaves five architecture record
+items outside Sol's authority: D-12's printed order needs correction, completed
+replay bypasses approval revalidation and needs its D-06 exception recorded,
+`IDEMPOTENCY_CONFLICT` now also covers a tool-name mismatch, the D-31 schedule
+payment for the kernel expansion is unresolved, and the preflight-to-policy
+race recheck has no concurrent probe. A conditional approval retry can still
+raise `ApprovalRequired` if the framework does not resend approval. None is
+silently closed here. T10 receives no standalone reviewer; D-35 and D-47 place
+its read-only review and execution at the immutable same-SHA R2 checkpoint
+after T12B.
