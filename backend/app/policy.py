@@ -69,6 +69,7 @@ def check(
     *,
     run_id: UUID,
     tool_call_id: str,
+    blast_radius_count: int | None = None,
 ) -> PolicyDecision:
     """Called inside the tool body, immediately before any mutation, on EVERY
     path including the approved one. This is the authoritative gate.
@@ -90,7 +91,23 @@ def check(
     destructive = tool_name in DESTRUCTIVE_TOOLS
     # len, not a distinct count. Four references to one id count as four and
     # fail closed. See D-17.
-    count = len(target_task_ids)
+    #
+    # Scope and blast radius are two different questions asked of two different
+    # lists, and conflating them inflates the approval gate. A tool may need an
+    # id checked for ownership without that id being something the call mutates:
+    # `create_task` and `bulk_update_tasks` both resolve `blocked_by`, which
+    # names a row they point at rather than a row they change. Counting it made
+    # three ids plus one blocker cross a threshold of three, gating a call whose
+    # contract says the gate depends on `len(task_ids)`.
+    #
+    # The default preserves the original behavior exactly, and it defaults in the
+    # conservative direction rather than the permissive one: a caller that
+    # forgets it over-counts and gates too often, which fails closed. That is why
+    # this is optional where D-15's run_id and D-18's conn are required. Those
+    # two fail open when omitted; this one does not.
+    count = (
+        len(target_task_ids) if blast_radius_count is None else blast_radius_count
+    )
     over_blast = count > settings.blast_radius_threshold
     requires_approval = destructive or over_blast
     reason = ApprovalReason.DESTRUCTIVE if destructive else ApprovalReason.BLAST_RADIUS

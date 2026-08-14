@@ -88,6 +88,95 @@ def acquire(
         return _resolve_conflict(conn, run_id, tool_call_id, args_hash)
 
 
+def replay_completed(
+    run_id: UUID,
+    tool_call_id: str,
+    tool_name: str,
+    args_hash: str,
+    *,
+    actor_id: UUID,
+) -> object | None:
+    """Return a committed result for a byte-identical repeat, or None.
+
+    This exists because section 10's order and section 14's duplicate-call
+    guarantee contradict each other for any tool whose target rows are absent by
+    the time the call repeats. `policy.check` runs first and performs a mandatory
+    scope load; a target that no longer exists is indistinguishable from another
+    actor's row, by design, so it raises OUT_OF_SCOPE and `acquire` is never
+    reached. The stored result then sits in a completed lease that nothing can
+    return. `delete_tasks` guarantees this by succeeding, and an update whose
+    target is deleted afterwards reaches it too.
+
+    Why this is not a hole in the trust boundary. A completed row exists only
+    because `acquire` ran, which happens only after `policy.check` passed, and it
+    reaches `completed` only inside the transaction that committed the mutation.
+    So a completed row with a matching hash is evidence that this call was
+    already authorized and its result already returned once. Handing back the
+    same bytes to the same actor discloses nothing new. The scope rule is a
+    control against probing rows you never owned, and this is not that.
+
+    Three things carry that argument, and removing any one of them breaks it:
+
+    - **Actor.** `tool_invocations` stores no actor, and `SELECT_LEASE` carries
+      no actor predicate, so ownership is resolved through `runs.load` before the
+      lease is read at all. A foreign or missing run is refused here rather than
+      returning None, because falling through would let `acquire` replay another
+      actor's result for any tool whose policy check has no target ids to catch
+      it. This is the only actor check the tool body has.
+    - **Tool.** `tool_name` is compared here even though `_resolve_conflict` does
+      not compare it. That asymmetry is deliberate rather than overlooked: a
+      mismatch that fell through this function would reach `acquire` and replay
+      under the wrong tool, so this raises instead of returning None.
+    - **Arguments.** The hash is compared before status is examined, matching the
+      ordering `_resolve_conflict` uses for the same reason. A completed row
+      whose hash differs must not replay a result belonging to other arguments.
+
+    On mismatch this raises rather than returning None, and that precedence is
+    deliberate. Falling through would land on the OUT_OF_SCOPE that this function
+    exists to get past, so the caller would see 403 for what is actually a 409.
+    Reporting the conflict is safe because the read is already actor bound: it
+    only ever tells a caller about a call id inside a run they own.
+
+    Returns None for a row that is pending or failed, and for no row at all,
+    which hands the call to `policy.check` and then to `acquire` unchanged. None
+    is usable as the sentinel because every tool stores a list.
+    """
+    # Ownership first, and terminally. A run that does not exist and a run
+    # belonging to someone else both raise OutOfScopeError here, identically,
+    # which is the same refusal `SELECT_RUN` already guarantees. Returning None
+    # for a foreign run would be wrong: the call would fall through to policy,
+    # which cannot rescue a tool with no target ids, and `acquire` would then
+    # replay the other actor's stored result off a lookup that carries no actor
+    # predicate. Resolving here rather than trusting the caller follows
+    # `runs.load_history`, which takes actor_id and resolves internally for the
+    # same reason.
+    #
+    # Imported inside the function because runs.py imports the pool at module
+    # scope, and this module is deliberately importable without a database.
+    from . import runs
+
+    runs.load(run_id, actor_id)
+
+    with _pool().connection() as conn:
+        row = _select_lease(conn, run_id, tool_call_id)
+
+    if row is None:
+        # Owned run, no invocation. An ordinary first call. Hand it to policy and
+        # then to acquire, unchanged.
+        return None
+
+    if row["tool_name"] != tool_name:
+        raise IdempotencyConflictError()
+
+    if row["arguments_hash"] != args_hash:
+        raise IdempotencyConflictError()
+
+    if row["status"] != LeaseStatus.COMPLETED.value:
+        return None
+
+    return row["result"]
+
+
 def complete(run_id: UUID, tool_call_id: str, result, *, conn) -> None:
     """Mark the lease completed and store the result the retry will replay.
 

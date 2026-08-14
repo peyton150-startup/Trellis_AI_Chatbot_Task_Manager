@@ -2627,3 +2627,557 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  t10-tools:
+    name: T10 tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      - name: Verify all six tool bodies and replay preflight
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from uuid import UUID, uuid4
+
+          from psycopg.types.json import Json
+
+          from app import domain, idempotency, policy, runs, sql, tools
+          from app.config import settings
+          from app.db import pool
+          from app.errors import IdempotencyConflictError, OutOfScopeError
+          from app.models import (
+              BulkUpdateTasksArgs,
+              CreateTaskArgs,
+              DeleteTasksArgs,
+              ListTasksArgs,
+              ProposePlanArgs,
+              UpdateTaskArgs,
+          )
+
+
+          ACTOR = settings.actor_id
+          OTHER = UUID("00000000-0000-0000-0000-000000000002")
+          TOOL_NAMES = (
+              "list_tasks",
+              "create_task",
+              "update_task",
+              "bulk_update_tasks",
+              "delete_tasks",
+              "propose_plan",
+          )
+          STORED_RESULT = [{"stored": "result"}]
+
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+
+          def reset():
+              with pool.connection() as conn:
+                  conn.execute(sql.TRUNCATE_ALL_STATE)
+                  conn.commit()
+
+
+          def create_task(owner_id, title):
+              with pool.connection() as conn:
+                  mutation = domain.create_task(
+                      owner_id,
+                      CreateTaskArgs(title=title),
+                      conn=conn,
+                  )
+                  conn.commit()
+              return mutation.tasks[0]
+
+
+          def prepare(tool_name, label):
+              if tool_name == "list_tasks":
+                  create_task(ACTOR, f"{label} list baseline")
+                  arguments = ListTasksArgs(limit=7)
+                  payload = {
+                      "status": None,
+                      "due_before": None,
+                      "due_after": None,
+                      "priority": None,
+                      "limit": 7,
+                  }
+                  return arguments, payload, []
+
+              if tool_name == "create_task":
+                  blocker = create_task(ACTOR, f"{label} blocker")
+                  arguments = CreateTaskArgs(
+                      title=f"{label} created",
+                      blocked_by=blocker.id,
+                  )
+                  payload = {
+                      "title": f"{label} created",
+                      "notes": "",
+                      "due_date": None,
+                      "priority": "medium",
+                      "blocked_by": str(blocker.id),
+                  }
+                  return arguments, payload, [blocker.id]
+
+              if tool_name == "update_task":
+                  task = create_task(ACTOR, f"{label} update target")
+                  arguments = UpdateTaskArgs(
+                      task_id=task.id,
+                      expected_version=1,
+                      notes=f"{label} updated",
+                  )
+                  payload = {
+                      "notes": f"{label} updated",
+                      "task_id": str(task.id),
+                      "expected_version": 1,
+                  }
+                  return arguments, payload, [task.id]
+
+              if tool_name == "bulk_update_tasks":
+                  task = create_task(ACTOR, f"{label} bulk target")
+                  arguments = BulkUpdateTasksArgs(
+                      task_ids=[task.id],
+                      due_date=None,
+                  )
+                  payload = {"due_date": None, "task_ids": [str(task.id)]}
+                  return arguments, payload, [task.id]
+
+              if tool_name == "delete_tasks":
+                  task = create_task(ACTOR, f"{label} delete target")
+                  arguments = DeleteTasksArgs(task_ids=[task.id])
+                  payload = {"task_ids": [str(task.id)]}
+                  return arguments, payload, [task.id]
+
+              arguments = ProposePlanArgs(
+                  summary=f"{label} summary",
+                  steps=["first", "second"],
+              )
+              payload = {
+                  "summary": f"{label} summary",
+                  "steps": ["first", "second"],
+              }
+              return arguments, payload, []
+
+
+          def invoke(tool_name, run_id, call_id, arguments, *, approved=False):
+              function = getattr(tools, tool_name, None)
+              require(function is not None, f"{tool_name} is not implemented")
+              return function(
+                  tools.ToolContext(
+                      actor_id=ACTOR,
+                      run_id=run_id,
+                      tool_call_id=call_id,
+                      tool_call_approved=approved,
+                  ),
+                  arguments,
+              )
+
+
+          def approve_delete(run_id, call_id, payload):
+              args_hash = policy.arguments_hash(payload)
+              with pool.connection() as conn:
+                  conn.execute(
+                      sql.INSERT_APPROVAL,
+                      {
+                          "run_id": run_id,
+                          "tool_call_id": call_id,
+                          "tool_name": "delete_tasks",
+                          "arguments": Json(payload),
+                          "arguments_hash": args_hash,
+                          "required_reason": "destructive",
+                          "preview": Json(
+                              {"creates": [], "updates": [], "deletes": payload["task_ids"]}
+                          ),
+                          "approval_ttl_seconds": settings.approval_ttl_seconds,
+                      },
+                  )
+                  conn.execute(
+                      sql.DECIDE_APPROVAL,
+                      {
+                          "run_id": run_id,
+                          "tool_call_id": call_id,
+                          "decision": "approved",
+                      },
+                  )
+                  conn.commit()
+
+
+          def insert_lease(
+              run_id,
+              call_id,
+              tool_name,
+              args_hash,
+              *,
+              status="completed",
+              result=STORED_RESULT,
+          ):
+              ttl = -1 if status == "pending" else settings.lease_ttl_seconds
+              with pool.connection() as conn:
+                  conn.execute(
+                      sql.INSERT_LEASE,
+                      {
+                          "run_id": run_id,
+                          "tool_call_id": call_id,
+                          "tool_name": tool_name,
+                          "arguments_hash": args_hash,
+                          "lease_ttl_seconds": ttl,
+                      },
+                  )
+                  if status == "completed":
+                      idempotency.complete(run_id, call_id, result, conn=conn)
+                  conn.commit()
+              if status == "failed":
+                  idempotency.fail(run_id, call_id, "forced gate failure")
+
+
+          def read_lease(run_id, call_id):
+              with pool.connection() as conn:
+                  row = conn.execute(
+                      sql.SELECT_LEASE,
+                      {"run_id": run_id, "tool_call_id": call_id},
+                  ).fetchone()
+                  conn.commit()
+              return row
+
+
+          def read_tasks(owner_id=ACTOR):
+              with pool.connection() as conn:
+                  rows = conn.execute(
+                      sql.SELECT_TASKS_FOR_OWNER,
+                      {
+                          "owner_id": owner_id,
+                          "status": None,
+                          "due_before": None,
+                          "due_after": None,
+                          "priority": None,
+                          "limit": 50,
+                      },
+                  ).fetchall()
+                  conn.commit()
+              return [dict(row) for row in rows]
+
+
+          def read_events(run_id):
+              with pool.connection() as conn:
+                  rows = conn.execute(
+                      sql.SELECT_ALL_EVENTS_FOR_RUN,
+                      {"run_id": run_id},
+                  ).fetchall()
+                  conn.commit()
+              return [dict(row) for row in rows]
+
+
+          def fingerprint(run_id, call_id):
+              with pool.connection() as conn:
+                  run = conn.execute(
+                      sql.SELECT_RUN,
+                      {"run_id": run_id, "actor_id": ACTOR},
+                  ).fetchone()
+                  lease = conn.execute(
+                      sql.SELECT_LEASE,
+                      {"run_id": run_id, "tool_call_id": call_id},
+                  ).fetchone()
+                  approval = conn.execute(
+                      sql.SELECT_APPROVAL,
+                      {"run_id": run_id, "tool_call_id": call_id},
+                  ).fetchone()
+                  events = conn.execute(
+                      sql.SELECT_ALL_EVENTS_FOR_RUN,
+                      {"run_id": run_id},
+                  ).fetchall()
+                  tasks = conn.execute(
+                      sql.SELECT_TASKS_FOR_OWNER,
+                      {
+                          "owner_id": ACTOR,
+                          "status": None,
+                          "due_before": None,
+                          "due_after": None,
+                          "priority": None,
+                          "limit": 50,
+                      },
+                  ).fetchall()
+                  conn.commit()
+              return {
+                  "run": None if run is None else dict(run),
+                  "lease": None if lease is None else dict(lease),
+                  "approval": None if approval is None else dict(approval),
+                  "events": [dict(row) for row in events],
+                  "tasks": [dict(row) for row in tasks],
+              }
+
+
+          def remove_scope_targets(target_ids):
+              if not target_ids:
+                  return
+              with pool.connection() as conn:
+                  domain.delete_tasks(
+                      ACTOR,
+                      DeleteTasksArgs(task_ids=target_ids),
+                      conn=conn,
+                  )
+                  conn.commit()
+
+
+          def expect_raises(error_type, operation, message):
+              try:
+                  operation()
+              except error_type:
+                  return
+              except Exception as exc:
+                  raise RuntimeError(
+                      f"{message}: raised {type(exc).__name__}, expected {error_type.__name__}"
+                  ) from exc
+              raise RuntimeError(f"{message}: did not raise {error_type.__name__}")
+
+
+          def verify_owned_first_call(tool_name):
+              reset()
+              run = runs.create(ACTOR, f"T10 {tool_name} first", "t10-gate")
+              call_id = f"{tool_name}-first"
+              arguments, payload, _ = prepare(tool_name, "first")
+              if tool_name == "delete_tasks":
+                  approve_delete(run.id, call_id, payload)
+              result = invoke(
+                  tool_name,
+                  run.id,
+                  call_id,
+                  arguments,
+                  approved=tool_name == "delete_tasks",
+              )
+              lease = read_lease(run.id, call_id)
+              require(lease is not None, f"{tool_name} first call took no lease")
+              require(lease["status"] == "completed", f"{tool_name} lease did not complete")
+              require(lease["attempt"] == 1, f"{tool_name} first call was not attempt 1")
+              require(
+                  lease["arguments_hash"] == policy.arguments_hash(payload),
+                  f"{tool_name} did not hash the canonical payload",
+              )
+              require(result == lease["result"], f"{tool_name} returned a value unlike its lease")
+
+              events = read_events(run.id)
+              tasks = read_tasks()
+              if tool_name == "list_tasks":
+                  require(len(result) == 1, "list_tasks did not return its one owned task")
+                  require(events == [], "list_tasks wrote domain events")
+              elif tool_name == "create_task":
+                  require(result[0]["title"] == "first created", "create_task returned the wrong row")
+                  require(len(tasks) == 2, "create_task did not preserve its blocker and add one row")
+                  require(len(events) == 1, "create_task did not write exactly one event")
+              elif tool_name == "update_task":
+                  require(result[0]["notes"] == "first updated", "update_task did not apply notes")
+                  require(result[0]["version"] == 2, "update_task did not increment version")
+                  require(len(events) == 1, "update_task did not write exactly one event")
+              elif tool_name == "bulk_update_tasks":
+                  require(result[0]["version"] == 2, "bulk_update_tasks did not update its row")
+                  require(len(events) == 1, "bulk_update_tasks did not write exactly one event")
+              elif tool_name == "delete_tasks":
+                  require(len(result) == 1, "delete_tasks did not return the deleted row")
+                  require(tasks == [], "delete_tasks left its target behind")
+                  require(len(events) == 1, "delete_tasks did not write exactly one event")
+              else:
+                  require(result == [payload], "propose_plan returned the wrong display plan")
+                  require(tasks == [], "propose_plan mutated task state")
+                  require(events == [], "propose_plan wrote domain events")
+
+
+          def verify_run_refusal(tool_name, *, missing):
+              reset()
+              call_id = f"{tool_name}-{'missing' if missing else 'foreign'}"
+              run_id = uuid4() if missing else runs.create(
+                  OTHER, f"T10 {tool_name} foreign", "t10-gate"
+              ).id
+              arguments, _, _ = prepare(tool_name, "refusal")
+              expect_raises(
+                  OutOfScopeError,
+                  lambda: invoke(tool_name, run_id, call_id, arguments),
+                  f"{tool_name} did not refuse the {'missing' if missing else 'foreign'} run first",
+              )
+              require(
+                  read_lease(run_id, call_id) is None,
+                  f"{tool_name} refusal took a lease",
+              )
+
+
+          def verify_completed_replay(tool_name):
+              reset()
+              run = runs.create(ACTOR, f"T10 {tool_name} replay", "t10-gate")
+              call_id = f"{tool_name}-replay"
+              arguments, payload, target_ids = prepare(tool_name, "replay")
+              insert_lease(
+                  run.id,
+                  call_id,
+                  tool_name,
+                  policy.arguments_hash(payload),
+              )
+              remove_scope_targets(target_ids)
+              before = fingerprint(run.id, call_id)
+              result = invoke(tool_name, run.id, call_id, arguments)
+              after = fingerprint(run.id, call_id)
+              require(result == STORED_RESULT, f"{tool_name} did not return its stored result")
+              require(after == before, f"{tool_name} completed replay wrote database state")
+
+
+          def verify_noncompleted_fallthrough(tool_name, status):
+              reset()
+              run = runs.create(ACTOR, f"T10 {tool_name} {status}", "t10-gate")
+              call_id = f"{tool_name}-{status}"
+              arguments, payload, _ = prepare(tool_name, status)
+              if tool_name == "delete_tasks":
+                  approve_delete(run.id, call_id, payload)
+              insert_lease(
+                  run.id,
+                  call_id,
+                  tool_name,
+                  policy.arguments_hash(payload),
+                  status=status,
+              )
+              invoke(
+                  tool_name,
+                  run.id,
+                  call_id,
+                  arguments,
+                  approved=tool_name == "delete_tasks",
+              )
+              lease = read_lease(run.id, call_id)
+              require(lease["status"] == "completed", f"{tool_name} {status} lease did not execute")
+              require(lease["attempt"] == 2, f"{tool_name} {status} lease was not attempt 2")
+
+
+          def verify_mismatch(tool_name, *, wrong_tool):
+              reset()
+              kind = "tool" if wrong_tool else "hash"
+              run = runs.create(ACTOR, f"T10 {tool_name} {kind} mismatch", "t10-gate")
+              call_id = f"{tool_name}-{kind}-mismatch"
+              arguments, payload, _ = prepare(tool_name, kind)
+              stored_tool = (
+                  "list_tasks" if tool_name != "list_tasks" else "create_task"
+              ) if wrong_tool else tool_name
+              stored_hash = (
+                  policy.arguments_hash(payload) if wrong_tool else "f" * 64
+              )
+              insert_lease(run.id, call_id, stored_tool, stored_hash)
+              before = fingerprint(run.id, call_id)
+              expect_raises(
+                  IdempotencyConflictError,
+                  lambda: invoke(tool_name, run.id, call_id, arguments),
+                  f"{tool_name} accepted a {kind} mismatch",
+              )
+              require(
+                  fingerprint(run.id, call_id) == before,
+                  f"{tool_name} {kind} mismatch wrote database state",
+              )
+
+
+          def verify_owned_scope_refusal(tool_name):
+              reset()
+              run = runs.create(ACTOR, f"T10 {tool_name} scope", "t10-gate")
+              call_id = f"{tool_name}-scope"
+              foreign = create_task(OTHER, f"{tool_name} foreign target")
+              if tool_name == "create_task":
+                  arguments = CreateTaskArgs(title="scope create", blocked_by=foreign.id)
+              elif tool_name == "update_task":
+                  arguments = UpdateTaskArgs(
+                      task_id=foreign.id,
+                      expected_version=1,
+                      notes="scope update",
+                  )
+              elif tool_name == "bulk_update_tasks":
+                  arguments = BulkUpdateTasksArgs(
+                      task_ids=[foreign.id],
+                      notes="scope bulk",
+                  )
+              else:
+                  arguments = DeleteTasksArgs(task_ids=[foreign.id])
+              expect_raises(
+                  OutOfScopeError,
+                  lambda: invoke(
+                      tool_name,
+                      run.id,
+                      call_id,
+                      arguments,
+                      approved=tool_name == "delete_tasks",
+                  ),
+                  f"{tool_name} accepted another actor's target",
+              )
+              require(read_lease(run.id, call_id) is None, f"{tool_name} scope refusal took a lease")
+
+
+          for name in TOOL_NAMES:
+              verify_run_refusal(name, missing=False)
+              verify_run_refusal(name, missing=True)
+              verify_owned_first_call(name)
+              verify_completed_replay(name)
+              verify_noncompleted_fallthrough(name, "pending")
+              verify_noncompleted_fallthrough(name, "failed")
+              verify_mismatch(name, wrong_tool=True)
+              verify_mismatch(name, wrong_tool=False)
+
+          for name in ("create_task", "update_task", "bulk_update_tasks", "delete_tasks"):
+              verify_owned_scope_refusal(name)
+
+          # Scope checks include blocked_by, while the conditional approval count
+          # includes only rows the operation updates. Three targets plus a blocker
+          # must therefore pass a threshold of three without an approval.
+          reset()
+          run = runs.create(ACTOR, "T10 separated blast radius", "t10-gate")
+          blocker = create_task(ACTOR, "blast blocker")
+          targets = [create_task(ACTOR, f"blast target {index}") for index in range(3)]
+          arguments = BulkUpdateTasksArgs(
+              task_ids=[task.id for task in targets],
+              blocked_by=blocker.id,
+              notes="three rows only",
+          )
+          result = invoke(
+              "bulk_update_tasks",
+              run.id,
+              "bulk-separated-blast",
+              arguments,
+          )
+          require(len(result) == 3, "three-target bulk update did not complete")
+          require(
+              all(row["blocked_by"] == str(blocker.id) for row in result),
+              "bulk update did not apply the checked blocker",
+          )
+          require(
+              runs.load_approval(run.id, "bulk-separated-blast") is None,
+              "three-target bulk update created an approval",
+          )
+
+          reset()
+          print(
+              "PASS T10: all six tools refuse foreign and missing runs before work, "
+              "canonicalize and complete first calls, replay completed calls without "
+              "writes, pass pending and failed rows to acquire, reject tool and hash "
+              "mismatches, take no lease on refusal, and separate scope targets from "
+              "the three-row blast radius"
+          )
+          PY
+
+      - name: Verify cumulative deterministic tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
