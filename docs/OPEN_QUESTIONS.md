@@ -336,3 +336,85 @@ Note:      Because nothing in option B touches `policy.py` or `idempotency.py`,
            the lint work no longer trips the blast-radius gate and needs no
            re-plan or schedule cut. That is a consequence of the measurement, not
            an assumption; option A would have required both.
+
+## Q-08  BUILD_SPEC section 12 and LINEAR_INTEGRATION section 8 disagree about what T07 is
+Task:      T07
+Blocking:  yes
+Status:    RESOLVED by D-37, agreed with the user on 2026-08-13
+Context:   `CLAUDE.md` names both documents as sources of truth. Section 12 of
+           `docs/BUILD_SPEC.md` describes T07 as `undo.py` "as specified" and
+           lists no T00L row. Section 8 of `docs/LINEAR_INTEGRATION.md`
+           sequences T00L before T07 and gives T07's done-when as "As specified,
+           plus the diverged refusal", meaning the `EXTERNALLY_MODIFIED`
+           precheck from its section 4.4. Section 12 absorbed the T00B row when
+           T00B landed and absorbed nothing else, so the two tables have been
+           out of step since the Linear specification merged.
+           This is a contradiction rather than a gap, which is the case rule 0.1
+           exists for. D-36, merged while T07 was being scoped, compounds it: it
+           states that "T00L and T07 add EXTERNALLY_MODIFIED logic to KERNEL
+           undo.py" and commits to the delta receiving focused review at the
+           post-T08 checkpoint.
+Options:   A. BUILD_SPEC governs. T07 implements section 8 as written and the
+              divergence clause is a later retrofit. Cheapest path to T08 and
+              the ugly demo bar, and it costs a second edit to a merged KERNEL
+              file if T00L is taken, which D-31 prices at a re-plan.
+           B. Run T00L first, then write `undo.py` once with the clause.
+              Avoids the second kernel edit and costs about half a day before
+              T08 starts, on a task that is itself OPUS ONLY.
+           C. Cut the Linear expansion, making the contradiction moot.
+Resolution: A, agreed with the user on 2026-08-13. Recorded as D-37, which also
+           demotes the LINEAR_INTEGRATION section 8 sequencing to proposed and
+           re-aims D-36's review commitment at something that exists.
+
+## Q-09  Section 8's precheck is unimplementable for a run that touched one task twice
+Task:      T07
+Blocking:  yes
+Status:    RESOLVED by D-38, agreed with the user on 2026-08-13
+Context:   Section 8 step 3 compares each event against current database state:
+           `current.version == event.after["version"]`, and for a `deleted`
+           event, that the row is still absent. Both conditions are written
+           against the database, and only the newest event on a task can
+           satisfy them.
+           A run that creates a task and then updates it leaves the create
+           event's `after["version"]` at 1 while the row is at 2, so the undo
+           refuses `VERSION_CONFLICT` on a run nothing else touched. A run that
+           updates a task and then deletes it leaves the update event demanding
+           a row its own delete removed, so the undo refuses `ROW_DISAPPEARED`.
+           Both are runs the demo can produce.
+Options:   A. Walk the events in the same reverse order the apply pass uses and
+              compare each against projected state: the newest event on a task
+              against the database, earlier ones against the state left by
+              undoing the later ones. Identical to the literal reading for every
+              run that touches each task once.
+           B. Transcribe step 3 literally and record the refusal as a known
+              limitation.
+Resolution: A. Recorded as D-38, with the two-projection split the option
+           statement above does not capture: the precheck compares historical
+           versions from the snapshots while the apply pass guards on the
+           physical version in the row, and those diverge as soon as the first
+           compensation lands.
+
+## Q-10  T07 cannot reach its own done-when, restore a deletion, or read a run completely, within `undo.py` alone
+Task:      T07
+Blocking:  yes
+Status:    RESOLVED by D-39, D-40, and D-41, agreed with the user on 2026-08-13
+Context:   Section 12 lists T07's files as `undo.py`. Four things are outside
+           that list and none is optional.
+           Section 11 routes `test_invariants.py` to Sol while T07's done-when
+           is `test_stale_undo_refused` passing, the same collision D-16 and
+           D-20 resolved for T04 and T05, each scoped to its own task.
+           Section 5 has no statement that restores a deleted task under its
+           original id, and `INSERT_TASK` accepts neither `id` nor `version`.
+           Section 5's delete carries no version predicate, which is safe on the
+           tool path and not on the undo path, where the precheck that
+           established the version is a separate pass.
+           `SELECT_EVENTS_FOR_RUN` carries a `LIMIT`, and a truncated read
+           produces the partial undo section 8 forbids while still reporting
+           success.
+Options:   A. Expand the file list with recorded decisions, as T04 and T05 did.
+           B. Inline the SQL in `undo.py`, which CLAUDE.md and section 5 forbid.
+           C. Leave the named test to a later task, which leaves T07 with no
+              definition of done.
+Resolution: A. D-39 covers the three statements and the two domain entry points,
+           D-40 the test-authorship exception and why the thirteen test names do
+           not grow, D-41 the orchestration and cascade-event boundary.

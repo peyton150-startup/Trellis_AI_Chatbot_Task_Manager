@@ -1,8 +1,13 @@
 """The thirteen deterministic invariant tests from BUILD_SPEC section 11.
 
-T04 owns six of them and T05 adds three more. The remaining four belong to T07
-and T08 and are deliberately absent rather than skipped, so the count of
-collected tests always matches the count of proven invariants.
+T04 owns six of them, T05 adds three more, and T07 adds the tenth. The remaining
+three belong to T08 and are deliberately absent rather than skipped, so the
+count of collected tests always matches the count of proven invariants.
+
+T07 adds no name to section 11's list. Its one named test carries seven
+scenarios instead, following the shape T04 established for
+test_forged_approval_rejected, which covers three forgery shapes plus a positive
+control under a single name. See D-40.
 
 None of these constructs an Agent, calls a model, or makes a network call. They
 call the policy layer and the idempotency kernel directly against real
@@ -30,11 +35,21 @@ from psycopg.types.json import Json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import idempotency, policy, sql
+from app import domain, idempotency, policy, sql, undo
 from app.config import settings
 from app.db import pool
 from app.errors import PolicyError
-from app.models import Approval, LeaseAction, LeaseStatus, ToolInvocation, ToolName
+from app.models import (
+    Approval,
+    CreateTaskArgs,
+    DeleteTasksArgs,
+    LeaseAction,
+    LeaseStatus,
+    ToolInvocation,
+    ToolName,
+    UndoReason,
+    UpdateTaskArgs,
+)
 
 
 ACTOR_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -752,3 +767,339 @@ def test_expired_pending_lease_is_stolen(db):
     assert still_held.attempt == 1
     assert still_held.status is LeaseStatus.PENDING
     assert _count_tasks(db) == 1
+
+
+# ------------------------------------------------------------------ T07 undo
+
+
+def _run_step(conn, run_id, mutation):
+    """Commit one domain mutation and its events as a single tool would.
+
+    This is the section 10 step 4 shape from _commit_work above, without the
+    lease: undo cares about task_events rows and current task state, not about
+    which tool wrote them.
+    """
+    domain.write_events(run_id, ACTOR_ID, mutation.events, conn=conn)
+    conn.commit()
+    return mutation
+
+
+def _setup_task(conn, setup_run_id, title, **fields):
+    """Create a task under a run that is not the one being undone."""
+    mutation = _run_step(
+        conn,
+        setup_run_id,
+        domain.create_task(ACTOR_ID, CreateTaskArgs(title=title, **fields), conn=conn),
+    )
+    return mutation.tasks[0]
+
+
+def _foreign_write(conn, task_id, expected_version, title):
+    """A mutation by someone other than the run under undo, and unevented.
+
+    Deliberately writes no task_events row. Undo loads one run's events, so a
+    foreign write is invisible to it except through the version it leaves
+    behind, which is the whole point of the version guards.
+    """
+    row = conn.execute(
+        sql.UPDATE_TASK_GUARDED,
+        {
+            "id": task_id,
+            "owner_id": ACTOR_ID,
+            "expected_version": expected_version,
+            "title": title,
+            "notes": None,
+            "due_date": None,
+            "set_due_date": False,
+            "priority": None,
+            "status": None,
+            "blocked_by": None,
+            "set_blocked_by": False,
+        },
+    ).fetchone()
+    conn.commit()
+    assert row is not None, "the foreign write fixture did not take"
+    return row
+
+
+def _foreign_delete(conn, task_id):
+    conn.execute(
+        sql.DELETE_TASKS_BY_IDS, {"owner_id": ACTOR_ID, "task_ids": [task_id]}
+    )
+    conn.commit()
+
+
+def _recreate_task(conn, snapshot):
+    """Put a row back under an id undo expects to stay absent."""
+    conn.execute(
+        sql.INSERT_TASK_RESTORED,
+        {
+            "id": snapshot["id"],
+            "owner_id": snapshot["owner_id"],
+            "title": snapshot["title"],
+            "notes": snapshot["notes"],
+            "due_date": snapshot["due_date"],
+            "priority": snapshot["priority"],
+            "status": snapshot["status"],
+            "blocked_by": snapshot["blocked_by"],
+            "version": snapshot["version"] + 1,
+            "created_at": snapshot["created_at"],
+        },
+    )
+    conn.commit()
+
+
+def _tasks_by_id(conn):
+    rows = conn.execute(
+        sql.SELECT_TASKS_FOR_OWNER,
+        {
+            "owner_id": ACTOR_ID,
+            "status": None,
+            "due_before": None,
+            "due_after": None,
+            "priority": None,
+            "limit": 50,
+        },
+    ).fetchall()
+    conn.commit()
+    return {row["id"]: dict(row) for row in rows}
+
+
+def _run_events(conn, run_id):
+    rows = conn.execute(sql.SELECT_ALL_EVENTS_FOR_RUN, {"run_id": run_id}).fetchall()
+    conn.commit()
+    return rows
+
+
+def _fingerprint(conn, run_id):
+    """Both surfaces a refused undo must leave untouched.
+
+    Task rows in full, including version and updated_at, plus the run's event
+    count. Asserting only the first would pass an implementation that wrote a
+    restored event and then refused; asserting only the second would pass one
+    that mutated a row without auditing it.
+    """
+    return _tasks_by_id(conn), len(_run_events(conn, run_id))
+
+
+def test_stale_undo_refused(db):
+    """Undo applies in full or refuses in full, and never lands in between.
+
+    Seven scenarios under one name. Section 11 fixes the thirteen invariant test
+    names verbatim and this file's collected count is meant to equal the count
+    of proven invariants, so T07 deepens the named test rather than adding six
+    more names. See D-40.
+
+    Scenarios 1 through 3 are positive controls, and they are not padding: an
+    undo_run that refused unconditionally would pass scenarios 4 through 7
+    completely while being useless. Scenarios 2 and 3 are the multi-touch cases
+    that a literal reading of section 8's precheck refuses, which is what D-38
+    corrects. Scenarios 4 through 7 each assert zero writes on both surfaces,
+    rather than leaving that to one shared check, because one refusal path could
+    otherwise write before refusing while a different clean path proves nothing
+    about it.
+    """
+    # 1. Single touch, the shape section 8 was written against. One update, one
+    #    compensation, values back and version forward.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    original = _setup_task(db, setup_run_id, "Task A", notes="original")
+
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(
+                task_id=original.id,
+                expected_version=1,
+                title="Task A edited",
+                notes="edited",
+            ),
+            conn=db,
+        ),
+    )
+
+    result = undo.undo_run(run_id, ACTOR_ID)
+    assert result.refused is False
+    assert result.reason is None
+    assert result.applied == 1
+
+    row = _tasks_by_id(db)[original.id]
+    assert row["title"] == "Task A"
+    assert row["notes"] == "original"
+    # History is append-only and never rewound: the compensation is a forward
+    # mutation, so the version moves on rather than back to 1.
+    assert row["version"] == 3
+
+    events = _run_events(db, run_id)
+    assert len(events) == 2
+    assert events[0]["operation"] == "restored"
+    assert events[0]["before"]["title"] == "Task A edited"
+    assert events[0]["after"]["title"] == "Task A"
+
+    # 2. Create then update the same task in one run. The literal precheck
+    #    compares the create event's after.version of 1 against a current
+    #    version of 2 and refuses a run nothing else touched.
+    _truncate(db)
+    run_id = _insert_run(db)
+    created = _run_step(
+        db, run_id, domain.create_task(ACTOR_ID, CreateTaskArgs(title="Task B"), conn=db)
+    ).tasks[0]
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(
+                task_id=created.id, expected_version=1, title="Task B edited"
+            ),
+            conn=db,
+        ),
+    )
+
+    result = undo.undo_run(run_id, ACTOR_ID)
+    assert result.refused is False
+    assert result.applied == 2
+    assert _tasks_by_id(db) == {}
+
+    # 3. Update then delete the same task in one run. The literal precheck
+    #    demands the row exist for the update event, and the run's own delete
+    #    removed it. The compensating restore must also continue the version
+    #    sequence, so the following guarded update expects 3 and not the
+    #    historical 2.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    original = _setup_task(db, setup_run_id, "Task C", notes="original")
+
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(
+                task_id=original.id, expected_version=1, title="Task C edited"
+            ),
+            conn=db,
+        ),
+    )
+    _run_step(
+        db,
+        run_id,
+        domain.delete_tasks(ACTOR_ID, DeleteTasksArgs(task_ids=[original.id]), conn=db),
+    )
+    assert _tasks_by_id(db) == {}
+
+    result = undo.undo_run(run_id, ACTOR_ID)
+    assert result.refused is False
+    assert result.applied == 2
+
+    row = _tasks_by_id(db)[original.id]
+    assert row["title"] == "Task C"
+    assert row["notes"] == "original"
+    # 2 at deletion, restored at 3, then the update compensation lands at 4.
+    assert row["version"] == 4
+
+    # 4. A foreign write interleaved between two of the run's own events. The
+    #    terminal event still matches the database, so a check that only
+    #    compared the newest event would proceed and silently destroy the
+    #    foreign change.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    task = _setup_task(db, setup_run_id, "Task D")
+
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(task_id=task.id, expected_version=1, title="run edit one"),
+            conn=db,
+        ),
+    )
+    _foreign_write(db, task.id, expected_version=2, title="someone else")
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(task_id=task.id, expected_version=3, title="run edit two"),
+            conn=db,
+        ),
+    )
+
+    before = _fingerprint(db, run_id)
+    result = undo.undo_run(run_id, ACTOR_ID)
+    assert result.refused is True
+    assert result.reason is UndoReason.VERSION_CONFLICT
+    assert result.applied == 0
+    assert _fingerprint(db, run_id) == before
+
+    # 5. The named invariant. The run finished, then the row moved.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    task = _setup_task(db, setup_run_id, "Task E")
+
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(task_id=task.id, expected_version=1, title="run edit"),
+            conn=db,
+        ),
+    )
+    _foreign_write(db, task.id, expected_version=2, title="moved after the run")
+
+    before = _fingerprint(db, run_id)
+    result = undo.undo_run(run_id, ACTOR_ID)
+    assert result.refused is True
+    assert result.reason is UndoReason.VERSION_CONFLICT
+    assert result.applied == 0
+    assert _fingerprint(db, run_id) == before
+
+    # 6. The row the run created is gone. Section 8 calls this out specifically:
+    #    a version-only precheck has no version to compare and would pass, then
+    #    apply against nothing.
+    _truncate(db)
+    run_id = _insert_run(db)
+    created = _run_step(
+        db, run_id, domain.create_task(ACTOR_ID, CreateTaskArgs(title="Task F"), conn=db)
+    ).tasks[0]
+    _foreign_delete(db, created.id)
+
+    before = _fingerprint(db, run_id)
+    result = undo.undo_run(run_id, ACTOR_ID)
+    assert result.refused is True
+    assert result.reason is UndoReason.ROW_DISAPPEARED
+    assert result.applied == 0
+    assert _fingerprint(db, run_id) == before
+
+    # 7. The row the run deleted is back. Absence is the expected state for a
+    #    deleted event, so presence is the conflict. Detected in the precheck
+    #    here; the primary key on the restore insert is the backstop for the
+    #    narrower race where the row reappears after the precheck, which is not
+    #    constructible from one sequential connection and is covered by the T07
+    #    CI gate instead.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    doomed = _setup_task(db, setup_run_id, "Task G")
+
+    deleted = _run_step(
+        db,
+        run_id,
+        domain.delete_tasks(ACTOR_ID, DeleteTasksArgs(task_ids=[doomed.id]), conn=db),
+    )
+    _recreate_task(db, deleted.events[0].before)
+
+    before = _fingerprint(db, run_id)
+    result = undo.undo_run(run_id, ACTOR_ID)
+    assert result.refused is True
+    assert result.reason is UndoReason.ROW_RECREATED
+    assert result.applied == 0
+    assert _fingerprint(db, run_id) == before

@@ -99,6 +99,60 @@ DELETE FROM tasks
 RETURNING *;
 """
 
+# The two T07 compensation writes, added under D-39. Section 5 lists neither,
+# and neither existing statement can be adapted to.
+#
+# DELETE_TASKS_BY_IDS carries no version predicate, which is safe for the tool
+# path because policy.check and the domain lock run immediately before it inside
+# one transaction. It is not safe for undo: the precheck that established the
+# version is a separate pass, and without a predicate here a concurrent write
+# landing in between would be deleted rather than refused, while undo reported
+# success. Of undo's three compensations that is the only one where nothing else
+# could refuse, because an update is guarded by version and a restore by the
+# primary key. Zero rows deleted therefore means the row moved or vanished; undo
+# reports VERSION_CONFLICT for both and the precheck keeps the finer
+# distinction.
+DELETE_TASK_GUARDED = """
+DELETE FROM tasks
+ WHERE id = %(id)s
+   AND owner_id = %(owner_id)s
+   AND version = %(expected_version)s
+RETURNING *;
+"""
+
+# INSERT_TASK cannot restore a deletion. It lets the database generate the id
+# and defaults version to 1, while section 8 requires the original id from
+# event.before and a version continuing from the deleted row's plus one, because
+# history is append-only and never rewound. created_at is carried across for the
+# same reason: the row is the same task returning, not a new one, and
+# SELECT_TASKS_FOR_OWNER orders on created_at.
+#
+# The primary key is this statement's guard. The precheck already establishes
+# that the id is absent, so a unique violation here means the row reappeared
+# between the two passes. undo lets that abort the transaction and translates it
+# to a ROW_RECREATED refusal rather than catching it in place, because an
+# all-or-nothing operation has nothing to continue with.
+INSERT_TASK_RESTORED = """
+INSERT INTO tasks (
+  id, owner_id, title, notes, due_date, priority, status, blocked_by,
+  version, created_at, updated_at
+)
+VALUES (
+  %(id)s::uuid,
+  %(owner_id)s::uuid,
+  %(title)s,
+  %(notes)s,
+  %(due_date)s::date,
+  %(priority)s::task_priority,
+  %(status)s::task_status,
+  %(blocked_by)s::uuid,
+  %(version)s,
+  %(created_at)s::timestamptz,
+  now()
+)
+RETURNING *;
+"""
+
 INSERT_TASK_EVENT = """
 INSERT INTO task_events (task_id, run_id, actor_id, operation, before, after)
 VALUES (
@@ -118,6 +172,23 @@ SELECT *
  WHERE run_id = %(run_id)s
  ORDER BY id DESC
  LIMIT %(limit)s;
+"""
+
+# Deliberately unbounded, under D-39. Do not add a LIMIT to this statement.
+#
+# Section 5 requires a LIMIT on every list query, and that rule is about
+# paginated reads for display. This is not one. Undo is all-or-nothing by
+# specification, so a truncated read does not return a shorter answer, it returns
+# a wrong one: the events past the bound are silently not compensated and the
+# result still reports success. No fixed bound is provably safe either, because
+# bulk_update_tasks places no cap on task_ids and one approved call can write
+# arbitrarily many events. SELECT_EVENTS_FOR_RUN above keeps its LIMIT and
+# remains the statement for display reads.
+SELECT_ALL_EVENTS_FOR_RUN = """
+SELECT *
+  FROM task_events
+ WHERE run_id = %(run_id)s
+ ORDER BY id DESC;
 """
 
 INSERT_LEASE = """

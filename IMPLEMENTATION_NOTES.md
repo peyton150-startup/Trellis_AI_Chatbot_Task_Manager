@@ -355,3 +355,135 @@ The probe creates one throwaway issue per state-sensitive fact rather than the
 single issue originally authorized, because sharing one would couple the checks;
 that is recorded as D-33. The blind Sonnet review that CLAUDE.md requires for
 Opus-produced pull requests is outstanding and is the next step.
+
+## T07: Kernel undo
+
+**Local role:** `backend/app/undo.py` compensates one agent run's `task_events`
+in reverse, entirely or not at all. `undo_run(run_id, actor_id)` loads every
+event for the run in descending id order, runs a read-only precheck over all of
+them, applies the compensations in one transaction, and returns an `UndoResult`.
+A refusal is a return value rather than an exception, because it is an answer the
+user sees. Undoing a `created` event deletes the task, a `deleted` event
+re-inserts it under its original id, and an `updated` or `restored` event
+restores the six mutable fields from the before snapshot. History is
+append-only: every compensation is a new forward mutation evented as `restored`
+under the original `run_id`, and no `task_events` row is ever deleted or
+rewritten. `backend/app/sql.py` gains `DELETE_TASK_GUARDED`,
+`INSERT_TASK_RESTORED`, and `SELECT_ALL_EVENTS_FOR_RUN`. `backend/app/domain.py`
+gains `delete_task_guarded` and `restore_task`, so the domain layer remains the
+only writer of both tables. `backend/tests/test_invariants.py` grows from nine
+tests to ten, with the tenth carrying seven scenarios.
+`.github/workflows/ci.yml` adds the unconditional `T07 kernel undo` gate while
+preserving all nine earlier jobs.
+
+**Whole-system role:** Undo is the third of the four properties the trust
+boundary is built to demonstrate, after authorization and idempotency, and it is
+the one an interviewer can break by hand: edit a task in another tab, then press
+undo. Its value is not that it reverses work but that it refuses to when the
+world moved underneath it, and refuses completely rather than partially. That
+depends on every earlier task holding: T06's complete JSON snapshots supply the
+original id, the restorable fields, and the versions the precheck compares;
+T06's delete-cascade ordering under D-23 is what lets a deleted blocker be
+restored before any pointer to it; T04's actor scope is inherited through the
+owner-scoped statements, so a run belonging to another actor reaches no rows.
+T18 exposes the button and owns the eligibility gate that keeps undo a single
+application. T20's Run Inspector reads the same event rows. The demo script at
+3:00 is "delete everything except interview work, approve, then undo", and this
+is the second half of that beat.
+
+**Inputs and dependencies:** T07 consumes the T01 `tasks` and `task_events`
+schema including the `ON DELETE SET NULL` self reference, T02's dictionary-row
+pool and SQL catalog, T03's `UndoResult`, `UndoReason`, `TaskEvent`, `Task`, and
+`UpdateTaskArgs` models, T04's `VersionConflictError`, and all seven T06 domain
+functions plus the two added here. It consumes T06's `model_fields_set`
+contract, which is why `_restore_arguments` passes all six restorable fields
+explicitly including the ones whose value is null. Five decisions were taken
+before any code was written: D-37 sequencing, D-38 undo semantics, D-39 the
+persistence and read expansion, D-40 the test-authorship exception, D-41 the
+orchestration and cascade-event boundary. Runtime dependencies are Python 3.12,
+Pydantic 2.13.4, and psycopg 3.3.4. The tests and the gate require live
+PostgreSQL 16, because every guard this module relies on is evaluated inside a
+SQL statement.
+
+**Outputs and consumers:** T07 exports `undo_run`, which T18 calls behind
+`POST /api/runs/{id}/undo`, plus three SQL constants and two domain entry
+points. `RunDetail.can_undo` in T08 and the T18 exposure own the eligibility
+gate that D-38 requires: compensation events keep the original `run_id`, so a
+run that already carries them is no longer eligible, and repeated invocation is
+not redo. The compensation events this module writes are ordinary `task_events`
+rows and are read by T20 like any others.
+
+**Verification:** Test-first. `test_stale_undo_refused` was written against
+section 8's text with no kernel file in the tree, and
+`pytest tests/test_invariants.py -q` reported `ImportError: cannot import name
+'undo' from 'app' (unknown location)`. After implementation the same command
+reported `10 passed`, which is section 12's definition of done for T07. The
+cumulative default suite reports `37 passed, 13 deselected` and
+`cd backend && ruff check .` reports `All checks passed!`. The T07 gate was run
+locally against live PostgreSQL and printed `PASS T07: guards on the
+compensating writes, unbounded event read, delete cascade round trip, one direct
+compensation plus N audited cascade events, no partial undo on a later conflict,
+and no half-applied undo under a concurrent writer`, with its race section
+reporting `10 applied in full, 10 refused with zero writes`.
+
+Because one model authored both the kernel and the tests that judge it under
+D-40, fourteen single-line mutations were applied one at a time, each run and
+reverted: the precheck comparing against the database instead of the projection,
+the apply pass guarding on the historical version, a restore reusing the deleted
+version instead of continuing past it, the absence check removed, the existence
+check removed, the version comparison removed, a refusal reporting applied rows,
+the refusal path committing, every event relabelled, no event relabelled, the
+guard removed from `DELETE_TASK_GUARDED`, a `LIMIT` added to
+`SELECT_ALL_EVENTS_FOR_RUN`, the restore generating a new id, and the guarded
+delete dropping its cascade audit. Twelve were detected, nine by the named test
+and four by the gate. `undo.py` was restored to sha256
+`3cba4e7900dce660a5e1b20d9f679eb9f8e59a1f18c844599e9e137c79590153`, `sql.py` to
+`633984231c570363cbc6d4f09f654676e17c280b1a766f93773c083837a3af72`, and
+`domain.py` to `762ef0ea528cb0aeb4a754f793946f70b81b0456120fbcb834d2098a42413e03`,
+all matching their pre-mutation baselines. Files were read and written as bytes
+throughout, because `sql.py` and `domain.py` are CRLF in the worktree while
+`undo.py` is LF, and a pattern encoded with the wrong ending silently matches
+nothing.
+
+**Limitations and review status:** Two of the fourteen mutations are
+**equivalent under the current test surface and are reported as such rather than
+counted as kills.** Removing the precheck's `ROW_RECREATED` branch is masked by
+the primary key on `INSERT_TASK_RESTORED`, which produces an identical
+observable refusal; that is the redundancy D-38 intends, and the consequence is
+that the precheck branch is not independently proven. A discriminator exists,
+because the `task_events` sequence advances non-transactionally and would move
+only on the backstop path, but reading a sequence means raw SQL in the gate
+against the single-catalog rule, and it would assert which of two correct
+defenses fired rather than a behaviour. Making the refusal path commit instead
+of roll back is equivalent because the precheck writes nothing; the rollback is
+lock hygiene. The checkpoint 1 reviewer should look at the first of these
+specifically.
+
+The primary key backstop's translation into a `ROW_RECREATED` refusal is
+therefore exercised only at the statement level, never end to end, because the
+row must reappear between the two passes and `SELECT_TASKS_BY_IDS_FOR_UPDATE`
+cannot lock a row that is absent. `_effective_operation`'s resolution of a
+`restored` event by snapshot shape is likewise unexercised, because reaching it
+requires a second undo of the same run, which D-38 makes ineligible. That
+eligibility is enforced by `RunDetail.can_undo` and T18 rather than by this
+module, which is an asymmetry with `policy.check`, where the kernel re-verifies
+an approval the framework already gated; it is recorded here rather than closed,
+because closing it needs a fourth `UndoReason` member and `models.py` is T03's
+file. Undo does not resolve the run against `agent_runs`; the wire contract in
+T08 owns that, and a foreign run refuses here through the owner-scoped
+statements rather than being distinguished. A task restored with a `blocked_by`
+pointing at a blocker some other actor deleted fails the foreign key and is
+reported as `ROW_DISAPPEARED`, which is the closest of the three reasons section
+8 provides. `backend/app/__init__.py` remains absent as Q-04 records.
+
+Claude Opus 5 implemented T07 under the user's authorizations of 2026-08-13
+recorded as D-37 through D-41, all granted before any code was written and after
+the user pushed back on three of the proposals: row locking was demoted from a
+correctness requirement to a strengthening in favour of a guarded delete, the
+savepoint was rejected, and the extra semantics were required to become test
+scenarios rather than gate-only checks. The blind review that CLAUDE.md requires
+for Opus-produced pull requests is batched with T08 at review checkpoint 1 under
+D-35, with the read, execute, and reconcile phases and a Vercel Sandbox
+execution pass against the pinned commit SHA. D-37 adds one item to that
+review's scope: whether the T00L divergence precheck can be retrofitted into
+this precheck pass, and at what cost.

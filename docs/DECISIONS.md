@@ -1167,3 +1167,224 @@ should be read as "11.0d as originally recorded, plus Linear," not as a complete
 current estimate. Pricing those is not attempted here. D-31 exists so that the
 next such addition is priced when it is proposed rather than reconstructed
 afterwards, which is what this decision had to do.
+
+---
+
+## Undo decisions recorded at T07
+
+Recorded on 2026-08-13, before any T07 code was written. D-36 is taken by the
+Linear schedule ledger, so this block starts at D-37.
+
+### D-37: BUILD_SPEC section 12 governs sequencing, and LINEAR_INTEGRATION section 8 is a proposal
+
+`CLAUDE.md` names both files as sources of truth and they disagree about what
+T07 is. Section 12 lists T07 as `undo.py` "as specified" with no T00L row.
+Section 8 of `docs/LINEAR_INTEGRATION.md` sequences T00L before T07 and gives
+T07's done-when as "As specified, plus the diverged refusal". See Q-08.
+
+**BUILD_SPEC section 12 governs.** T07 implements section 8 of BUILD_SPEC as
+written. It does not implement the `EXTERNALLY_MODIFIED` precheck from
+LINEAR_INTEGRATION section 4.4. That clause is a proposed delta to BUILD_SPEC
+section 8 rather than part of it, so this is not T07 shipping an incomplete
+section 8; it is the Linear document standing ahead of the ratified plan.
+
+The LINEAR_INTEGRATION section 8 task table is **proposed and unratified**
+except for the T00B row, which section 12 absorbed when T00B landed. T00L is now
+carried in section 12 as well, with its deferral stated in the row, so the two
+tables no longer disagree about whether it exists. T00L is not a T07
+prerequisite.
+
+**Cost, stated rather than hidden.** If T00L is taken, the divergence precheck
+becomes a second edit to a merged KERNEL file, which D-31 prices at an explicit
+re-plan and a named cut. That cost was accepted in exchange for keeping T07 on
+the critical path to T08 and the ugly demo bar.
+
+**D-36's review commitment is re-aimed, not dropped.** D-36 states that the
+Linear-added kernel delta receives focused review when T07 and T08 are reviewed
+together at the post-T08 checkpoint. With T07 shipping without the delta, that
+clause has nothing to point at. It becomes this instead: at checkpoint 1 the
+reviewer examines the shipped `undo.py` for whether the T00L divergence precheck
+can be retrofitted into its precheck pass, and at what cost. That is the
+question this decision defers rather than answers, so it is the one worth a
+reviewer's attention.
+
+### D-38: projected-state undo semantics
+
+Section 8's precheck compares every event against current database state, which
+refuses a valid undo for any run that touched one task more than once. See Q-09
+for the two reproducible cases.
+
+**Terminal events for each task are validated against current database state;
+earlier same-task events are validated against projected historical state
+derived from the event snapshots. Compensation maintains a separate
+physical-version projection. Every mutating compensation is guarded at its write
+boundary: updates by expected version, deletes by expected version, and restores
+by primary-key uniqueness. Any failed guard or conflict aborts and rolls back
+the entire undo.**
+
+**The two projections are different numbers and are computed differently.** The
+precheck tracks the historical version carried in the snapshots. The apply pass
+tracks the physical version in the row, which moves forward as each compensation
+lands, because history is append-only and a compensation is a new forward
+mutation. They diverge as soon as the first compensation lands:
+
+```
+run: X at v1 --update--> v2 (event U) --delete--> gone (event D)
+
+precheck, reverse order, historical
+  D is terminal for X: the row must be absent            ok
+  projected := D.before                                  v2, exists
+  U.after["version"] == 2 == projected                   ok
+
+apply, reverse order, physical
+  undo D: re-insert from D.before at version 3           before.version + 1
+  undo U: guarded update, expected_version = 3           not U.after["version"]
+          the row lands at v4
+```
+
+Guard on the historical 2 and the update touches zero rows and the undo dies
+mid-apply. Compare the precheck against the physical projection and nothing ever
+matches.
+
+**The projected precheck is stronger than the literal one, not weaker.**
+`undo_run` loads one run's events, so a foreign write can land between two of
+that run's own events on the same task. The terminal check still passes, because
+the newest event agrees with the database. The projected comparison then finds
+that the earlier event's `after["version"]` does not match the state the later
+event recorded, and refuses. Undoing that earlier event would have destroyed a
+change the run never made.
+
+**A trap worth naming.** The T06 delete cascade writes an `updated` event where
+`before["version"] == after["version"]`, because `ON DELETE SET NULL` is a
+foreign key action and does not run the guarded update. Code that derives the
+projected historical version as `after["version"] - 1` instead of reading
+`before["version"]` breaks there and only there.
+
+**Row locking is a strengthening, not the correctness condition.**
+`SELECT_TASKS_BY_IDS_FOR_UPDATE` is used in the precheck, in the canonical id
+order D-23 established, so the common conflicts surface in the precheck where
+they carry a precise reason. It cannot be the contract, because an absent row
+cannot be locked and the `deleted` events are precisely the ones whose expected
+state is absence. The guards above are what make the apply pass correct, and T07
+must be correct without the locks.
+
+**Repeated invocation is not redo.** Compensation events keep the original
+`run_id` per section 8 step 4, so a second call would load both the original and
+the compensation wave, and undoing that combined history is not a well-defined
+inverse of anything. Calling it redo would turn an accidental consequence of
+event selection into a contract. T07 defines undo as a single application to an
+eligible run. Once compensation events exist for a run, that run is no longer
+eligible, and `RunDetail.can_undo` with the T18 exposure is where that
+eligibility is enforced. A future redo needs its own design. `undo.py` still
+understands a `restored` event, because section 8 requires the precheck to, but
+understanding one is not a claim that a second undo is supported.
+
+**A savepoint around the restore insert was considered and rejected.** A unique
+violation aborts the transaction, so the translation to `ROW_RECREATED` happens
+after the rollback at the boundary rather than in place. A savepoint would let
+the rest of the undo proceed past a conflict, and there is no correct undo that
+proceeds past a conflict. Its only purpose would be a capability that must never
+be exercised, in a KERNEL file whose central promise is the opposite.
+
+### D-39: T07 persistence and read expansion
+
+Section 12 lists T07's files as `undo.py`. Three statements and two domain entry
+points are added. See Q-10.
+
+```sql
+DELETE_TASK_GUARDED        delete one task only if its version still matches
+INSERT_TASK_RESTORED       re-insert under the original id, version, created_at
+SELECT_ALL_EVENTS_FOR_RUN  every event for one run, descending, no LIMIT
+```
+
+```python
+domain.delete_task_guarded(owner_id, task_id, expected_version, *, conn)
+domain.restore_task(owner_id, snapshot, *, version, conn)
+```
+
+**Why the guarded delete exists.** Of undo's three compensations, the delete was
+the only one with no guard available. `UPDATE_TASK_GUARDED` refuses on version
+and the restore insert refuses on the primary key, but `DELETE_TASKS_BY_IDS`
+carries only `owner_id` and `id`. That is correct on the tool path, where the
+policy check and the row lock run immediately before it in one transaction. On
+the undo path the precheck is a separate pass, so without a predicate on the
+write a concurrent change landing in between is deleted rather than refused,
+while undo reports success. Zero rows deleted means the row moved or vanished;
+undo reports `VERSION_CONFLICT` for both and the precheck keeps the finer
+distinction.
+
+`DeleteTasksArgs` is deliberately not given an `expected_version` field. It is
+the `delete_tasks` tool's argument model, and changing a tool contract to serve
+undo would put the cost in the wrong place. The domain entry point takes the id
+and version directly instead.
+
+**Why the restore insert exists.** `INSERT_TASK` lets the database generate the
+id and defaults `version` to 1. Section 8 requires the original id from
+`event.before` and a version continuing from the deleted row's plus one.
+`created_at` is carried across for the same reason: the row is the same task
+returning, and `SELECT_TASKS_FOR_OWNER` orders on it. The caller supplies the
+version rather than this statement deriving it, because the plus-one rule is
+undo semantics and the domain layer executes writes.
+
+**The undo event read is deliberately unbounded, and this is the rule rather
+than a filename.** Section 5 requires a `LIMIT` on every list query, and that
+rule governs paginated reads for display. Undo is all-or-nothing, so a truncated
+read does not return a shorter answer, it returns a wrong one: the events past
+the bound are silently not compensated and the result still reports success. No
+fixed bound is provably safe either, because `bulk_update_tasks` places no cap
+on `task_ids`. `SELECT_EVENTS_FOR_RUN` keeps its `LIMIT` and remains the
+statement for display reads. Do not add a `LIMIT` to `SELECT_ALL_EVENTS_FOR_RUN`.
+
+### D-40: T07-only test-authorship exception
+
+Section 11 routes `test_invariants.py` to Sol. T07's done-when is
+`test_stale_undo_refused` passing, and Sol was not reachable. D-16 was T04-only
+and D-20 was T05-only, both explicitly, so T07 needs its own. Granted by the
+user on 2026-08-13, scoped to T07 alone, and not precedent for T08.
+
+Compensating measures, matching T05: the red run is preserved before any
+implementation exists, single-line mutations are applied one at a time and each
+required to behave as predicted, both production files are restored and verified
+by digest, and the blind review at checkpoint 1 receives the task specification,
+the diff, and the verification evidence only.
+
+**The exception includes multi-scenario expansion of the existing named
+invariant, and does not increase the section 11 collected-test count.** Section
+11 lists thirteen test names verbatim, and this file's collected count is meant
+to equal the count of proven invariants. The semantics D-38 settles are
+constructible as tests and belong in tests rather than hidden in a CI gate, but
+adding six names would widen an enumerated list. `test_stale_undo_refused`
+therefore carries seven scenarios under one name, following the shape T04
+established for `test_forged_approval_rejected`, which covers three forgery
+shapes plus a positive control. Three of the seven are positive controls, and
+they are not padding: an `undo_run` that refused unconditionally would pass every
+refusal scenario. Each of the four refusal scenarios asserts zero writes on both
+surfaces, task rows including `version` and `updated_at` and the run's event
+count, rather than leaving that to one shared check that a single clean path
+could satisfy.
+
+### D-41: undo orchestration and cascade-event boundary
+
+`undo.py` may construct and relabel compensation `PendingTaskEvent` payloads,
+but all task and event persistence executes through the domain layer, which
+remains the only writer of `tasks` and `task_events`.
+
+The domain functions report the physical operation they performed: `update_task`
+emits `updated`, `restore_task` emits `created`, `delete_task_guarded` emits
+`deleted`. Undo relabels the direct compensation to `restored`, which section 8
+names, so the operation each layer reports always describes what that layer did.
+
+**Undoing a `created` event through the domain layer retains all D-23 cascade
+audit events, so one inverse operation may legitimately emit one direct
+compensation event plus N cascade events.** Section 8's singular event wording
+describes the direct compensation and does not suppress domain-required audit
+records. Suppressing them would reopen the hole D-23 closed, where an
+`ON DELETE SET NULL` write reaches the database without passing through any
+function that could audit it.
+
+**The cascade events are not relabelled.** The direct inverse of the run's event
+is the compensation and is named `restored`. The rows a compensating delete
+produces through `ON DELETE SET NULL` are fresh side effects rather than
+inverses of anything, and keep the `updated` semantics D-23 gave them.
+Relabelling them would make the event log claim a pointer was restored when it
+was cleared.
