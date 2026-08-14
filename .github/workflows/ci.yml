@@ -1894,3 +1894,391 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  t08-runs-wire-contract:
+    name: T08 runs and wire contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # Section 11 names two testable invariants for T08 and both are about the
+      # request body. Everything else section 9 requires is unreachable from
+      # those two names: the run resolver, the RunDetail projection, and the
+      # endpoint surface itself. Same precedent as T04's error table, T05's
+      # lease guards, and T07's atomicity checks, which all carry what a named
+      # test cannot construct rather than letting it ship unexercised.
+      #
+      # Two of these checks need real elapsed time. duration_ms is derived from
+      # lease_expires_at rather than created_at, and the two anchors only differ
+      # once time has actually passed between the row being created and the
+      # attempt being granted, so the sleeps are the measurement rather than a
+      # workaround for flakiness.
+      - name: Verify T08 resolver, RunDetail projection, and endpoint surface
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          import time
+          from uuid import UUID, uuid4
+
+          sys.path.insert(0, ".")
+
+          from fastapi.routing import APIRoute
+          from fastapi.testclient import TestClient
+
+          from app import domain, idempotency, runs, sql, undo
+          from app.config import settings
+          from app.db import pool
+          from app.main import app
+          from app.models import (
+              CreateTaskArgs,
+              LeaseAction,
+              RunStatus,
+              ToolStepStatus,
+          )
+
+          ACTOR = settings.actor_id
+          OTHER = UUID("00000000-0000-0000-0000-000000000002")
+          TTL = settings.lease_ttl_seconds
+          ARGS_HASH = "a" * 64
+
+          problems = []
+
+          def check(condition, message):
+              if not condition:
+                  problems.append(message)
+
+          def truncate():
+              with pool.connection() as conn:
+                  conn.execute(sql.TRUNCATE_ALL_STATE)
+                  conn.commit()
+
+          def lease(run_id, call_id, ttl_seconds=TTL):
+              with pool.connection() as conn:
+                  conn.execute(
+                      sql.INSERT_LEASE,
+                      {
+                          "run_id": run_id,
+                          "tool_call_id": call_id,
+                          "tool_name": "create_task",
+                          "arguments_hash": ARGS_HASH,
+                          "lease_ttl_seconds": ttl_seconds,
+                      },
+                  )
+                  conn.commit()
+
+          def statement(sql_text, run_id, call_id, **extra):
+              with pool.connection() as conn:
+                  row = conn.execute(
+                      sql_text,
+                      {"run_id": run_id, "tool_call_id": call_id, **extra},
+                  ).fetchone()
+                  conn.commit()
+                  return row
+
+          def commit_task(run_id, title):
+              with pool.connection() as conn:
+                  mutation = domain.create_task(
+                      ACTOR, CreateTaskArgs(title=title), conn=conn
+                  )
+                  domain.write_events(run_id, ACTOR, mutation.events, conn=conn)
+                  conn.commit()
+                  return mutation.tasks[0]
+
+          def steps_of(run_id):
+              return {step.tool_call_id: step for step in runs.detail(run_id, ACTOR).steps}
+
+          # ---------------------------------------------------------------- 1
+          # The resolver. A run id from a browser is a lookup key, so a run that
+          # does not exist and a run belonging to somebody else must be the same
+          # rejection, byte for byte. If they differ at all, the API enumerates
+          # which run ids are real.
+          truncate()
+          client = TestClient(app)
+
+          foreign = runs.create(OTHER, "a run owned by another actor", "t08-gate")
+          missing_response = client.get(f"/api/runs/{uuid4()}")
+          foreign_response = client.get(f"/api/runs/{foreign.id}")
+
+          check(missing_response.status_code == 403, f"missing run returned {missing_response.status_code}")
+          check(foreign_response.status_code == 403, f"foreign run returned {foreign_response.status_code}")
+          check(
+              missing_response.json() == foreign_response.json(),
+              f"missing and foreign differ: {missing_response.json()} vs {foreign_response.json()}",
+          )
+          check(
+              missing_response.json()["error"]["code"] == "OUT_OF_SCOPE",
+              f"resolver rejection code is {missing_response.json()}",
+          )
+
+          # A malformed id never reaches the resolver at all.
+          check(
+              client.get("/api/runs/not-a-uuid").status_code == 422,
+              "a malformed run id was not rejected by path validation",
+          )
+
+          # ---------------------------------------------------------------- 2
+          # duration_ms is anchored to the granted attempt, not to created_at.
+          # Both recovery statements bump attempt and reset lease_expires_at and
+          # leave created_at alone, so a stolen lease measured from created_at
+          # would be charged for the dead holder's entire expiry window.
+          truncate()
+          stolen_run = runs.create(ACTOR, "stolen lease", "t08-gate")
+          lease(stolen_run.id, "stolen", ttl_seconds=-3600)
+          time.sleep(2)
+          stolen = statement(sql.STEAL_EXPIRED_LEASE, stolen_run.id, "stolen", lease_ttl_seconds=TTL)
+          check(stolen is not None, "setup failed: the expired lease was not stolen")
+          statement(sql.COMPLETE_LEASE, stolen_run.id, "stolen", result=None)
+
+          step = steps_of(stolen_run.id)["stolen"]
+          check(step.attempt == 2, f"stolen lease reports attempt {step.attempt}, expected 2")
+          check(step.status is ToolStepStatus.COMPLETED, f"stolen lease status is {step.status}")
+          check(
+              step.duration_ms < 1000,
+              f"duration_ms is {step.duration_ms}: the anchor is created_at, so the "
+              "attempt is charged for the dead holder's expiry window",
+          )
+
+          # ---------------------------------------------------------------- 3
+          # REACQUIRE_FAILED_LEASE returns a row to pending and bumps attempt
+          # without clearing completed_at, so a reacquired row is pending while
+          # carrying the previous attempt's completion stamp. Branching on
+          # completed_at IS NULL instead of on status takes the terminal path
+          # and subtracts a later anchor from an earlier stamp.
+          truncate()
+          retry_run = runs.create(ACTOR, "reacquired lease", "t08-gate")
+          lease(retry_run.id, "retried")
+          statement(sql.FAIL_LEASE, retry_run.id, "retried", error="boom")
+          reacquired = statement(
+              sql.REACQUIRE_FAILED_LEASE, retry_run.id, "retried", lease_ttl_seconds=TTL
+          )
+          check(reacquired is not None, "setup failed: the failed lease was not reacquired")
+          check(
+              reacquired["completed_at"] is not None,
+              "setup assumption broke: reacquire now clears completed_at, so this check is moot",
+          )
+          time.sleep(2)
+
+          step = steps_of(retry_run.id)["retried"]
+          check(step.status is ToolStepStatus.PENDING, f"reacquired row reports {step.status}")
+          check(step.attempt == 2, f"reacquired row reports attempt {step.attempt}, expected 2")
+          check(
+              step.duration_ms > 1000,
+              f"duration_ms is {step.duration_ms}: a pending row was measured from its "
+              "stale completed_at, which is earlier than the attempt that is running",
+          )
+
+          # ---------------------------------------------------------------- 4
+          # A successful REPLAY writes nothing, so deduplicated is structurally
+          # unreachable. The gate asserts the honest consequence rather than a
+          # synthesized step: one row, attempt unchanged, status completed.
+          truncate()
+          replay_run = runs.create(ACTOR, "replayed call", "t08-gate")
+          first = idempotency.acquire(replay_run.id, "replayed", "create_task", ARGS_HASH)
+          check(first.action is LeaseAction.EXECUTE, f"first acquire returned {first.action}")
+          statement(sql.COMPLETE_LEASE, replay_run.id, "replayed", result=None)
+          second = idempotency.acquire(replay_run.id, "replayed", "create_task", ARGS_HASH)
+          check(second.action is LeaseAction.REPLAY, f"second acquire returned {second.action}")
+
+          replay_steps = runs.detail(replay_run.id, ACTOR).steps
+          check(len(replay_steps) == 1, f"a replay produced {len(replay_steps)} steps, expected 1")
+          check(replay_steps[0].attempt == 1, f"a replay moved attempt to {replay_steps[0].attempt}")
+          check(
+              ToolStepStatus.DEDUPLICATED not in {s.status for s in replay_steps},
+              "a step was reported as deduplicated, which the schema cannot currently prove",
+          )
+
+          # ---------------------------------------------------------------- 5
+          # steps[] is one row per durable invocation, ordered by created_at with
+          # tool_call_id breaking ties. Both halves are exercised, because an
+          # ORDER BY that dropped either clause still passes the other.
+          #
+          # Acquisition order first. Each lease commits separately, so every row
+          # gets its own created_at and the sort must follow acquisition rather
+          # than the alphabet.
+          truncate()
+          ordered_run = runs.create(ACTOR, "ordering", "t08-gate")
+          for call_id in ("call-c", "call-a", "call-b"):
+              lease(ordered_run.id, call_id)
+          rendered = [step.tool_call_id for step in runs.detail(ordered_run.id, ACTOR).steps]
+          check(
+              rendered == ["call-c", "call-a", "call-b"],
+              f"steps are not in acquisition order: {rendered}",
+          )
+          check(len(rendered) == 3, f"steps returned {len(rendered)} rows for 3 invocations")
+
+          # Then the tie-breaker. now() is the transaction timestamp in
+          # PostgreSQL, so three leases inserted in one transaction share a
+          # created_at to the microsecond and the sort has nothing but
+          # tool_call_id left to order them by. Without the second key this is
+          # where the response order becomes whatever the heap returns.
+          truncate()
+          tied_run = runs.create(ACTOR, "tied ordering", "t08-gate")
+          with pool.connection() as conn:
+              for call_id in ("call-z", "call-x", "call-y"):
+                  conn.execute(
+                      sql.INSERT_LEASE,
+                      {
+                          "run_id": tied_run.id,
+                          "tool_call_id": call_id,
+                          "tool_name": "create_task",
+                          "arguments_hash": ARGS_HASH,
+                          "lease_ttl_seconds": TTL,
+                      },
+                  )
+              conn.commit()
+          tied = runs.detail(tied_run.id, ACTOR).steps
+          check(
+              len({step.tool_call_id for step in tied}) == 3,
+              "the tie-break setup did not produce three distinct rows",
+          )
+          check(
+              [step.tool_call_id for step in tied] == ["call-x", "call-y", "call-z"],
+              f"steps sharing a created_at are not tie-broken by tool_call_id: "
+              f"{[step.tool_call_id for step in tied]}",
+          )
+
+          # The assertion above is necessary and not sufficient, and on its own
+          # it cannot see the tie-break disappear. tool_invocations is keyed
+          # (run_id, tool_call_id), so the planner feeds the sort from that index
+          # and the rows arrive already ordered by tool_call_id; the result is
+          # identical whether or not the statement asks for the second key.
+          # Deleting the key therefore survives, masked the same way T07's
+          # ROW_RECREATED branch is masked by the primary key backstop. Denying
+          # the planner that index makes a seq scan hand over heap order instead,
+          # which is deliberately not the expected order, so the ordering can
+          # only come from the ORDER BY. That is the property; PostgreSQL
+          # guarantees nothing about ties without it.
+          with pool.connection() as conn:
+              conn.execute("SET LOCAL enable_indexscan = off")
+              conn.execute("SET LOCAL enable_bitmapscan = off")
+              plan = "\n".join(
+                  row["QUERY PLAN"]
+                  for row in conn.execute(
+                      "EXPLAIN " + sql.SELECT_INVOCATIONS_FOR_RUN,
+                      {"run_id": tied_run.id},
+                  ).fetchall()
+              )
+              unindexed = conn.execute(
+                  sql.SELECT_INVOCATIONS_FOR_RUN, {"run_id": tied_run.id}
+              ).fetchall()
+              conn.commit()
+          # Without this the probe could pass vacuously: if the settings failed
+          # to take, the index would still be supplying the order and the check
+          # below would prove nothing.
+          check(
+              "Index Scan" not in plan,
+              f"the tie-break probe did not actually deny the index, so it "
+              f"proves nothing: {plan}",
+          )
+          check(
+              [row["tool_call_id"] for row in unindexed]
+              == ["call-x", "call-y", "call-z"],
+              f"with no index to borrow an order from, tied rows are not ordered "
+              f"by the statement: {[row['tool_call_id'] for row in unindexed]}",
+          )
+
+          # The read must stay unbounded. A fixed LIMIT would let RunDetail claim
+          # a complete run while silently dropping steps, because the wire shape
+          # carries no cursor and no truncation flag.
+          check(
+              "LIMIT" not in sql.SELECT_INVOCATIONS_FOR_RUN.upper(),
+              "SELECT_INVOCATIONS_FOR_RUN grew a LIMIT, so RunDetail can now lie by omission",
+          )
+
+          # ---------------------------------------------------------------- 6
+          # can_undo across the status matrix, and the D-38 single-application
+          # rule. Nothing in undo.py refuses a second undo, so this predicate is
+          # the only thing standing between the demo and undoing its own
+          # compensation wave.
+          def eligibility(status, with_events):
+              truncate()
+              run = runs.create(ACTOR, f"can_undo {status}", "t08-gate")
+              if with_events:
+                  commit_task(run.id, "Task A")
+              runs.set_status(run.id, status)
+              return runs.detail(run.id, ACTOR).can_undo
+
+          for status in (RunStatus.RUNNING, RunStatus.AWAITING_APPROVAL):
+              check(
+                  eligibility(status, True) is False,
+                  f"can_undo is true for a {status.value} run, which can still commit more effects",
+              )
+          for status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.INTERRUPTED):
+              check(
+                  eligibility(status, True) is True,
+                  f"can_undo is false for a terminal {status.value} run that committed effects",
+              )
+              check(
+                  eligibility(status, False) is False,
+                  f"can_undo is true for a {status.value} run that committed nothing",
+              )
+
+          # And the real one: a run that has already been undone is ineligible.
+          truncate()
+          undone = runs.create(ACTOR, "already undone", "t08-gate")
+          commit_task(undone.id, "Task B")
+          runs.set_status(undone.id, RunStatus.COMPLETED)
+          check(runs.detail(undone.id, ACTOR).can_undo is True, "setup failed: run was not undoable")
+          result = undo.undo_run(undone.id, ACTOR)
+          check(result.refused is False, f"setup failed: undo refused with {result.reason}")
+          check(
+              runs.detail(undone.id, ACTOR).can_undo is False,
+              "can_undo is still true after compensation, so a second undo would run over "
+              "the compensation wave. D-38 says the run is no longer eligible.",
+          )
+
+          # ---------------------------------------------------------------- 7
+          # The endpoint surface. Section 9 says exactly these and no others, and
+          # resume is not among them: D-36 credited resume and orphan sweep as
+          # removed in full and spent the 0.25d against the Linear expansion.
+          paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
+          expected = {"/api/tasks", "/api/runs", "/api/runs/{run_id}"}
+          check(paths == expected, f"the route surface is {sorted(paths)}, expected {sorted(expected)}")
+          check(
+              not any("resume" in path for path in paths),
+              "a resume endpoint exists, and D-36 already spent the credit for cutting it",
+          )
+
+          truncate()
+
+          if problems:
+              raise SystemExit("T08 does not hold its contract:\n" + "\n".join(problems))
+          print(
+              "PASS T08: the resolver refuses missing and foreign runs identically, "
+              "duration_ms is anchored to the granted attempt rather than created_at, "
+              "a reacquired pending row is measured from its reacquire, a replay "
+              "produces no deduplicated step, steps are unbounded and deterministically "
+              "ordered, can_undo holds across the status matrix and turns off after "
+              "compensation, and the route surface carries no resume endpoint"
+          )
+          PY
+
+      - name: Verify T08 invariant tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest tests/test_invariants.py -v
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
