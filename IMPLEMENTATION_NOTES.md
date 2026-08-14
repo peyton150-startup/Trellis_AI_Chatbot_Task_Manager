@@ -551,16 +551,46 @@ attempt, a reacquired pending row measured from its reacquire rather than its
 stale `completed_at`, a replay producing no `deduplicated` step, deterministic
 step ordering in both the acquisition-order and tied-timestamp cases, the read
 staying unbounded, `can_undo` across the full status matrix and after
-compensation, and a route surface with no resume endpoint.
+compensation, and a route surface with no resume endpoint. The tied-timestamp
+case is checked twice, once through `runs.detail` and once with the planner
+denied the primary key index, for the reason recorded below.
 
-Eight single-line mutations were applied one at a time against the gate, each
-restored and verified by digest. Seven were killed. One is recorded as
-equivalent: changing the resolver's rejection message, because `load` has a
-single `row is None` branch covering both the missing and the foreign case, so
-the message changes both responses identically and the equality assertion still
-holds. It was replaced by removing the `actor_id` predicate from `SELECT_RUN`,
-which is the mutation that actually tests the property, and that one is killed
-with the foreign run resolving to a full `RunDetail`.
+Nine single-line mutations were applied one at a time, each run against both
+detectors, reverted, and the file verified restored by digest: `SELECT_RUN`
+dropping its `actor_id` predicate, `SELECT_INVOCATIONS_FOR_RUN` dropping the
+`tool_call_id` tie-break from its `ORDER BY`, that same read gaining a `LIMIT`,
+`_duration_ms` anchoring on `created_at`, `_duration_ms` branching on
+`completed_at` rather than on `status`, `_can_undo` no longer excluding a
+compensated run, `_can_undo` no longer excluding a run with no events,
+`UNDOABLE_STATUSES` admitting a running run, and the validation handler
+returning 400 instead of 422. All nine are detected, eight by the gate and the
+handler status by both the gate and `test_extra_body_keys_rejected`. `runs.py`
+was restored to sha256
+`e042cb92dee128b5daf9f7e1bd5aa6528dff2d4e8d0b715427b5a07da8174eda`, `main.py` to
+`d6899356869749a28fbccbf53162b675cf7a24a295087a279d211d8a54b6ca0d`, and `sql.py`
+to `aea941b1650d2087191e695659942ffd52af51e42f45fde8f55fd2c1416f615c`, all
+matching their pre-mutation baselines. Files were read and written as bytes
+throughout, because all three are CRLF in the worktree.
+
+This table is a fresh derivation, not a record of the run T08 originally
+reported. That run claimed eight mutations with seven killed and one equivalent
+but recorded neither the mutations themselves nor any digest, which D-21 step 4
+makes mandatory rather than optional, and an unrecorded table cannot be audited
+by anyone. Nothing in this table confirms or contradicts the earlier count; it
+replaces it.
+
+The tie-break mutation is why the gate changed. It survived the gate as
+originally shipped, and the cause is that `tool_invocations` is keyed
+`(run_id, tool_call_id)`, so the planner feeds the sort from that index and the
+rows arrive already ordered by `tool_call_id`; the result is identical whether or
+not the statement asks for the second key. That is the same masking that makes
+T07's `ROW_RECREATED` branch equivalent under the primary key backstop. The
+statement itself was already correct, because PostgreSQL guarantees nothing about
+ties without the second key, so the repair belongs in the gate and not in
+`sql.py`. The tied-timestamp check now also reads with `enable_indexscan` and
+`enable_bitmapscan` off, where a seq scan supplies heap order instead, and it
+asserts first that `EXPLAIN` reports no index scan so the probe cannot pass
+vacuously. Under that plan the mutation is detected.
 
 **Limitations and review status:** Four contracts are deferred with deadlines,
 all recorded in D-45. There is no legal error code for a valid actor-owned run
@@ -582,3 +612,15 @@ deliberate trade for agreement over efficiency at demo scale.
 
 Reviewed at checkpoint 1 together with T07, per D-35. Routing exception D-42
 granted for test authorship, scoped to T08 alone and not precedent for T09.
+
+Checkpoint 1 ran against pinned `e9048a2`: one Claude Sonnet agent, blind and
+read-only, reading both diffs before executing and executing in a Vercel Sandbox
+on a fresh clone pinned to that SHA. It returned no findings. It reproduced ruff,
+`39 passed, 13 deselected`, the twelve invariants, and both the T07 and T08 gate
+scripts against live PostgreSQL, and added one probe of its own, a three touch
+same task undo that neither the named test nor either gate constructs, which
+passed with state exactly restored. It stated that it could not verify these jobs
+on GitHub's own runners, `npm run build`, or the branch protection configuration.
+It did not examine the mutation claim, which is what left the gap above
+unreported: an unrecorded mutation table is invisible to every passing gate, the
+same class of defect the T00B review found by reading rather than by running.

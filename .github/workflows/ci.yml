@@ -2157,6 +2157,46 @@ jobs:
               f"{[step.tool_call_id for step in tied]}",
           )
 
+          # The assertion above is necessary and not sufficient, and on its own
+          # it cannot see the tie-break disappear. tool_invocations is keyed
+          # (run_id, tool_call_id), so the planner feeds the sort from that index
+          # and the rows arrive already ordered by tool_call_id; the result is
+          # identical whether or not the statement asks for the second key.
+          # Deleting the key therefore survives, masked the same way T07's
+          # ROW_RECREATED branch is masked by the primary key backstop. Denying
+          # the planner that index makes a seq scan hand over heap order instead,
+          # which is deliberately not the expected order, so the ordering can
+          # only come from the ORDER BY. That is the property; PostgreSQL
+          # guarantees nothing about ties without it.
+          with pool.connection() as conn:
+              conn.execute("SET LOCAL enable_indexscan = off")
+              conn.execute("SET LOCAL enable_bitmapscan = off")
+              plan = "\n".join(
+                  row["QUERY PLAN"]
+                  for row in conn.execute(
+                      "EXPLAIN " + sql.SELECT_INVOCATIONS_FOR_RUN,
+                      {"run_id": tied_run.id},
+                  ).fetchall()
+              )
+              unindexed = conn.execute(
+                  sql.SELECT_INVOCATIONS_FOR_RUN, {"run_id": tied_run.id}
+              ).fetchall()
+              conn.commit()
+          # Without this the probe could pass vacuously: if the settings failed
+          # to take, the index would still be supplying the order and the check
+          # below would prove nothing.
+          check(
+              "Index Scan" not in plan,
+              f"the tie-break probe did not actually deny the index, so it "
+              f"proves nothing: {plan}",
+          )
+          check(
+              [row["tool_call_id"] for row in unindexed]
+              == ["call-x", "call-y", "call-z"],
+              f"with no index to borrow an order from, tied rows are not ordered "
+              f"by the statement: {[row['tool_call_id'] for row in unindexed]}",
+          )
+
           # The read must stay unbounded. A fixed LIMIT would let RunDetail claim
           # a complete run while silently dropping steps, because the wire shape
           # carries no cursor and no truncation flag.
