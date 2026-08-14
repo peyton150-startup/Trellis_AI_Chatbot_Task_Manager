@@ -90,6 +90,29 @@ If Opus availability runs short before the kernel is done, spend what is left in
 
 Those five are the demo. Everything else is scaffolding around them, and Sol builds scaffolding fine.
 
+### Active authoring allocation from T09 through T12B
+
+Use this allocation for the remaining work before R2:
+
+| Task | Authoring allocation |
+|---|---|
+| T09 | Sol |
+| T10 | Opus writes only `create_task`; Sol transcribes the remaining five tools against that exact reference structure. |
+| T11 | Sol |
+| T12A | Opus |
+| T12B | Opus |
+
+The preferred T10 split uses Opus capacity in addition to the substantial T12A
+and T12B passes. Treat the `create_task` reference pass as part of a third Opus
+allocation even though it is narrower. If remaining Opus capacity truly covers
+only two substantial authoring passes, spend both on T12A and T12B and let Sol
+write all six T10 tools directly from section 10. Do not reduce either boundary
+task to preserve the preferred T10 reference pass.
+
+This scarcity fallback changes T10 authorship only. It does not change T10's
+five-step contract, transaction boundary, verification, commit boundary, or R2
+review requirement.
+
 ### Review-budget triage from T07 forward
 
 **Active schedule exception:** task implementation, commits, and verification remain strictly one at a time. Dedicated model review is compressed into two checkpoints so scarce review usage is spent where a subtle mistake can invalidate the demo. This exception changes review cadence only; it does not change task order, author routing, file ownership, verification commands, or the rule against working ahead around a failed task.
@@ -987,7 +1010,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T08 | Runs and wire contract | **OPUS ONLY** | `runs.py`, `main.py`, `sql.py`, `tests/test_invariants.py`, this table's T08, T09, and T12B rows, BUILD_SPEC sections 9 and 10 | 12 of 13 pass; the AG-UI history test unblocks at T12A. File list expanded under D-42: `RunDetail.steps` needs a run-scoped invocation read that `sql.py` did not have, and the two remaining testable invariants did not exist. |
 | T09 | Seed and reset | SOL, D-48 EXCEPTION | `seed.py`, `main.py`, `sql.py`, `docs/ARCHITECTURE.md`, `docs/BUILD_SPEC.md`, `docs/DECISIONS.md`, `docs/OPEN_QUESTIONS.md` | `POST /api/demo/reset` with zero body bytes returns the 11 fixed tasks; any body bytes return 422 before mutation. Two successful resets preserve fixture ids and fields, leave no audit or control history, and a real late insert failure restores every pre-reset row. `main.py` remains in the list under D-44; D-48 adds the narrow body guard, administrative writer exception, SQL, documentation, and checkpoint-2 review timing. |
 | T10 | Tools | MIXED, see below | `tools.py` | Each tool callable directly, five-step body identical |
-| T11 | Prompts | **OPUS ONLY** | `prompts.py` | `render_task_block` output inspected both ways |
+| T11 | Prompts | SOL | `prompts.py` | `render_task_block` output inspected both ways |
 | T12A | Integrate the proven AG-UI transport | **OPUS ONLY** | `agent.py`, `main.py` | See T12A proof list below |
 | T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py`, `runs.py`, `sql.py` | See T12B proof list below. Owns `POST /api/runs/{id}/approvals/{tool_call_id}`, approval creation and decision, and `RunDetail.pending_approval`, which is null until here under D-45. Must also settle what that field means when one turn produces more than one approval-required call, and the invalid-run-state error code D-45 records as missing. |
 | R2 | Blind review and execution checkpoint 2 | NON-AUTHORING MODEL + HUMAN | T10 reference tool, T11, and T12A/T12B boundary changes | See the R2 review and execution gate below. The same immutable SHA passes review, fresh-sandbox execution, lint, deterministic tests, and the production build before T13. |
@@ -1038,9 +1061,26 @@ Delete `spike/` before T12A. Do not carry spike code into the real implementatio
 
 ### T10 model split
 
-**Opus writes the first tool, `create_task`, complete**, including the five-step body and the transaction boundary. That file section becomes the reference implementation.
+**Preferred allocation: Opus writes only the first tool, `create_task`,
+complete**, including the five-step body and the transaction boundary. Opus
+does not author any of the other five tools. That file section becomes the
+reference implementation.
 
-**Sol transcribes the remaining five** against it. Same step order, same names, same transaction shape. If a tool seems to need a different structure, it does not; write the question to `docs/OPEN_QUESTIONS.md` and stop.
+**Sol transcribes the remaining five** against that exact structure. Same step
+order, same names, same transaction shape. Sol does not redesign or normalize
+the reference while copying it. If a tool seems to need a different structure,
+it does not; write the question to `docs/OPEN_QUESTIONS.md` and stop.
+
+If the active allocation's two-pass scarcity condition applies, Sol writes all
+six tools directly from section 10 and preserves the same structure. This is an
+explicitly authorized T10-only fallback, not precedent for T12A or T12B.
+
+Review only the final T10 result after all six tools are present and T10's
+verification has passed. R2 performs that non-authoring, read-only review from
+its immutable same-SHA checkpoint, focusing on `create_task` as the reference
+implementation and the shared transaction shape. The partial Opus handoff is
+not review input. Any later T10 change invalidates the prior T10 review result
+and requires R2 to run again against the new immutable SHA.
 
 ### T12A: integrate the proven AG-UI transport
 

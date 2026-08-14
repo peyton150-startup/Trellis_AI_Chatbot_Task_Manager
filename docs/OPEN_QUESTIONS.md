@@ -438,5 +438,6 @@ Options:   A. Add an unaudited administrative entry point to `domain.py`.
               history, and grant Sol the exact body-guard exception needed here.
 Resolution: B. D-48 records the file expansion, minimum-authority SQL,
            namespace, dates, literal notes, zero-history baseline, transaction
-           proof, and checkpoint-2 review after T12B. The Sol exception is
-           T09-only and does not change T11, T12A, or T12B routing.
+           proof, and checkpoint-2 review after T12B. The Sol exception itself
+           is T09-only and does not change T12A or T12B routing. D-49 later
+           reassigns T11 to Sol.

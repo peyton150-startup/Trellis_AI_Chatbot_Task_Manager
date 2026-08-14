@@ -728,9 +728,45 @@ limited to this fixed reset and does not authorize general task mutation outside
 `domain.py`.
 
 Under the user-approved D-48 routing exception, Sol authored all of T09,
-including the narrow no-body guard. This preserves Opus capacity for T11 and
-T12A/T12B. The exception authorizes only `0 body bytes -> continue; any body
-bytes -> 422 before mutation` and no broader wire-contract change. This
-exception does not spend a standalone review. Per the user's 2026-08-14 timing
-clarification, T09 review remains batched at checkpoint 2 after T12B, where the
-reviewed SHA and any findings or dispositions will be recorded.
+including the narrow no-body guard. This preserves Opus capacity for the T10
+`create_task` reference and T12A/T12B. The exception authorizes only `0 body
+bytes -> continue; any body bytes -> 422 before mutation` and no broader
+wire-contract change. This exception does not spend a standalone review. Per
+the user's 2026-08-14 timing clarification, T09 review remains batched at
+checkpoint 2 after T12B, where the reviewed SHA and any findings or
+dispositions will be recorded.
+
+## Documentation model allocation, revision 03
+
+**Local role:** Records the active T09 through T12B authoring allocation. T09
+and T11 belong to Sol. T10 keeps the preferred mixed handoff in which Opus
+authors only the complete `create_task` reference and Sol transcribes the other
+five tools. T12A and T12B belong to Opus.
+
+**Whole-system role:** Concentrates scarce Opus authoring capacity at the AG-UI
+transport and approval boundary while retaining a high-quality reference for
+the policy, lease, mutation, event, and completion transaction when capacity
+allows. The conditional fallback protects T12A and T12B by assigning all of
+T10 to Sol if only two substantial Opus passes remain. R2 still reviews the
+final T10 result without adding another checkpoint or weakening the same-SHA
+gate.
+
+**Inputs and dependencies:** BUILD_SPEC sections 1A, 10, and 12; D-35's
+compressed review cadence; D-47's immutable same-SHA R2 rule; the existing
+five-step tool-body contract; and the user's 2026-08-14 allocation decision.
+
+**Outputs and consumers:** D-49 closes the allocation. BUILD_SPEC is the
+executable routing source for T09 through T12B. PROJECT_PLAN records the
+capacity tradeoff. The T10 handoff, T11 author, T12A and T12B authors, and R2
+reviewer all consume these boundaries.
+
+**Verification:** Documentation checks compare the T09 through T12B allocation
+across BUILD_SPEC, DECISIONS, and PROJECT_PLAN; confirm T11 is tagged SOL in the
+task table; confirm the preferred and scarcity T10 paths preserve section 10's
+five-step contract; scan changed lines for em dashes; and run
+`git diff --check`.
+
+**Limitations and review status:** No application code, CI workflow, dependency,
+database, task estimate, or task order changes here. The fallback is conditional
+on actual remaining Opus capacity. R2 has not run; it remains the non-authoring,
+read-only review and execution gate after T12B.

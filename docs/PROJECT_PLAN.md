@@ -295,10 +295,25 @@ Adding people is not available and would not help on work this coupled. The avai
 
 ### Review compression from T07 forward
 
+The active authoring allocation through R2 is:
+
+| Task | Allocation |
+|---|---|
+| T09 | Sol |
+| T10 | Opus authors only `create_task`; Sol transcribes the other five tools against it. |
+| T11 | Sol |
+| T12A | Opus |
+| T12B | Opus |
+
+The preferred T10 reference pass is additional Opus usage beyond T12A and T12B.
+If capacity truly covers only two substantial Opus passes, reserve them for
+T12A and T12B and assign all of T10 to Sol under D-49. The task estimate and
+sequence do not change; this is model-capacity triage inside the existing work.
+
 The original review cadence assumed every review-tagged task received a dedicated blind read before it was marked done. Under the active schedule pressure, keep task implementation, commits, and verification separate, but batch dedicated model review at the two boundaries where a subtle defect can invalidate the demo:
 
 1. **After T08:** review T07 undo and T08 wire contract together. T08 is mandatory; T07 may receive a lightweight read.
-2. **After T12B, R2:** review the T10 reference tool and transaction shape, T11 prompts, T12A transport and trust boundary, and T12B approval path. Pin the blind review to an immutable SHA, execute that exact SHA through the T12A/T12B path in a fresh Vercel Sandbox, and require `cd backend && ruff check .`, `cd backend && pytest -m "not network"`, and `npm run build`. Any unresolved BLOCK, sandbox failure, lint failure, test failure, or production-build failure blocks T13. Any fix that changes the SHA restarts all of R2.
+2. **After T12B, R2:** perform a non-authoring, read-only review of the final T10 result, focusing on the `create_task` reference and shared transaction shape, plus T11 prompts, T12A transport and trust boundary, and T12B approval path. Pin the blind review to an immutable SHA, execute that exact SHA through the T12A/T12B path in a fresh Vercel Sandbox, and require `cd backend && ruff check .`, `cd backend && pytest -m "not network"`, and `npm run build`. Any unresolved BLOCK, sandbox failure, lint failure, test failure, or production-build failure blocks T13. Any fix that changes the SHA restarts all of R2.
 3. **At T15:** run the full ugly-demo smoke path and inspect it manually. Once this is green, reduce review depth and finish, test, make reproducible, and rehearse the demonstrable system.
 
 Remaining review budget is allocated in this order: **T12B > T08 > T12A > T07 > T10 > everything else.** Seed/reset, prompts, board, chat, approval UI, undo UI, timeout handling, Run Inspector, OTel, evals, and polish use their specified verification, functional, visual, or rehearsal checks rather than dedicated blind reviews. T17 may be reviewed with T23 if that work is reached. T23 receives a security review only if time remains after T15 is green.
