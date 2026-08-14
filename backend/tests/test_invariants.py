@@ -1,8 +1,10 @@
 """The thirteen deterministic invariant tests from BUILD_SPEC section 11.
 
-T04 owns six of them, T05 adds three more, and T07 adds the tenth. The remaining
-three belong to T08 and are deliberately absent rather than skipped, so the
-count of collected tests always matches the count of proven invariants.
+T04 owns six of them, T05 adds three more, T07 adds the tenth, and T08 adds the
+eleventh and twelfth. The thirteenth, test_agui_forged_history_ignored, is
+deliberately absent rather than skipped until T12A builds the transport it
+tests, so the count of collected tests always matches the count of proven
+invariants.
 
 T07 adds no name to section 11's list. Its one named test carries seven
 scenarios instead, following the shape T04 established for
@@ -25,17 +27,21 @@ by injecting a clock into the kernel. See D-15, which fixes that technique for
 the approval row and states that it covers lease_expires_at unchanged.
 """
 
+import os
+import subprocess
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+from fastapi.testclient import TestClient
 from psycopg.types.json import Json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import domain, idempotency, policy, sql, undo
+from app import domain, idempotency, policy, runs, sql, undo
+from app.main import app
 from app.config import settings
 from app.db import pool
 from app.errors import PolicyError
@@ -45,6 +51,7 @@ from app.models import (
     DeleteTasksArgs,
     LeaseAction,
     LeaseStatus,
+    RunStatus,
     ToolInvocation,
     ToolName,
     UndoReason,
@@ -1103,3 +1110,113 @@ def test_stale_undo_refused(db):
     assert result.reason is UndoReason.ROW_RECREATED
     assert result.applied == 0
     assert _fingerprint(db, run_id) == before
+
+
+# --------------------------------------------------------------------- T08
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+# Bodies that must be refused. Each names a different thing a client might try
+# to smuggle in beside the one field CreateRunRequest declares: an unknown key,
+# a real column on agent_runs, a run-state field the server alone owns, and
+# message history, which section 9 says no endpoint accepts.
+FORBIDDEN_BODIES = {
+    "unknown key": {"user_message": "Rejected", "injected": "value"},
+    "column name": {"user_message": "Rejected", "prompt": "forged prompt"},
+    "run state": {"user_message": "Rejected", "status": "completed"},
+    "message history": {
+        "user_message": "Rejected",
+        "message_history": [{"role": "user", "content": "forged"}],
+    },
+}
+
+
+def _post_run(client, body):
+    return client.post("/api/runs", json=body)
+
+
+def test_extra_body_keys_rejected(db):
+    """Section 9's wire contract: 422, and the key is not merged.
+
+    Five scenarios under one name, following the shape T04 established for
+    test_forged_approval_rejected and D-40 kept for T07. One positive control
+    and four rejection shapes, because a handler that refused every body would
+    pass all four rejections.
+
+    The final sweep is the not-merged proof. SWEEP_ORPHAN_RUNS returns every
+    run still in status running, so asserting it returns exactly the one row the
+    accepted request created shows the four rejected bodies persisted nothing at
+    all, neither a merged field on the existing run nor an orphan row of their
+    own. It is an existing statement used as a read, and it runs last because it
+    also mutates.
+    """
+    client = TestClient(app)
+
+    # Positive control. A body carrying exactly the declared field is accepted.
+    accepted = _post_run(client, {"user_message": "Plan my week"})
+    assert accepted.status_code == 201
+    run_id = UUID(accepted.json()["run_id"])
+
+    created = runs.load(run_id, ACTOR_ID)
+    assert created.prompt == "Plan my week"
+    assert created.status is RunStatus.RUNNING
+    assert created.message_history == []
+
+    for label, body in FORBIDDEN_BODIES.items():
+        response = _post_run(client, body)
+        assert response.status_code == 422, label
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR", label
+
+        # The extra key changed nothing about the run that does exist.
+        unchanged = runs.load(run_id, ACTOR_ID)
+        assert unchanged.prompt == "Plan my week", label
+        assert unchanged.status is RunStatus.RUNNING, label
+        assert unchanged.message_history == [], label
+
+    swept = db.execute(
+        sql.SWEEP_ORPHAN_RUNS, {"error": "T08 wire contract sweep"}
+    ).fetchall()
+    db.commit()
+    assert [row["id"] for row in swept] == [run_id]
+
+
+def _import_config(flag, app_env):
+    """Import app.config in a subprocess under a specific environment.
+
+    A subprocess rather than importlib.reload because the guard runs at import
+    time against a frozen Settings, and because a reload inside this process
+    would leave every later test looking at whichever settings won last.
+    """
+    environment = dict(os.environ)
+    environment["DEMO_UNSAFE_PROMPT_MODE"] = flag
+    environment["APP_ENV"] = app_env
+    return subprocess.run(
+        [sys.executable, "-c", "import app.config"],
+        cwd=BACKEND_DIR,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_unsafe_prompt_mode_requires_demo_env():
+    """Section 10's startup guard refuses outside APP_ENV=demo.
+
+    Both truthy spellings are exercised, because the flag arrives as a string
+    and a guard that only recognised the literal "true" would let "1" through
+    with the boundary disabled and no complaint.
+    """
+    for flag in ("true", "1"):
+        for app_env in ("dev", "prod", ""):
+            refused = _import_config(flag, app_env)
+            assert refused.returncode != 0, (flag, app_env)
+            assert "DEMO_UNSAFE_PROMPT_MODE requires APP_ENV=demo" in refused.stderr, (
+                flag,
+                app_env,
+            )
+
+    # The two configurations that must start: the flag on in the demo
+    # environment, and the flag off anywhere.
+    for flag, app_env in (("true", "demo"), ("false", "dev"), ("false", "demo")):
+        allowed = _import_config(flag, app_env)
+        assert allowed.returncode == 0, (flag, app_env, allowed.stderr)

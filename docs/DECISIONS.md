@@ -1388,3 +1388,211 @@ produces through `ON DELETE SET NULL` are fresh side effects rather than
 inverses of anything, and keep the `updated` semantics D-23 gave them.
 Relabelling them would make the event log claim a pointer was restored when it
 was cleared.
+
+---
+
+## Runs and wire contract decisions recorded at T08
+
+Recorded on 2026-08-14, before any T08 code was written, in the same order the
+T07 block established. D-42 through D-45.
+
+### D-42: T08 scope, the approval facade, and the unbounded invocation read
+
+**The test-authorship exception is granted afresh for T08.** Section 11 routes
+`test_invariants.py` to Sol. T08's done-when is 12 of 13 invariants passing,
+`test_extra_body_keys_rejected` and `test_unsafe_prompt_mode_requires_demo_env`
+do not exist, and D-40 states in terms that its T07 exception is not precedent
+for T08. Without a fresh ruling the task is mechanically impossible. Granted by
+the user on 2026-08-14, scoped to T08 alone, and not precedent for T09.
+
+Compensating measures match T05 and T07: the red run is preserved before any
+implementation exists, single-line mutations are applied one at a time and each
+required to behave as predicted, every touched file is restored and verified by
+digest, and the blind review at checkpoint 1 receives the task specification,
+the diff, and the verification evidence only.
+
+**T08's file list is `runs.py`, `main.py`, `sql.py`, and
+`tests/test_invariants.py`,** plus the `.github/workflows/ci.yml` and
+`IMPLEMENTATION_NOTES.md` companions CLAUDE.md requires of every task, and the
+`docs/BUILD_SPEC.md` and `docs/DECISIONS.md` edits this decision block records.
+
+**Approval reads live in `runs.py`, and no `approvals.py` is created.** Section
+10's five-step tool body names `approvals.load(run_id, tool_call_id)`, section 3
+has no such file in its "Create exactly this" tree, no task in section 12
+creates one, and `INSERT_APPROVAL`, `SELECT_APPROVAL`, and `DECIDE_APPROVAL`
+have sat in `sql.py` without a caller since T02. `policy.check` takes the
+approval row as a parameter and never writes one, so the reader has to exist
+somewhere by T10, which is two tasks before the approval bridge.
+
+Approval rows are run-scoped control state, so `runs.load_approval` is the
+smallest coherent home and section 10 is amended to name it. A new module would
+widen the file tree without buying separation on this schedule. T10 can
+therefore read an approval without owning approval persistence, and T12B gains
+`runs.py` and `sql.py` for creation, decision, and the `pending_approval` read.
+
+**`SELECT_INVOCATIONS_FOR_RUN` is deliberately unbounded,** on the reasoning
+D-39 recorded for `SELECT_ALL_EVENTS_FOR_RUN`. Section 5 requires a `LIMIT` on
+every list query, and that rule is about paginated reads for display.
+`RunDetail.steps` is not one: the section 9 wire shape carries no cursor and no
+truncation flag, so a fixed bound would not return a shorter answer, it would
+return a false one, claiming a complete run while silently omitting steps. No
+fixed bound is provably safe either, because `bulk_update_tasks` places no cap
+on `task_ids`. `SELECT_LEASE` keeps its key and remains the single-row read.
+Ordering is `created_at ASC, tool_call_id ASC`; the second key is a presentation
+tie-breaker for rows sharing a timestamp, not a claim that lexical id order
+reconstructs causal order.
+
+### D-43: RunStep semantics, and what the persistence model cannot prove
+
+**`RunStep.status` is the persisted invocation status, and `deduplicated` is
+structurally unreachable at T08.** `tool_invocations.status` is
+`pending | completed | failed`. Section 9's wire enum adds a fourth value that
+is computed when a lease returns `REPLAY`, and `idempotency.acquire` returns
+`REPLAY` straight off a read of a completed row and writes nothing. The row is
+not rewritten, no second attempt is recorded, and a later
+`GET /api/runs/{id}` reading Postgres has nothing to render.
+
+The narrow statement is the correct one. **Attempt number is durable for every
+path that rewrites the lease row.** `REACQUIRE_FAILED_LEASE` and
+`STEAL_EXPIRED_LEASE` both increment `attempt`. Successful replay is the
+exceptional path, the one that reads without writing, so replay occurrence and
+attribution are what is missing rather than attempt history generally. T08
+therefore populates `tool_call_id`, `tool_name`, `attempt`, `duration_ms`,
+`error`, and the three reachable statuses truthfully, and never synthesizes a
+`deduplicated` step.
+
+`agent_runs.tool_calls` exceeding `count(tool_invocations)` can establish that
+additional attempts occurred, and in the single-tool demo beat it supports an
+aggregate replay inference. It cannot attribute a replay to a particular tool
+call once several exist, so it is not a general solution and T08 does not use
+it.
+
+**This is a T20 prerequisite, not a note.** ARCHITECTURE's 8:00 demo beat reads
+`Attempt 1 COMMITTED / Attempt 2 DEDUPLICATED / Mutations 1`. Before T20 claims
+that surface, the project must decide whether to persist attempt history or to
+use the narrow single-tool reconstruction for that one display. As specified
+today, T20 is not executable.
+
+**`duration_ms` is the elapsed time of the most recent persisted attempt,
+anchored at `lease_expires_at - LEASE_TTL_SECONDS`.** `created_at` is the wrong
+anchor: neither recovery statement rewrites it, so a stolen lease measured from
+it is charged for the dead holder's entire expiry window and a three second tool
+reports as roughly two minutes. Every path that grants execution sets
+`lease_expires_at = now() + ttl`, and `COMPLETE_LEASE` and `FAIL_LEASE` set
+`completed_at` without touching it, so subtracting the TTL recovers the moment
+this attempt was granted. A terminal row measures to `completed_at`, a pending
+row to a database-side `now()` returned by the same statement, so an idle step's
+duration cannot drift with the reader's clock skew.
+
+**The branch is on `status`, not on `completed_at IS NULL`, and that is load
+bearing.** `REACQUIRE_FAILED_LEASE` returns a row to `pending` and bumps
+`attempt` without clearing `completed_at`, so a reacquired row is pending while
+still carrying the previous attempt's completion stamp, which is earlier than
+the current attempt's start. Branching on the timestamp takes the terminal path
+and subtracts a later anchor from an earlier stamp. Both readings are covered by
+mutation in the T08 gate.
+
+**Limitation.** The reconstruction assumes `LEASE_TTL_SECONDS` has not changed
+since an attempt acquired its lease. Changing it while historical rows remain
+makes the derived start inaccurate for those rows, which is why the result is
+clamped at zero rather than allowed to go negative.
+
+### D-44: endpoint ownership, `can_undo`, and actor-scoped `OUT_OF_SCOPE`
+
+**Each section 9 endpoint belongs to the task that owns its behavior.**
+
+```
+T08   GET  /api/tasks
+      POST /api/runs
+      GET  /api/runs/{id}
+T09   POST /api/demo/reset              T09 gains main.py
+T12A  POST /api/agui
+T12B  POST /api/runs/{id}/approvals/{tool_call_id}
+T18   POST /api/runs/{id}/undo
+CUT   POST /api/runs/{id}/resume
+```
+
+T12A, T12B, and T18 already list `main.py`. T09's file list is corrected to
+include it, because its done-when is an HTTP response and `seed.py` alone cannot
+produce one.
+
+**`/api/runs/{id}/resume` is removed from section 9's table.** D-36 credited
+"Cut order 2, resume and orphan sweep, 0.25d, Activity S, removed in full" and
+spent that credit inside the 0.42d quantified payment against the Linear
+expansion. Building the endpoint at T08 would make the only fully credited cut
+in that ledger fiction. Section 9 said "Exactly these endpoints. No others."
+while listing one that a later decision had already cut, and this resolves the
+contradiction in favour of D-36 as the most recent and the only one that moved a
+number. No not-implemented placeholder is created, because a placeholder is
+still an endpoint. If resume is ever reinstated it is `interrupted` only;
+approval continuation has its own bridge and must not gain a second path around
+it.
+
+**`can_undo` is eligibility to attempt compensation, not a promise of success.**
+
+```
+can_undo =
+    actor owns the run
+    AND status in {completed, failed, interrupted}
+    AND the run has at least one task_event
+    AND the run has no restored compensation event
+```
+
+The status clause is a safety condition: a `running` or `awaiting_approval` run
+can still commit further effects, and compensating a live run races its own
+continuation. `failed` and `interrupted` stay eligible because either can have
+committed tools before the run stopped.
+
+The fourth clause is what D-38 requires, and it matters more than it looks.
+Compensation events carry the original `run_id`, so a second undo would load the
+original wave together with its own compensations and invert nothing well
+defined. `undo.py` processes a `restored` event rather than refusing it, by
+design, so **this predicate is the only thing preventing a second undo**, and
+D-41 guarantees the detector is sound by relabelling every direct compensation
+to `restored`. T18 must enforce the same predicate server-side before calling
+the kernel rather than only hiding the button.
+
+Two limitations are recorded rather than solved. The undo precheck can still
+refuse an eligible run with `ROW_DISAPPEARED`, `VERSION_CONFLICT`, or
+`ROW_RECREATED` when current state has moved, so `can_undo` true is not a
+guarantee. And a route-level read followed by `undo_run` refuses repeated
+sequential calls but does not by itself prove that two simultaneous undo
+requests cannot both pass eligibility before either writes compensation. That
+concurrency question belongs to T18 and is not solved by expanding the kernel
+today.
+
+**`OUT_OF_SCOPE` is widened from tasks to actor-scoped resource resolution.**
+Section 9 requires the resolver to reject a run that does not exist or belongs
+to another actor and never names the code. `OutOfScopeError`'s docstring scopes
+it to tasks. At API resource resolution it means: the requested actor-scoped
+resource is unavailable to this actor, without distinguishing absence from
+ownership failure. That preserves the non-enumeration property the architectural
+invariant already states for tasks. `errors.py` is not edited to reword the
+docstring, because it is KERNEL and a cosmetic edit would trip D-31 for nothing.
+
+### D-45: contracts deferred out of T08, with their deadlines
+
+Four things are unresolved. None blocks T08, and each has a task before which it
+must be settled.
+
+**No legal error code exists for a valid, actor-owned run whose current status
+forbids the requested action.** Section 6 closes the vocabulary at twelve codes
+and says every rejection uses one of them. None of them means this.
+`VALIDATION_ERROR`, `OUT_OF_SCOPE`, and the approval-specific codes must not be
+bent to fit. The endpoint ownership in D-44 means no T08 route needs this
+rejection, so it is recorded rather than solved. **Resolve before T12B and
+T18**, both of which reject on run state. Adding a thirteenth code edits KERNEL
+`errors.py` and therefore trips D-31, which is why it is not done casually here.
+
+**`RunDetail.pending_approval` is null at T08 and T12B owns it.** Nothing writes
+an approval row until the bridge exists, so null is observationally correct
+today. The genuinely unspecified question is what the field means when a model
+produces more than one approval-required call in a turn: the wire shape carries
+exactly one pending approval and Pydantic AI's deferred result can carry a list.
+T08 does not invent a first-row-wins rule. **Resolve at T12B**, which gains
+`runs.py` and `sql.py` for it.
+
+**No durable representation exists for a successful replay.** See D-43.
+**Resolve before T20.**
+
+**Concurrent undo eligibility.** See D-44. **Resolve at T18.**

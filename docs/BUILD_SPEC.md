@@ -679,12 +679,15 @@ Exactly these endpoints. No others.
 | POST | `/api/runs` | `{ "user_message": string }` | `{ "run_id": uuid }` |
 | GET | `/api/runs/{id}` | none | `RunDetail` |
 | POST | `/api/runs/{id}/approvals/{tool_call_id}` | `{ "decision": "approved" \| "denied" }` | `RunDetail` |
-| POST | `/api/runs/{id}/resume` | none | `RunDetail` |
 | POST | `/api/runs/{id}/undo` | none | `{ "applied": int, "refused": bool, "reason": string? }` |
 | POST | `/api/demo/reset` | none | `{ "tasks": Task[] }` |
 | POST | `/api/agui` | AG-UI `RunAgentInput`: `threadId`, new `runId`, `messages`, `state`, `tools`, `context`, `forwardedProps`; continuation also includes `resume[]` | SSE event stream |
 
 The AG-UI transport row is the one unresolved item in this document. The exact HTTP method and request shape are determined by task T00A on Day 1 and written into `docs/DECISIONS.md`, and this table is then updated with the answer. Until T00A completes, do not implement that endpoint by guessing. This is the single permitted "TBD" in the spec; there are no others.
+
+`POST /api/runs/{id}/resume` was removed from this table at T08 under D-44. D-36 credited resume and orphan sweep as "Activity S, removed in full" and spent that 0.25d inside the quantified payment for the Linear expansion, so an endpoint table that still listed it contradicted the ledger. Do not add it back, and do not add a not-implemented placeholder, which is still an endpoint. If it is ever reinstated it is `interrupted` only; approval continuation has its own bridge in section 10 and must not gain a second path around it.
+
+Each remaining row belongs to the task that owns its behavior, under D-44: T08 builds `GET /api/tasks`, `POST /api/runs`, and `GET /api/runs/{id}`; T09 builds `/api/demo/reset` with the fixture; T12A builds `/api/agui`; T12B builds the approvals decision with the approval bridge; T18 builds `/api/runs/{id}/undo`.
 
 > **OPUS ONLY for the enforcement code below.** Routes and response shaping are SOL work; the four rules in this block are not.
 
@@ -740,7 +743,7 @@ Each is a Python function in `tools.py` with a Pydantic argument model. Every to
 
 ```
 1. args_hash    = arguments_hash(arguments)
-2. approval_row = approvals.load(run_id, tool_call_id)   # None for ungated tools
+2. approval_row = runs.load_approval(run_id, tool_call_id)  # None for ungated tools
    decision     = policy.check(actor_id, tool_name, arguments, target_ids, approval_row)
 3. outcome      = idempotency.acquire(run_id, tool_call_id, tool_name, args_hash)
    if outcome.action == "REPLAY": return outcome.result
@@ -807,6 +810,8 @@ agent_runs.id                      one application run, one row, stable
 | `propose_plan` | `summary`, `steps[]` | no | Returns a plan for display. **Mutates no domain state.** It still acquires a lease and writes a `tool_invocations` row, like every other tool. |
 
 Every optional enum field is a Python `Enum`, never a free string. Required fields are required. No field accepts arbitrary JSON.
+
+Step 2 named `approvals.load(...)` until T08. There is no `approvals.py` in section 3's file tree, no task in section 12 creates one, and `policy.check` takes the approval row as a parameter and never writes one, so the reader had to exist by T10 with nobody owning it. D-42 places approval reads in `runs.py`, where run-scoped control state already lives, and T12B owns creation, decision, and `RunDetail.pending_approval`.
 
 ### `prompts.py`
 
@@ -980,12 +985,12 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T00B | Gate B: Linear API probe | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, this table row, `CLAUDE.md` sources-of-truth line | Six facts recorded in `docs/DECISIONS.md`, fixture written, GATE B PASS or FAIL. Runs after T06 and before T07; see section 8 of `docs/LINEAR_INTEGRATION.md` for why. |
 | T00L | Linear boundary retrofit | **OPUS ONLY** | `migrations/002_linear.sql`, `errors.py`, `policy.py`, `sql.py`, `models.py` if needed, `tests/test_invariants.py`, this table row, BUILD_SPEC sections 3, 4, 6, 11, `docs/ARCHITECTURE.md` parts 2 and 4 | Invariant suite passes at whatever count D-29 concludes, no network. `docs/LINEAR_INTEGRATION.md` section 8 sequences this before T07; it is not a T07 prerequisite, and the `EXTERNALLY_MODIFIED` precheck it adds to KERNEL `undo.py` is a retrofit to a merged file rather than part of T07. |
 | T07 | KERNEL undo | **OPUS ONLY** | `undo.py` | `test_stale_undo_refused` passes |
-| T08 | Runs and wire contract | **OPUS ONLY** | `runs.py`, `main.py` | 12 of 13 pass; the AG-UI history test unblocks at T12A |
-| T09 | Seed and reset | SOL | `seed.py` | `POST /api/demo/reset` returns 11 tasks |
+| T08 | Runs and wire contract | **OPUS ONLY** | `runs.py`, `main.py`, `sql.py`, `tests/test_invariants.py`, this table's T08, T09, and T12B rows, BUILD_SPEC sections 9 and 10 | 12 of 13 pass; the AG-UI history test unblocks at T12A. File list expanded under D-42: `RunDetail.steps` needs a run-scoped invocation read that `sql.py` did not have, and the two remaining testable invariants did not exist. |
+| T09 | Seed and reset | SOL | `seed.py`, `main.py` | `POST /api/demo/reset` returns 11 tasks. `main.py` is in the list under D-44 because the done-when is an HTTP response and `seed.py` alone cannot produce one; T08 deliberately did not create this route. |
 | T10 | Tools | MIXED, see below | `tools.py` | Each tool callable directly, five-step body identical |
 | T11 | Prompts | **OPUS ONLY** | `prompts.py` | `render_task_block` output inspected both ways |
 | T12A | Integrate the proven AG-UI transport | **OPUS ONLY** | `agent.py`, `main.py` | See T12A proof list below |
-| T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py` | See T12B proof list below |
+| T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py`, `runs.py`, `sql.py` | See T12B proof list below. Owns `POST /api/runs/{id}/approvals/{tool_call_id}`, approval creation and decision, and `RunDetail.pending_approval`, which is null until here under D-45. Must also settle what that field means when one turn produces more than one approval-required call, and the invalid-run-state error code D-45 records as missing. |
 | T13 | Board and task card | SOL | `Board.tsx`, `TaskCard.tsx`, `useBoard.ts`, `api.ts`, `types.ts` | Board renders seed data |
 | T14 | Chat | SOL | `Chat.tsx` | Streaming turn visible, board refetches after tool completion. See the assistant-ui ownership note below. |
 | T15 | **UGLY DEMO BAR** | either | none | Prompt to committed board update, unstyled |
@@ -994,7 +999,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T18 | Undo endpoint and button | SOL | `main.py`, `Board.tsx` | Undo restores; refuses after an external edit. `undo.py` is KERNEL, do not edit it here. |
 | T19 | Timeout, retry, degraded state | SOL | `tools.py`, `agent.py`, `Chat.tsx` | Forced timeout shows degraded state, does not hang |
 | T20 | Run Inspector | SOL | `RunInspector.tsx` | Shows attempts, COMMITTED and DEDUPLICATED, usage |
-| T21 | Resume and orphan sweep | SOL | `runs.py`, `main.py` | If retained: killed run marked interrupted at boot and resume works. Verification only under the active review-budget exception. |
+| T21 | Resume and orphan sweep | SOL | `runs.py`, `main.py` | **Cut.** D-36 credited this as "Activity S, removed in full" and spent the 0.25d against the Linear expansion, so the earlier "if retained" wording is settled: it was not retained. D-44 removes `/api/runs/{id}/resume` from section 9 to match. `SWEEP_ORPHAN_RUNS` stays in `sql.py` as an unused statement rather than being deleted, so reinstating the task is a decision rather than a rewrite. |
 | T22 | OTel | SOL | `telemetry.py`, `tests/test_telemetry.py`, `requirements.txt` | `pytest tests/test_telemetry.py` passes: at least one `chat` span and at least one `execute_tool` span, captured at the exporter. See the T22 note below and D-30. |
 | T23 | Injection path | SOL | `prompts.py`, `seed.py` | Flag true wrecks the board, flag false does not. Opus reviews the startup guard only if time remains after T15 is green. |
 | T24 | Eval suite | SOL | `test_evals.py`, `fixtures/cases.py` | 15 cases run, pass rate recorded |

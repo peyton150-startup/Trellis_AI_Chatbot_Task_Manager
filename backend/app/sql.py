@@ -191,6 +191,30 @@ SELECT *
  ORDER BY id DESC;
 """
 
+# Deliberately unbounded, under D-42, on the same reasoning D-39 recorded for
+# SELECT_ALL_EVENTS_FOR_RUN. Section 5 requires a LIMIT on every list query, and
+# that rule is about paginated reads for display. RunDetail.steps is not one:
+# the wire shape in section 9 carries no cursor and no truncation flag, so a
+# fixed bound would not return a shorter answer, it would return a false one,
+# claiming a complete run while silently omitting steps. No fixed bound is
+# provably safe either, because bulk_update_tasks places no cap on task_ids.
+# SELECT_LEASE remains the single-row read and keeps its key.
+#
+# now() rides along because RunStep.duration_ms for a still-pending row is
+# measured against it. lease_expires_at was written by the database clock, so
+# reading the observation time from any other clock would make an idle step's
+# duration drift with the caller's skew.
+#
+# The tool_call_id tie-breaker makes ordering deterministic when two rows share
+# a created_at. It is a presentation device, not a claim that lexical id order
+# reconstructs causal order.
+SELECT_INVOCATIONS_FOR_RUN = """
+SELECT *, now() AS observed_at
+  FROM tool_invocations
+ WHERE run_id = %(run_id)s
+ ORDER BY created_at ASC, tool_call_id ASC;
+"""
+
 INSERT_LEASE = """
 INSERT INTO tool_invocations
   (run_id, tool_call_id, tool_name, arguments_hash, status, lease_expires_at)

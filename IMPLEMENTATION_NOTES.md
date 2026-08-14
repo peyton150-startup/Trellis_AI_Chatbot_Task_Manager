@@ -487,3 +487,98 @@ D-35, with the read, execute, and reconcile phases and a Vercel Sandbox
 execution pass against the pinned commit SHA. D-37 adds one item to that
 review's scope: whether the T00L divergence precheck can be retrofitted into
 this precheck pass, and at what cost.
+
+## T08: Runs and wire contract
+
+**Local role:** `runs.py` owns the run record lifecycle and is the only place in
+the codebase that resolves a run identifier to a run, reads or writes
+`agent_runs.message_history`, or reads an approval row. `main.py` is the FastAPI
+application and enforces the four wire-contract rules from BUILD_SPEC section 9
+before any handler body executes, and maps every `PolicyError` to the HTTP
+status its class fixes in `errors.py`.
+
+**Whole-system role:** This is the task where the trust boundary becomes
+reachable from outside the process. Everything T04 through T07 proved was true
+of functions called directly; T08 is what makes those guarantees true of an HTTP
+request from a browser. Three properties matter beyond this task. A client
+supplied run id becomes a lookup key rather than a grant, because every route
+that accepts one passes it through `runs.load`, which resolves it against
+`agent_runs` and refuses identically whether the run is missing or belongs to
+another actor. Message history becomes server owned, because `runs.load_history`
+is the single function that produces one and no request model carries a message
+list, which is the property `test_agui_forged_history_ignored` will regression
+test at T12A. And `RunDetail.can_undo` becomes the enforcement point for D-38's
+single application rule, which nothing else in the system enforces: `undo.py`
+processes a `restored` event rather than refusing it, so without this predicate a
+second undo would run over its own compensation wave.
+
+**Inputs and dependencies:** `models.py` from T03 for every request and response
+model, including the `TrellisModel` base whose `extra="forbid"` is what turns an
+undeclared key into a parse failure. `errors.py` and `policy.py` from T04 for the
+twelve code and status pairs. `idempotency.py` from T05 for the lease semantics
+`RunStep` renders. `domain.py` from T06 for `list_tasks` and for the event
+records `can_undo` reads. `undo.py` from T07 and D-38 for the eligibility rule.
+`sql.py` from T02, which already carried every run statement this task needed
+except the invocation read.
+
+**Outputs and consumers:** `runs.create`, `load`, `load_history`, `save_history`,
+`set_status`, `record_usage`, `load_approval`, and `detail`. Three endpoints:
+`GET /api/tasks`, `POST /api/runs`, `GET /api/runs/{id}`. `sql.py` gains
+`SELECT_INVOCATIONS_FOR_RUN`, deliberately unbounded under D-42. T10 consumes
+`runs.load_approval` at step 2 of the five step tool body. T12A consumes
+`load_history` and `save_history`. T12B consumes `load_approval` and owns
+approval creation, decision, and `pending_approval`. T18 consumes the `can_undo`
+predicate and must enforce it server side. T20 consumes `RunDetail.steps`.
+
+**Verification:**
+
+```
+cd backend && ruff check .                    All checks passed!
+cd backend && pytest -m "not network"         39 passed, 13 deselected
+```
+
+39 is the 37 that passed on master plus the two invariants this task adds,
+`test_extra_body_keys_rejected` and `test_unsafe_prompt_mode_requires_demo_env`,
+which brings the count to 12 of 13. The red run was preserved first: with the
+tests written and no implementation, collection failed with
+`ImportError: cannot import name 'runs' from 'app'`.
+
+The `T08 runs and wire contract` CI gate carries what those two names
+structurally cannot reach, on the precedent of T04's error table, T05's lease
+guards, and T07's atomicity checks: the resolver returning byte identical
+rejections for a missing and a foreign run, `duration_ms` anchored to the granted
+attempt, a reacquired pending row measured from its reacquire rather than its
+stale `completed_at`, a replay producing no `deduplicated` step, deterministic
+step ordering in both the acquisition-order and tied-timestamp cases, the read
+staying unbounded, `can_undo` across the full status matrix and after
+compensation, and a route surface with no resume endpoint.
+
+Eight single-line mutations were applied one at a time against the gate, each
+restored and verified by digest. Seven were killed. One is recorded as
+equivalent: changing the resolver's rejection message, because `load` has a
+single `row is None` branch covering both the missing and the foreign case, so
+the message changes both responses identically and the equality assertion still
+holds. It was replaced by removing the `actor_id` predicate from `SELECT_RUN`,
+which is the mutation that actually tests the property, and that one is killed
+with the foreign run resolving to a full `RunDetail`.
+
+**Limitations and review status:** Four contracts are deferred with deadlines,
+all recorded in D-45. There is no legal error code for a valid actor-owned run
+whose status forbids the requested action, which must be resolved before T12B
+and T18; T08's endpoint allocation avoids needing it. `RunDetail.pending_approval`
+is null and T12B owns both its population and the unspecified question of what
+it means when one turn produces several approval-required calls. A successful
+replay has no durable representation, so `RunStep.status = deduplicated` is
+structurally unreachable and ARCHITECTURE's 8:00 demo beat is not executable as
+specified until T20's prerequisite is settled. Concurrent undo eligibility is
+T18's.
+
+`duration_ms` assumes `LEASE_TTL_SECONDS` has not changed since an attempt
+acquired its lease, and clamps at zero rather than reporting a negative
+reconstruction. `detail` reads all events for a run to compute `can_undo`, using
+the same statement `undo.py` uses so display and enforcement cannot drift; on a
+polled endpoint that is more work than an aggregate would be, and it is a
+deliberate trade for agreement over efficiency at demo scale.
+
+Reviewed at checkpoint 1 together with T07, per D-35. Routing exception D-42
+granted for test authorship, scoped to T08 alone and not precedent for T09.
