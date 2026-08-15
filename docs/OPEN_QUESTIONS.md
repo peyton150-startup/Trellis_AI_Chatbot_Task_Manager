@@ -16,7 +16,10 @@ Options:   the candidate readings, if there is more than one
 
 ## Open
 
-_(none open)_
+Q-12, Q-14, Q-15, Q-16, Q-17. Each is recorded in full below, in number order,
+alongside the resolved entries rather than duplicated here. This index was stale
+while Q-12 was open and is corrected as part of recording Q-14 through Q-17.
+Q-13 was withdrawn on 2026-08-15 as false when written; the entry is kept.
 
 ---
 
@@ -488,3 +491,131 @@ Options:   A. Add an Opus-owned, read-only completed-replay preflight before
 Resolution: Pending. Option A is the narrowest design that preserves both
            security and replay semantics, but it requires Opus-owned kernel
            work and explicit authorization before T10 can continue.
+
+## Q-13  WITHDRAWN. T12A cannot start because T11 never ran
+Task:      T12A
+Blocking:  no
+Status:    WITHDRAWN on 2026-08-15. The question was false when written.
+Context:   The claim was that `backend/app/prompts.py` did not exist. T11 had in
+           fact merged as PR #23, commit `12d229f`, with its own `T11 prompts` CI
+           gate, and `origin/master` had already fast-forwarded to `cc1970f`
+           carrying it at 17:03:52, ahead of the 17:22 observation. The session
+           read local `master` at `a1c5aa7` and never fetched, so the checkout was
+           two commits behind and the file was present upstream the whole time.
+           Kept rather than deleted because the failure is worth naming: a task
+           precondition was reported from a stale local ref. One `git fetch`
+           before asserting that a file does not exist would have prevented it.
+Resolution: None required. T11 is complete and T12A's ordering precondition under
+           rule 0.3 is satisfied.
+
+## Q-17  D-12 requires three things that cannot all hold
+Task:      T10, discovered during the T12A blocked report
+Blocking:  no for the code, which D-50 fixes. Yes for the process question.
+Status:    OPEN, recorded on 2026-08-15
+Context:   D-12 states that step 0 is an immediate classify-and-raise, that
+           `policy.py` needs no change, and that "actor scope is resolved before
+           the raise, never after". The owner load was private, and
+           `policy.check` cannot serve as the pre-raise call: on a conditional
+           call with no approval row it raises the `APPROVAL_REQUIRED`
+           `PolicyError`, not the framework's `ApprovalRequired`. D-12 asserted a
+           property and supplied no mechanism for it.
+
+           D-50 resolves the code by publishing `policy.resolve_scope`, which is
+           the `policy.py` change D-12 said was unnecessary. What remains open is
+           the process failure. Rule 0.1 and section 1A both say a contradiction
+           in the specification is written here and stopped on, never resolved by
+           picking a side. T10 picked, and the resulting behavior shipped through
+           a green gate that could not see it.
+Options:   A. Amend D-12 to name the mechanism, leaving its ordering requirement
+              intact. D-50 already implements this reading.
+           B. Supersede D-12's identical-body requirement outright, so the
+              ordering obligation attaches only to tools that can defer, and
+              BUILD_SPEC section 10's "identical five-step body" is corrected to
+              match rather than carrying a two-tool exception.
+           C. Treat this as a review-process finding as well: the T10 gate was
+              authored alongside the code it tests, and the two cases that would
+              have caught the defect were the two the gate parameterized around.
+              Whether gate authorship should be separated from implementation
+              authorship is a schedule question, not a code one.
+
+## Q-14  Four of T12A's six proofs name a client that no task has built yet
+Task:      T12A
+Blocking:  yes
+Status:    OPEN, observed on 2026-08-14 against master at `a1c5aa7`
+Context:   T12A's proof list requires that assistant-ui sends the message (1),
+           that the client renders the streamed AG-UI events (3), that tool
+           completion reaches the client (4), and that the board refetches and
+           displays committed state (5). The verification adds "the board
+           reflects committed state after refetch".
+
+           No frontend exists. `git ls-files` matches zero paths under
+           `frontend/`, there is no root `package.json`, and section 3's frontend
+           tree is unbuilt. `Board.tsx` and `useBoard.ts` belong to T13 and
+           `Chat.tsx` to T14, and T12A's file list is `agent.py` and `main.py`.
+           Satisfying those four proofs literally means writing files two later
+           tasks own, which rule 0.4 forbids.
+
+           The server-side half of each proof is reachable inside the file list:
+           an HTTP client can post `RunAgentInput` and assert the SSE event
+           sequence, including `TOOL_CALL_RESULT`, and `GET /api/tasks` returns
+           committed state for the refetch. Gate A already proved the browser
+           half end to end in a real browser, which is what the disposable spike
+           existed for, and the T12A preamble says this task wires that proven
+           shape into the real agent, run record, and trust boundary.
+Options:   A. Read proofs 1, 3, 4, and 5 as server-side proofs at T12A: assert
+              what a client would receive and what a refetch would return, cite
+              Gate A for the rendering half, and let T13, T14, and T15 prove the
+              rendered half against the real components. No file-list expansion.
+           B. Expand T12A to build a minimal client. Proves the sentences
+              literally and writes T13 and T14 files early, which needs a file
+              list expansion and an explicit decision.
+
+## Q-15  Deleting `spike/` at T12A needs a branch-protection change this session cannot make
+Task:      T12A
+Blocking:  yes for the T12A pull request, no for T12A implementation
+Status:    OPEN, observed on 2026-08-14 against master at `a1c5aa7`
+Context:   Section 12's T00A block says to delete `spike/` before T12A, and 17
+           spike files are still tracked. D-13 already fixed the order and the
+           reason: `T00A spike build` is a required status check on `master` with
+           admin enforcement, so a T12A pull request that deletes the tree fails
+           its own required check, and branch protection cannot be edited from
+           inside that pull request. The required check must come off master
+           first, and only then may the pull request delete the CI job and the
+           tree.
+           Removing a required status check is a repository administration
+           action against the shared default branch. It is not implementation,
+           and this session does not take it unilaterally.
+Options:   A. The user removes `T00A spike build` from master's required checks,
+              preserving strict up-to-date checks, admin enforcement,
+              conversation resolution, and every other required context. The
+              T12A pull request then deletes the job and the tree, per D-13.
+           B. `spike/` survives T12A and a later task deletes it. Contradicts
+              section 12 and leaves disposable code alongside the production
+              integration through R2.
+
+## Q-16  The T12A verification needs a runtime model and a database that this environment does not have
+Task:      T12A
+Blocking:  yes for verification, no for implementation
+Status:    OPEN, observed on 2026-08-14
+Context:   The prescribed verification runs the prompt `Create a task called Test
+           AG-UI` and asserts exactly one committed `create_task` mutation. That
+           requires a live model call and a live database.
+           Neither is present. There is no `.env`; `MODEL_ID`,
+           `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `DATABASE_URL` are all unset
+           in the session environment, and `docker ps` lists no running
+           PostgreSQL container. `config.py` also declares `anthropic_api_key`
+           and no OpenAI field, though section 1 supports either provider and
+           Pydantic AI reads the credential from the environment itself, so that
+           asymmetry does not by itself block an OpenAI `MODEL_ID`.
+           Gate A is not a substitute. The T00A spike ran against a `FunctionModel`
+           and never called a provider, so no live model call has been made in
+           this repository at any point.
+Options:   A. Provide `MODEL_ID` and the matching key in a local `.env`, start the
+              Compose database, and run the verification against the real
+              provider. This is the proof the task asks for.
+           B. Verify the transport deterministically against a `FunctionModel`
+              that emits the `create_task` call, and run the live provider check
+              separately. Makes T12A reproducible in CI, and it proves the wiring
+              rather than the model's behavior, which the eval suite owns.
+           C. Both: a deterministic gate for CI and one recorded live run as the
+              observed evidence.

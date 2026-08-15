@@ -6,6 +6,23 @@ one order: canonical payload, argument hash, actor-bound completed-replay
 preflight, D-12 classification, authoritative policy check, lease acquisition,
 one transaction, and return.
 
+D-50 inserts one step between the replay preflight and D-12 classification, and
+only in the two tools whose classification can actually require approval:
+`bulk_update_tasks`, which is conditional on the blast radius, and
+`delete_tasks`, which is destructive at any count. Those two resolve actor scope
+before the raise, because D-12 requires scope to be resolved before the raise
+and every other tool's classification is inert, returning `required=False` at a
+count of zero or one. The other four are unchanged, so the identical-body rule
+in BUILD_SPEC section 10 now has a named two-tool exception rather than a silent
+one. Adding the step to a tool that cannot defer would buy a second database
+read and no property, and it still could not run ahead of the framework's
+declarative gate on `delete_tasks`, which fires before the body at all.
+
+The step sits after the replay preflight, not before it. Q-12 exists because a
+committed delete removes its own targets, so a scope load ahead of replay would
+raise `OUT_OF_SCOPE` on a byte-identical repeat and make the stored result
+unreachable, which is the defect Q-12 reproduced.
+
 The completed-replay preflight sits ahead of both policy and D-12 step 0. It is
 read only and resolves run ownership before reading a lease. That makes a
 committed result reachable after its target rows disappear while still ensuring
@@ -426,6 +443,27 @@ def bulk_update_tasks(
     if replayed is not None:
         return replayed
 
+    # 1b. D-50. Scope resolves before the raise, never after. Without this a
+    #     call carrying four foreign or nonexistent ids classifies as over the
+    #     blast radius and defers, so the caller receives ApprovalRequired where
+    #     the contract requires OUT_OF_SCOPE, and the question of another actor's
+    #     rows travels on to the component that builds the approval preview. The
+    #     race recheck mirrors step 2: a preflight that lost to a committing
+    #     caller sees a missing target, and a committed result still replays.
+    try:
+        policy.resolve_scope(ctx.actor_id, target_ids)
+    except OutOfScopeError:
+        replayed = idempotency.replay_completed(
+            ctx.run_id,
+            ctx.tool_call_id,
+            tool_name,
+            args_hash,
+            actor_id=ctx.actor_id,
+        )
+        if replayed is not None:
+            return replayed
+        raise
+
     # 0. This is the conditional framework gate established by D-12. Hashing
     #    and completed replay are read only; lease acquisition remains after it.
     requirement = policy.classify(tool_name, payload, blast_radius_count)
@@ -502,6 +540,26 @@ def delete_tasks(
     )
     if replayed is not None:
         return replayed
+
+    # 1b. D-50, same ordering as bulk_update_tasks and for the same reason. This
+    #     tool is classified destructive at any count, so on the direct-call
+    #     surface that section 12 requires, an unapproved call naming another
+    #     actor's task reached the raise before any scope load. The framework
+    #     route gates before the body and never showed it; the T10 gate passed
+    #     approved=True for this tool and never showed it either.
+    try:
+        policy.resolve_scope(ctx.actor_id, target_ids)
+    except OutOfScopeError:
+        replayed = idempotency.replay_completed(
+            ctx.run_id,
+            ctx.tool_call_id,
+            tool_name,
+            args_hash,
+            actor_id=ctx.actor_id,
+        )
+        if replayed is not None:
+            return replayed
+        raise
 
     # 0. The framework normally gates this tool before the body runs. Keeping
     #    the same guard here makes direct invocation fail closed too.

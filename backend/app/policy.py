@@ -60,6 +60,33 @@ def classify(
     return ApprovalRequirement(required=required, reason=reason)
 
 
+def resolve_scope(actor_id: UUID, target_task_ids: list[UUID]) -> None:
+    """Step 1 of `check`, exposed so a tool body can run it on its own.
+
+    D-12's closing paragraph requires actor scope to be resolved before the
+    conditional `ApprovalRequired` raise, never after, and then supplies no
+    mechanism for doing so: it prints an immediate classify-and-raise, keeps the
+    owner load private, and states that `policy.py` needs no change. Those three
+    cannot all hold. D-50 resolves the contradiction by publishing the scope
+    check rather than by weakening the ordering requirement.
+
+    This is a function rather than a copy of the loop inside `check` because two
+    spellings of the scope rule would drift, and the rule is the one place where
+    a divergence is an authorization bug rather than an inconsistency. `check`
+    calls it too, so there is exactly one definition.
+
+    Raising here does not make `check`'s own step 1 redundant. `check` remains
+    the authoritative gate and runs on every path including the approved
+    continuation, where scope may have moved since the pre-raise call. See D-06.
+    """
+    owners = _load_task_owners(target_task_ids)
+    for task_id in target_task_ids:
+        if owners.get(task_id) != actor_id:
+            # A missing row and another actor's row both land here and produce
+            # the identical error. Do not distinguish them.
+            raise OutOfScopeError()
+
+
 def check(
     actor_id: UUID,
     tool_name: str,
@@ -80,12 +107,7 @@ def check(
     must not be optimized away.
     """
     # 1. SCOPE
-    owners = _load_task_owners(target_task_ids)
-    for task_id in target_task_ids:
-        if owners.get(task_id) != actor_id:
-            # A missing row and another actor's row both land here and produce
-            # the identical error. Do not distinguish them.
-            raise OutOfScopeError()
+    resolve_scope(actor_id, target_task_ids)
 
     # 2. CLASSIFY
     destructive = tool_name in DESTRUCTIVE_TOOLS

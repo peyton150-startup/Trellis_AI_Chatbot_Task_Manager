@@ -897,3 +897,63 @@ configuration value becomes the renderer's `trust` argument. T17 owns later
 behavioral proof of clarification, and T23 owns the end-to-end injection demo.
 No standalone review is allocated. D-35 and D-47 place T11 inspection in the
 immutable same-SHA R2 checkpoint after T12B.
+
+## T10 correction: scope resolves before the conditional approval raise
+
+**Local role:** `policy.resolve_scope` becomes the one public spelling of the
+actor-scope rule and remains step 1 of `policy.check`. `bulk_update_tasks` and
+`delete_tasks` call it between the replay preflight and D-12's step 0, so a call
+naming rows the actor does not own is refused with `OUT_OF_SCOPE` instead of
+being classified and deferred with its target ownership still unknown.
+
+**Whole-system role:** D-12 requires scope to be resolved before the raise
+precisely so the question of another actor's rows never travels on to the
+component that builds an approval preview. Without this, every mutating call that
+crosses the blast radius, and every unapproved direct `delete_tasks`, handed that
+question forward. It also restores the direct-call surface BUILD_SPEC section 12
+makes T10's definition of done: each tool callable directly, failing closed.
+
+**Inputs and dependencies:** D-12's ordering requirement and the mechanism it
+omitted, resolved as D-50. D-17's `SELECT_TASK_OWNERS` and the empty-target skip.
+Q-12's replay preflight, which is why the new step sits after it rather than
+before. D-06, which keeps `check`'s own scope step on every path.
+
+**Outputs and consumers:** `policy.resolve_scope(actor_id, target_task_ids)`.
+T12B consumes the same function before generating a preview or writing an
+approval row, which is the boundary BUILD_SPEC's T12B section already mandates.
+
+**Verification:** `docker compose up -d`, then the T10 gate extracted from
+`.github/workflows/ci.yml`, `cd backend && ruff check .`, and
+`cd backend && pytest -m "not network"`. All three pass: gate exit 0, ruff "All
+checks passed", 39 passed and 13 deselected.
+
+Mutation evidence, per D-21. Each new case was run against `tools.py` at
+`cc1970f` and then against the fix. Seven of eight flip, which is what proves the
+cases test the fix rather than passing for another reason:
+
+```text
+case                                  at cc1970f                 with D-50
+pre-raise bulk_update_tasks foreign   FAIL ApprovalRequired       PASS OUT_OF_SCOPE, no lease
+pre-raise bulk_update_tasks missing   FAIL ApprovalRequired       PASS OUT_OF_SCOPE, no lease
+pre-raise bulk_update_tasks mixed     FAIL ApprovalRequired       PASS OUT_OF_SCOPE, no lease
+pre-raise delete_tasks foreign        FAIL ApprovalRequired       PASS OUT_OF_SCOPE, no lease
+pre-raise delete_tasks missing        FAIL ApprovalRequired       PASS OUT_OF_SCOPE, no lease
+pre-raise delete_tasks mixed          FAIL ApprovalRequired       PASS OUT_OF_SCOPE, no lease
+unapproved foreign delete             FAIL ApprovalRequired       PASS OUT_OF_SCOPE, no lease
+continuation rechecks scope           PASS                        PASS
+```
+
+The eighth passes both ways and is labeled honestly: it is a D-06 regression
+guard, not evidence for this fix. It defers an owned two-target delete, approves
+it, transfers one target's owner, and asserts the continuation refuses and
+deletes nothing, which distinguishes a real continuation-time `policy.check` from
+a path that cached the pre-raise result.
+
+**Limitations and review status:** Three things are deliberately not settled
+here. D-31's payment for the merged T10 kernel expansion is unnamed and Q-12
+remains unratified. Q-17 records that D-12's three requirements were mutually
+unsatisfiable and that the contradiction should have stopped T10 under rule 0.1.
+The identical-body rule in BUILD_SPEC section 10 now carries a recorded two-tool
+exception that Q-17 option B may prefer to supersede instead. This correction
+changes `tools.py`, so under D-47 any R2 result covering T10 would be stale; no
+R2 result exists yet, which is why doing it now is the cheapest point.
