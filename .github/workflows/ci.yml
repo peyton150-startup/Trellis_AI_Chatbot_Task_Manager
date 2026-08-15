@@ -2660,6 +2660,7 @@ jobs:
           from uuid import UUID, uuid4
 
           from psycopg.types.json import Json
+          from pydantic_ai.exceptions import ApprovalRequired
 
           from app import domain, idempotency, policy, runs, sql, tools
           from app.config import settings
@@ -3121,6 +3122,132 @@ jobs:
               require(read_lease(run.id, call_id) is None, f"{tool_name} scope refusal took a lease")
 
 
+          def owned_ids():
+              return sorted(str(row["id"]) for row in read_tasks())
+
+
+          def surviving_ids(target_ids):
+              present = {str(row["id"]) for row in read_tasks()}
+              present |= {str(row["id"]) for row in read_tasks(OTHER)}
+              return sorted(str(target) for target in target_ids if str(target) in present)
+
+
+          def scope_targets(tool_name, kind, label):
+              if kind == "foreign":
+                  return [create_task(OTHER, f"{label} foreign {i}").id for i in range(4)]
+              if kind == "missing":
+                  return [uuid4() for _ in range(4)]
+              owned = [create_task(ACTOR, f"{label} owned {i}").id for i in range(3)]
+              return owned + [create_task(OTHER, f"{label} mixed foreign").id]
+
+
+          def verify_scope_precedes_raise(tool_name, kind):
+              """D-50. Scope resolves before the conditional ApprovalRequired raise.
+
+              Before D-50 each of these returned ApprovalRequired instead: four ids
+              cross the blast radius and delete_tasks is destructive at any count, so
+              classification required approval and the raise happened while the scope
+              of the targets was still unknown. The mixed case is the one a fix that
+              short-circuits on "every target is foreign" would still pass.
+              """
+              reset()
+              label = f"{tool_name} {kind}"
+              run = runs.create(ACTOR, f"T10 {label} pre-raise", "t10-gate")
+              call_id = f"{tool_name}-{kind}-preraise"
+              targets = scope_targets(tool_name, kind, label)
+              owned_before = owned_ids()
+              if tool_name == "bulk_update_tasks":
+                  arguments = BulkUpdateTasksArgs(task_ids=targets, notes="scope preraise")
+              else:
+                  arguments = DeleteTasksArgs(task_ids=targets)
+              expect_raises(
+                  OutOfScopeError,
+                  lambda: invoke(tool_name, run.id, call_id, arguments, approved=False),
+                  f"{tool_name} {kind} over threshold did not refuse before the raise",
+              )
+              require(
+                  read_lease(run.id, call_id) is None,
+                  f"{tool_name} {kind} pre-raise refusal took a lease",
+              )
+              require(
+                  owned_ids() == owned_before,
+                  f"{tool_name} {kind} pre-raise refusal mutated owned state",
+              )
+
+
+          def verify_unapproved_foreign_delete_refuses():
+              """D-50. The single-target destructive case the old gate could not see.
+
+              verify_owned_scope_refusal passes approved=True for delete_tasks, which
+              skips step 0 entirely, so the OutOfScopeError it observed came from
+              policy.check and proved nothing about the unapproved direct call that
+              BUILD_SPEC section 12 requires to work.
+              """
+              reset()
+              run = runs.create(ACTOR, "T10 delete unapproved foreign", "t10-gate")
+              call_id = "delete_tasks-unapproved-foreign"
+              foreign = create_task(OTHER, "delete unapproved foreign target")
+              expect_raises(
+                  OutOfScopeError,
+                  lambda: invoke(
+                      "delete_tasks",
+                      run.id,
+                      call_id,
+                      DeleteTasksArgs(task_ids=[foreign.id]),
+                      approved=False,
+                  ),
+                  "unapproved delete_tasks raised before checking scope",
+              )
+              require(
+                  read_lease(run.id, call_id) is None,
+                  "unapproved foreign delete took a lease",
+              )
+
+
+          def verify_continuation_rechecks_scope():
+              """D-06. The approved continuation re-resolves scope, it does not cache it.
+
+              Approving a call whose targets never moved cannot distinguish a real
+              continuation-time policy.check from a path that kept the pre-raise
+              result. So ownership is changed underneath the approval between the
+              deferral and the continuation, and the continuation must still refuse.
+              """
+              reset()
+              run = runs.create(ACTOR, "T10 continuation recheck", "t10-gate")
+              call_id = "delete_tasks-continuation-recheck"
+              targets = [create_task(ACTOR, f"continuation owned {i}").id for i in range(2)]
+              arguments = DeleteTasksArgs(task_ids=targets)
+              payload = {"task_ids": [str(target) for target in targets]}
+
+              expect_raises(
+                  ApprovalRequired,
+                  lambda: invoke("delete_tasks", run.id, call_id, arguments, approved=False),
+                  "owned unapproved delete did not defer",
+              )
+              approve_delete(run.id, call_id, payload)
+              with pool.connection() as conn:
+                  conn.execute(
+                      "UPDATE tasks SET owner_id = %(owner)s WHERE id = %(id)s",
+                      {"owner": OTHER, "id": targets[0]},
+                  )
+                  conn.commit()
+
+              survivors_before = surviving_ids(targets)
+              expect_raises(
+                  OutOfScopeError,
+                  lambda: invoke("delete_tasks", run.id, call_id, arguments, approved=True),
+                  "continuation deleted a target that changed owner after approval",
+              )
+              require(
+                  read_lease(run.id, call_id) is None,
+                  "refused continuation took a lease",
+              )
+              require(
+                  surviving_ids(targets) == survivors_before,
+                  "refused continuation deleted the remaining targets",
+              )
+
+
           for name in TOOL_NAMES:
               verify_run_refusal(name, missing=False)
               verify_run_refusal(name, missing=True)
@@ -3133,6 +3260,15 @@ jobs:
 
           for name in ("create_task", "update_task", "bulk_update_tasks", "delete_tasks"):
               verify_owned_scope_refusal(name)
+
+          # D-50. Only these two tools can classify as requiring approval, so only
+          # these two could reach the raise with the scope of their targets unknown.
+          for name in ("bulk_update_tasks", "delete_tasks"):
+              for scope_kind in ("foreign", "missing", "mixed"):
+                  verify_scope_precedes_raise(name, scope_kind)
+
+          verify_unapproved_foreign_delete_refuses()
+          verify_continuation_rechecks_scope()
 
           # Scope checks include blocked_by, while the conditional approval count
           # includes only rows the operation updates. Three targets plus a blocker
@@ -3168,7 +3304,10 @@ jobs:
               "canonicalize and complete first calls, replay completed calls without "
               "writes, pass pending and failed rows to acquire, reject tool and hash "
               "mismatches, take no lease on refusal, and separate scope targets from "
-              "the three-row blast radius"
+              "the three-row blast radius; and under D-50 the two tools that can "
+              "require approval resolve actor scope before the raise, for foreign, "
+              "missing, and mixed targets and for an unapproved single-target delete, "
+              "while an approved continuation still re-resolves scope"
           )
           PY
 

@@ -1738,3 +1738,71 @@ force: this review occurs inside R2, against R2's immutable same SHA, and focuse
 on `create_task` as the reference plus the shared transaction shape. This
 decision adds no intermediate review checkpoint. A T10 change after review
 invalidates the R2 result under D-47.
+
+## Ordering correction recorded on 2026-08-15
+
+### D-50: scope resolves before the conditional approval raise, and D-12 gains the mechanism it never had
+
+Recorded after a blind review of merged T10 found that `bulk_update_tasks` and
+`delete_tasks` classify and raise `ApprovalRequired` before any actor-scope load.
+
+**The defect, reproduced.** Against `cc1970f`, a direct call carrying four
+foreign, four nonexistent, or three owned plus one foreign task ids raised
+`ApprovalRequired` where the contract requires `OUT_OF_SCOPE`. The same held for
+an unapproved single-target `delete_tasks` naming another actor's row, because
+that tool classifies destructive at any count. Seven cases, all failing with the
+identical symptom. The evidence table is in `IMPLEMENTATION_NOTES.md`.
+
+**Why no gate saw it.** `verify_owned_scope_refusal` exercised one foreign target
+below the threshold, which cannot reach the raise for `bulk_update_tasks`, and it
+passed `approved=tool_name == "delete_tasks"`, which skips step 0 entirely, so
+the `OutOfScopeError` it observed came from `policy.check` and proved nothing
+about the unapproved direct call BUILD_SPEC section 12 requires to work.
+
+**D-12 is the root cause, not T10 alone.** D-12 requires three things that cannot
+all hold: an immediate classify-and-raise as step 0, that `policy.py` needs no
+change, and that "actor scope is resolved before the raise, never after." The
+owner load is private and `policy.check` cannot serve as the pre-raise call,
+because on a conditional call with no approval row it raises the
+`APPROVAL_REQUIRED` `PolicyError` rather than the framework's `ApprovalRequired`.
+D-12 asserted a property and supplied no mechanism. Under rule 0.1 that
+contradiction should have been written to `docs/OPEN_QUESTIONS.md` and stopped
+on. It was not, which is the process finding; see Q-17.
+
+**The resolution.** `policy.resolve_scope(actor_id, target_task_ids)` becomes
+public and is step 1 of `check`, so there is one definition of the scope rule
+rather than two spellings that can drift. The two tools whose classification can
+require approval call it between the replay preflight and step 0.
+
+The step sits after the replay preflight, not before it. Q-12 exists because a
+committed delete removes its own targets, so a scope load ahead of replay would
+raise `OUT_OF_SCOPE` on a byte-identical repeat and make the stored result
+unreachable. The refusal path carries the same race recheck step 2 already uses.
+
+**Uniformity is now a named exception.** The other four tools are unchanged.
+Their classification is inert at a count of zero or one, so they cannot reach the
+raise with scope unknown, and adding the step would buy a second database read
+and no property. BUILD_SPEC section 10's identical-body rule therefore has a
+recorded two-tool exception rather than a silent one.
+
+**What this does not claim.** No disclosure occurred and none was prevented. The
+AG-UI interrupt message is built from the model's proposed arguments, not from a
+database lookup, so owned, foreign, and nonexistent ids produce byte-identical
+output and it conveys no ownership or existence fact. Nothing in the application
+writes an approval row or moves a run to `awaiting_approval` today:
+`runs.set_status` has no callers and T12B owns both. The confirmed consequence is
+a wrong control outcome on the direct-call surface, changing no state and taking
+no lease. T12B's preview guard remains indispensable and is not weakened by this
+change, because declaratively gated `delete_tasks` never enters its body before
+the framework defers.
+
+**`check` still runs its own scope step on every path.** D-06 is unaffected. The
+pre-raise call cannot substitute, because ownership can move between the
+deferral and the approved continuation. The gate proves that adversarially by
+transferring a target's owner after approval and asserting the continuation
+refuses and deletes nothing.
+
+**D-31 payment is not settled here.** This decision records the ordering fix and
+its evidence. It does not name a schedule cut, and the merged T10 kernel
+expansion under Q-12 remains unratified. Both are the user's to settle before
+T12B and R2.
