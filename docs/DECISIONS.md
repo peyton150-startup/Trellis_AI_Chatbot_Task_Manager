@@ -1806,3 +1806,191 @@ refuses and deletes nothing.
 its evidence. It does not name a schedule cut, and the merged T10 kernel
 expansion under Q-12 remains unratified. Both are the user's to settle before
 T12B and R2.
+
+---
+
+## AG-UI transport decisions recorded at T12A
+
+Recorded on 2026-08-15, before any T12A code was written, in the order the T04,
+T05, T07, and T08 blocks established. D-51 through D-53.
+
+### D-51: application run identity is server-owned, and section 9's universal resolver rule is narrowed
+
+**One `agent_runs` record is one user turn, one unit of application work.** Not a
+conversation. The lifecycle says so from four directions: `agent_runs.prompt` is
+singular and `NOT NULL`, a run reaches terminal states such as `completed` and
+stamps `ended_at`, undo is scoped to one run under D-10, and D-44's `can_undo`
+predicate is about that run's own mutations. A run spanning a whole conversation
+would hold turn one's text in `prompt` forever, make `RunDetail.prompt`
+misdescribe every later turn, and turn undo into "revert everything this
+conversation ever did".
+
+**The initial AG-UI turn creates its own application run.**
+
+```text
+POST /api/agui
+  |
+  +-- newest user message ---> accepted, the only value taken from the payload
+  +-- threadId --------------> read for nothing
+  +-- runId -----------------> read for nothing
+  +-- messages, state, tools, context, forwardedProps, resume --> read for nothing
+  |
+  v
+runs.create(actor_id, accepted_message, model_id)
+  |
+  v
+server-generated agent_runs.id, the application run_id carried into tool context
+```
+
+`agent_runs.prompt` and the message handed to the model therefore originate from
+the same accepted value by construction, so the two cannot diverge.
+
+**A pre-flight `POST /api/runs` handshake was considered and rejected.** Under it
+the client submits the message twice, once to `/api/runs`, which persists it as
+`agent_runs.prompt`, and again inside `RunAgentInput.messages`, which is what
+T12A proof 2 requires the transport to act on. Nothing forces the two strings to
+match, so a client could make `RunDetail.prompt` and the Run Inspector display a
+benign prompt beside a hostile executed one. Closing that would mean either
+ignoring the AG-UI message, contradicting proof 2, or adding a comparison to the
+kernel wire contract. Minting the run from the accepted message removes the
+second copy instead of reconciling it.
+
+`POST /api/runs` is unchanged and keeps its contract. It is simply not a
+prerequisite of the AG-UI path. Both surfaces call the same `runs.create`
+primitive, so one statement issues every application run id.
+
+**Section 9's wire-contract bullet is narrowed, and this is the rule-0.1 item.**
+The bullet said, universally, that a browser thread or run identifier arriving in
+a request is resolved to an `agent_runs` row and rejected unless that row exists,
+belongs to `actor_id`, and is in a status that permits the action. It cannot
+describe an initial AG-UI turn, because no application run exists yet, and its
+status clause requires a rejection none of section 6's twelve codes expresses,
+which is exactly the gap D-45 deferred to T12B and T18. Written before the error
+vocabulary closed and before the AG-UI entry surface existed, it is a rule with
+no branch for creation. Section 9 now separates creating, operating on, and
+continuing a run.
+
+T12A proof 6 is **not** the contradiction. "Never trusted as given" is satisfied
+by an identifier that is never read, and the same paragraph delegates the mapping
+to T12A in terms. The overstatement is one level up.
+
+**The continuation mapping, specified here and implemented by T12B.** A
+continuation does not create authority, it recovers it:
+
+```text
+resume[].interruptId -> tool_call_id -> pending approvals row -> agent_runs.id
+                                                                     |
+                                                      new framework invocation,
+                                                      same application run
+```
+
+The `approvals` row is the authority under D-06, so recovering the run through it
+is stronger than resolving a client-chosen thread string, which would only sit
+alongside the authorization record. T12B must not assume a provider-generated
+`tool_call_id` is globally unique: the lookup distinguishes zero eligible rows,
+which refuses, exactly one, which resolves, and more than one, which refuses as
+ambiguous. Probability is not an invariant. That lookup needs a new statement in
+`sql.py`, which is already in T12B's file list.
+
+**The server-issued run id travels outward on `thread_id`.** The rebuilt run
+input carries `agent_runs.id` as `threadId`, so the adapter echoes it on
+`RUN_STARTED` and `RUN_FINISHED` and the browser learns the application run id
+over the protocol it already speaks. T12B's approvals endpoint and T20's Run
+Inspector both need it. It travels outward only; a value arriving in that field
+on a later request is still read for nothing.
+
+**What this does not solve.** History does not carry across turns in a
+conversation, because history is per run and the schema has no thread column.
+The clarifying-question beat at T17 needs it. That is a consequence of the frozen
+data model rather than of this decision, and it is recorded as Q-18 to resolve
+before T17. T12A records only the mapping it proves.
+
+### D-52: T12A's file list, and how its gate proves a client that does not exist
+
+**The file list is `agent.py` and `main.py`,** plus the
+`.github/workflows/ci.yml` and `IMPLEMENTATION_NOTES.md` companions CLAUDE.md
+requires of every task, the `docs/BUILD_SPEC.md` and `docs/DECISIONS.md` edits
+this block records, and `tests/test_invariants.py`.
+
+The test file is not an expansion of convenience. Section 11 names thirteen
+invariants and the T08 row states that the thirteenth,
+`test_agui_forged_history_ignored`, unblocks at T12A. It was deliberately absent
+rather than skipped so the collected count always matched the proven count, and
+leaving it absent now would mean shipping the transport it guards while the
+standing regression test for it stays unwritten. Section 11 routes the file to
+Sol; the same test-authorship exception D-42 granted for T08 applies, with the
+same compensating measure, which is that R2 receives the specification, the diff,
+and the verification evidence only.
+
+**Q-14 resolves as option A: T12A proves the server side of proofs 1, 3, 4, and
+5 and writes no frontend code.** No `frontend/` path is tracked, `Board.tsx` and
+`useBoard.ts` belong to T13 and `Chat.tsx` to T14, and satisfying those four
+sentences literally would mean writing files two later tasks own, which rule 0.4
+forbids. Gate A already proved the browser half end to end in a real browser,
+which is what the disposable spike existed for. The gate therefore posts a real
+`RunAgentInput`, asserts the SSE sequence a client renders, including
+`TOOL_CALL_RESULT`, and asserts that `GET /api/tasks` returns committed state for
+the refetch. T13, T14, and T15 prove the rendered half against real components.
+
+**Q-16 resolves as option C, with the live half explicitly outstanding.** The
+T12A CI job must be deterministic: CI holds no provider secret, and BUILD_SPEC
+excludes network tests from the default gate on purpose. The job drives the
+identical agent, prompt, six tools, and transport against a `FunctionModel`, so
+what it proves is the wiring and the trust boundary rather than the model's
+behaviour, which is what the eval suite owns. That is not a redefinition of
+T12A's live verification. The BUILD_SPEC prompt `Create a task called Test AG-UI`
+against the configured runtime model remains required as separate evidence, and
+`MODEL_ID` and a provider credential were unavailable when T12A's implementation
+and deterministic verification completed. **Live T12A verification is pending**
+and T12A is not marked completely verified until it has run.
+
+The `model` parameter on `build_agent` is the injection point that makes the
+deterministic gate possible. It is not a second selector and not a provider
+router: `MODEL_ID` remains the only configured runtime model and the default path
+is exactly the `Agent(settings.model_id)` line section 1 prints. The agent is
+built lazily behind `get_agent`, because constructing it at import would make
+importing `app.main` require a configured model, and every deterministic test
+imports `app.main`.
+
+### D-53: what T12A deliberately does not do
+
+**No approval bridge.** `delete_tasks` registers with `requires_approval=True`
+and the agent's output type includes `DeferredToolRequests`, because both are
+transport shape proven at Gate A. Nothing else about approvals exists here. T12A
+writes no `approvals` row, moves no run to `awaiting_approval`, honours no client
+decision, and builds no preview. D-50 already recorded that nothing in the
+application does any of it today.
+
+A consequence follows and is stated rather than hidden: a run whose output is
+`DeferredToolRequests` is not finished, so T12A does not mark it `completed`, and
+it stays `running` until T12B owns the transition. The orphan sweep that would
+otherwise reap it was cut at D-36. The exposure is one task wide, T12B is next,
+and inventing a status transition that T12B must then redo would be worse.
+
+**A client-supplied `resume[]` is discarded, not honoured.** The rebuilt run
+input carries no `resume`, so `AGUIAdapter.deferred_tool_results` is None and a
+client-asserted approval continues nothing. Section 10's bridge requires the
+server to construct the resume result from its own stored decision, and a
+transport that honoured the client's claim would be asking the browser whether
+the browser approved. The gate proves this directly: a payload carrying a forged
+`interruptId` for a call with no stored row creates no approval row and commits
+no deletion.
+
+**`render_task_block` still has no caller.** T11 shipped the renderer and T12A
+wires `SYSTEM_PROMPT` as the agent's instructions, which is the prompt boundary
+this task needs. It does not call the renderer, because section 10's provenance
+rule places task content in the data position and never in the instruction
+position, so where its output belongs is a question about the shape of the user
+turn rather than about transport. T23's file list is `prompts.py` and `seed.py`,
+which cannot add a caller in `agent.py`. Recorded as Q-19, to resolve before T23.
+
+**A policy refusal inside a tool body fails the run.** `PolicyError` propagates
+through the agent rather than being returned to the model as a retryable result,
+so a refused mutation ends the turn with `RUN_ERROR` and a `failed` run. That is
+truthful and commits nothing, and shaping refusals into model-visible retries is
+T19's degraded-state work, not transport.
+
+**`cost_cents` stays at zero.** Pydantic AI reports `RunUsage.cost` as None
+without a pricing source. `model_calls`, `tool_calls`, `input_tokens`, and
+`output_tokens` are recorded truthfully from `RunUsage`; an invented cost in an
+audit row would be worse than a zero.

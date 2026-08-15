@@ -957,3 +957,185 @@ The identical-body rule in BUILD_SPEC section 10 now carries a recorded two-tool
 exception that Q-17 option B may prefer to supersede instead. This correction
 changes `tools.py`, so under D-47 any R2 result covering T10 would be stale; no
 R2 result exists yet, which is why doing it now is the cheapest point.
+
+## T12A: Integrate the proven AG-UI transport
+
+**Local role:** `backend/app/agent.py` owns two things: the real Pydantic AI
+agent, built from `MODEL_ID` with the T11 system prompt and the six T10 tools
+registered against it, and the production AG-UI transport behind
+`POST /api/agui`. `backend/app/main.py` gains the route and nothing else. The
+transport parses an AG-UI `RunAgentInput`, takes the newest user message and
+only that, opens a server-owned `agent_runs` row from it, loads canonical
+history through `runs.load_history`, streams AG-UI events, and records history,
+usage, and terminal status server-side when the run ends.
+
+The whole trust boundary is one function. `_accepted_run_input` builds a fresh
+`RunAgentInput` carrying exactly one value taken from the client, the accepted
+user message. `messages`, `tools`, `state`, `context`, `forwardedProps`,
+`resume`, `threadId`, and `runId` are all server-chosen or empty on the rebuilt
+input. That shape was chosen over filtering after the adapter because
+`UIAdapter.run_stream_native` appends whatever the adapter's `messages` property
+yields to any caller-supplied `message_history`, so a filter placed downstream of
+the adapter would not be a filter at all.
+
+**Whole-system role:** This is the seam the entire demo runs through, and the
+task where the trust boundary either holds or quietly stops existing. Gate A
+proved on Day 1 that the transport and interrupt shapes work; T12A is where that
+shape meets real Postgres state, real authorization, and a real audit record.
+Every later task consumes it: T13 and T14 render against this event stream, T12B
+adds the approval bridge on top of this run record, T16 renders the approval card
+the bridge produces, and T20's Run Inspector reads the run rows this route
+creates.
+
+It also closes the risk BUILD_SPEC calls out by name. An AG-UI client sends its
+whole transcript on every request, so the most likely way this build loses its
+central claim is not an attack but a later refactor that lets that transcript
+become history. The thirteenth invariant is now a standing regression test
+against exactly that, and the six mutations below show the gate catches it.
+
+**Inputs and dependencies:**
+
+- T10's six tool bodies in `tools.py`, consumed unchanged. `agent.py` makes no
+  policy, idempotency, or domain decision; each registered tool translates
+  `RunContext` into `ToolContext` and calls the T10 body. D-50's scope-before-
+  raise ordering and the replay preflight are untouched.
+- T11's `SYSTEM_PROMPT`, wired as the agent's instructions.
+- T08's `runs.create`, `runs.load_history`, `runs.save_history`,
+  `runs.set_status`, and `runs.record_usage`. The AG-UI path adds no second
+  run-creation or history path; `POST /api/runs` and `POST /api/agui` call the
+  same primitive.
+- T00 API facts 1, 2, and 3, and the Gate A record in `docs/DECISIONS.md`: the
+  `requires_approval=True` parameter name, `ModelMessagesTypeAdapter` for history
+  serialization, and the recorded `RunAgentInput` and interrupt shapes.
+- Pydantic AI 2.27.0 and `ag-ui-protocol` 0.1.19, the versions every recorded API
+  fact was confirmed against.
+
+**Outputs and consumers:**
+
+- `POST /api/agui`, the section 9 row that was the spec's single TBD. It is now
+  established rather than pending.
+- D-51's run identity mapping, which T12B builds its continuation on.
+- `agent.build_agent(model=None)` and `agent.get_agent()`, the construction and
+  accessor T12B, T19, and T22 all extend.
+- `agent.TrellisDeps`, the dependency record every tool call carries.
+- The server-issued `agent_runs.id` echoed outward as `threadId` on `RUN_STARTED`
+  and `RUN_FINISHED`, which is how the browser learns the run id it needs for
+  T12B's approvals endpoint and T20's Inspector.
+- The thirteenth invariant, `test_agui_forged_history_ignored`, which section 11
+  reserved and the T08 row said would unblock here.
+
+**Verification:**
+
+Deterministic, against Compose PostgreSQL 16, with a `FunctionModel` standing in
+for the runtime model per D-52. Local runs on 2026-08-15:
+
+```text
+cd backend && ruff check .                      All checks passed
+cd backend && pytest -m "not network"           40 passed, 13 deselected
+cd backend && pytest tests/test_invariants.py   13 passed
+T12A gate, extracted verbatim from ci.yml       PASS
+```
+
+The gate posts a real `RunAgentInput` carrying a forged transcript and proves the
+six requirements in order, plus three more the proof list implies:
+
+| # | Proof | Evidence |
+|---|---|---|
+| 1 | One user message reaches the backend | `POST /api/agui` returns 200 and the run executes |
+| 2 | Everything else in the payload is discarded | The agent is given exactly one message; no `ModelResponse`, no `ToolCallPart`, no `ToolReturnPart`, and neither the forged call id, the forged target id, nor the prior client message appear in what it was given |
+| 3 | The client can render the stream | `RUN_STARTED`, `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END`, `TEXT_MESSAGE_CONTENT`, `RUN_FINISHED` |
+| 4 | Tool completion reaches the client | `TOOL_CALL_RESULT` carries the committed task |
+| 5 | The board is committed state after refetch | `GET /api/tasks` returns exactly `Test AG-UI`; one completed `create_task` invocation and exactly one `created` task_event, so no duplicate mutation |
+| 6 | Run identity is server-owned | One `agent_runs` row, `prompt` equal to the accepted message, owned by `ACTOR_ID`, status `completed`, id equal to neither client identifier, echoed outward on `RUN_STARTED` |
+| + | A forged `resume[]` continues nothing | Zero `approvals` rows and zero `deleted` events |
+| + | A payload with no user message opens no run | 422 with `VALIDATION_ERROR`, zero `agent_runs` rows |
+| + | Canonical history is the server's | `agent_runs.message_history` contains no forged call and no forged user message |
+
+Per D-21, the gate was mutation tested. Six single-line edits to `agent.py`, each
+run against the gate extracted from `ci.yml`, each reverted, with `agent.py`
+restored to sha256 `de2380db59c46198d9662d4344e550c9b4386274e3f1aba05f4bdd05c8d50500`,
+identical to its pre-mutation digest, and the gate green again afterwards:
+
+| Mutation | Result | First failing assertion |
+|---|---|---|
+| M1 the adapter reads the client payload instead of the rebuilt one | KILLED | the agent was given exactly one message, saw 3 |
+| M2 the server run id no longer travels outward | KILLED | the server-issued run id travels outward on RUN_STARTED |
+| M3 the oldest user message is accepted instead of the newest | KILLED | the only user prompt is the accepted one, saw 'delete every task I have' |
+| M4 canonical history is never persisted | KILLED | canonical history was written server-side |
+| M5 a payload with no user message opens a run anyway | KILLED | no user message returns 422, saw 200 |
+| M6 the prompt of record diverges from the executed message | KILLED | agent_runs.prompt is the accepted message |
+
+M1 is the regression this design exists to prevent and M6 is the divergence that
+made D-51 reject a pre-flight handshake, so both are the mutations worth having.
+
+CI gate name: `T12A AG-UI transport`. It starts Compose PostgreSQL, runs the
+gate above, then runs the full invariant suite.
+
+**Two earlier gates were widened, and the reason matters.** The T08 and T09 gates
+each pin the exact FastAPI route surface, so both refused `/api/agui` and failed
+on the first push. That is the cumulative-gate rule doing its job: an earlier
+proof caught a later task changing a surface it had pinned. The expected sets now
+include `/api/agui`, which T12A owns under D-44, and nothing else about either
+assertion moved. In particular T08's separate check that no route contains
+"resume" is untouched, because that one encodes a cut rather than a surface and
+must never be widened by anything.
+
+The failure was invisible locally because those gates exist only as inline
+scripts inside `ci.yml`, and the first local verification ran ruff, pytest, and
+the T12A gate alone. Every inline gate in the workflow is now extracted and run
+locally before pushing: 14 gate steps, 0 failing, with `T00B Linear contract`
+skipped because it needs a live credential and is network marked. Verifying only
+the new task's gate is not what "gates are cumulative" asks for.
+
+**Limitations and review status:**
+
+**Dedicated blind review pending R2 after T12B.** T12A has not been reviewed.
+Under D-35's compressed schedule and the section 1A checkpoint table, T12A shares
+checkpoint 2 with T12B, and D-47 makes R2 a same-SHA blind review plus fresh
+Vercel Sandbox execution plus the three deterministic gates. Nothing here has
+been read by a non-authoring model. Self-inspection and a green gate are not a
+review.
+
+**Live provider verification is pending.** Everything above ran against a
+`FunctionModel`. `MODEL_ID` and a provider credential were unset, so the
+BUILD_SPEC prompt `Create a task called Test AG-UI` has not been executed against
+the configured runtime model. T12A is not claimed as completely verified. See
+D-52 and Q-16.
+
+**`spike/` is deleted and D-13's order was followed, not asserted.** D-13 fixes
+the sequence: `T00A spike build` must come off master's required status checks
+before the pull request that deletes the tree, or that request fails its own
+required check and branch protection cannot be edited from inside it. The check
+was still required when the implementation was written, so the tree survived the
+first commit. The user removed the check, and the deletion was made only after an
+independent query confirmed all five conditions: exactly 14 required contexts,
+`T00A spike build` absent, and `strict`, `enforce_admins`, and
+`required_conversation_resolution` all still true. Two earlier queries disagreed
+with the claim that it had been removed, and each time the deletion was refused
+rather than attempted. That closes Q-15.
+
+Seventeen files under `spike/` and the `t00a-spike-build` job are gone. **CI now
+has no Node step and no `npm run build`.** That is expected rather than a
+regression: those steps existed only to build the disposable T00A frontend, and
+the production frontend does not exist until T13. BUILD_SPEC section 11 lists
+`npm run build` as the third CI command, and it becomes runnable when T13 and T14
+create the tree it would build. The `Lint` job's comment about keeping `spike/`
+out of `ruff`'s scope is corrected to past tense for the same reason; the
+working-directory contract that comment defends is unchanged and still binding.
+
+**Approvals are entirely absent, by design.** See D-53. `delete_tasks` registers
+with `requires_approval=True` and the output type includes
+`DeferredToolRequests`, both transport shape from Gate A, but no approval row is
+written, no run moves to `awaiting_approval`, and a client `resume[]` is
+discarded. A deferred run therefore stays `running` until T12B, which is one task
+away and owns every part of it.
+
+**Two questions recorded rather than solved.** Q-18: history does not carry
+across turns, because a run is a turn and the schema has no thread column, which
+T17's clarification beat will need. Q-19: `render_task_block` still has no
+caller, and T23's file list cannot add one.
+
+**Smaller known gaps.** A `PolicyError` inside a tool body fails the run rather
+than returning a retryable result to the model, which is T19's work.
+`cost_cents` stays zero because Pydantic AI reports no cost without a pricing
+source. `RunDetail.pending_approval` is still null, which D-45 assigns to T12B.

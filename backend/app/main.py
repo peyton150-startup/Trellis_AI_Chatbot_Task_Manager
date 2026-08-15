@@ -27,12 +27,20 @@ what each one costs in code:
    Missing and not-yours are the same rejection, so the API cannot be used to
    discover which run ids exist.
 
-Section 9's table lists seven endpoints. Four are here. The rest belong to the
-tasks that own their behavior, under D-44: `/api/demo/reset` to T09 with the
-fixture, `/api/agui` to T12A, the approvals decision to T12B with the approval
-bridge, and undo to T18. `/api/runs/{id}/resume` is not here and is not coming,
-because D-36 credited resume and orphan sweep as removed in full and spent the
-0.25d; section 9's table is corrected to match.
+Section 9's table lists seven endpoints. Five are here. The rest belong to the
+tasks that own their behavior, under D-44: the approvals decision to T12B with
+the approval bridge, and undo to T18. `/api/runs/{id}/resume` is not here and is
+not coming, because D-36 credited resume and orphan sweep as removed in full and
+spent the 0.25d; section 9's table is corrected to match.
+
+`/api/agui` arrives at T12A and is the one route whose body is not a declared
+Pydantic model, because its shape is the AG-UI `RunAgentInput` the protocol
+fixes. Rule 1 is met differently there and no less strictly: rather than
+declaring which keys are forbidden, the transport constructs the payload the
+agent sees from scratch and copies exactly one value across, the newest user
+message. Rule 4 does not apply to it at all, because it accepts no run
+identifier to resolve. It creates the application run instead. See `agent.py`,
+whose module docstring is the argument for why that is the stronger property.
 
 Actor identity is `settings.actor_id`. This build has one actor by design, and
 authentication is out of scope for the demo, but every authorization decision
@@ -44,9 +52,9 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from app import domain, runs, seed
+from app import agent, domain, runs, seed
 from app.config import settings
 from app.db import pool
 from app.errors import PolicyError, ValidationFailedError
@@ -152,6 +160,19 @@ def get_run(run_id: UUID) -> RunDetail:
     run, or names another actor's run, is the 403 that `runs.load` raises.
     """
     return runs.detail(run_id, settings.actor_id)
+
+
+@app.post("/api/agui")
+async def post_agui(request: Request) -> Response:
+    """The AG-UI transport. One application run per accepted user message.
+
+    The handler lives in `agent.py` because the trust boundary it enforces is
+    inseparable from how the adapter is constructed, and splitting the two across
+    files would put half the argument in each. `agent.get_agent` is reached
+    through the module attribute rather than a `from` import so the deterministic
+    gate can substitute a model without a seam in this route.
+    """
+    return await agent.handle_agui_request(request)
 
 
 @app.post(

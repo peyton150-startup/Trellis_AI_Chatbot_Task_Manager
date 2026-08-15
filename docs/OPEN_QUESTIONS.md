@@ -16,10 +16,16 @@ Options:   the candidate readings, if there is more than one
 
 ## Open
 
-Q-12, Q-14, Q-15, Q-16, Q-17. Each is recorded in full below, in number order,
+Q-12, Q-17, Q-18, Q-19. Each is recorded in full below, in number order,
 alongside the resolved entries rather than duplicated here. This index was stale
 while Q-12 was open and is corrected as part of recording Q-14 through Q-17.
 Q-13 was withdrawn on 2026-08-15 as false when written; the entry is kept.
+
+Q-14, Q-15, and Q-16 were resolved on 2026-08-15 and moved out of this list.
+Q-14 and Q-16 by D-52; Q-15 by the user removing `T00A spike build` from
+master's required status checks, after which `spike/` and its CI job were
+deleted in D-13's order. Q-18 and Q-19 are recorded by T12A and neither blocks
+it.
 
 ---
 
@@ -540,8 +546,11 @@ Options:   A. Amend D-12 to name the mechanism, leaving its ordering requirement
 
 ## Q-14  Four of T12A's six proofs name a client that no task has built yet
 Task:      T12A
-Blocking:  yes
-Status:    OPEN, observed on 2026-08-14 against master at `a1c5aa7`
+Blocking:  was yes
+Status:    RESOLVED on 2026-08-15 by D-52, as option A. T12A proves the server
+           side of proofs 1, 3, 4, and 5 and writes no frontend code. Gate A
+           already proved the browser half in a real browser, and T13, T14, and
+           T15 prove the rendered half against real components.
 Context:   T12A's proof list requires that assistant-ui sends the message (1),
            that the client renders the streamed AG-UI events (3), that tool
            completion reaches the client (4), and that the board refetches and
@@ -572,8 +581,20 @@ Options:   A. Read proofs 1, 3, 4, and 5 as server-side proofs at T12A: assert
 
 ## Q-15  Deleting `spike/` at T12A needs a branch-protection change this session cannot make
 Task:      T12A
-Blocking:  yes for the T12A pull request, no for T12A implementation
-Status:    OPEN, observed on 2026-08-14 against master at `a1c5aa7`
+Blocking:  was yes for the T12A pull request, no for T12A implementation
+Status:    RESOLVED on 2026-08-15 as option A. The user removed
+           `T00A spike build` from master's required status checks, preserving
+           the other 14 contexts, strict up-to-date checks, admin enforcement,
+           and required conversation resolution. Only then were `spike/` and the
+           `t00a-spike-build` job deleted, in that order, per D-13.
+
+           Worth keeping for the process rather than the outcome. The removal was
+           reported as done twice before it was, and an independent query caught
+           it both times and refused to delete. A repository administration action
+           taken on someone else's word is exactly the kind of precondition worth
+           re-querying rather than trusting, because the failure is silent: the
+           deletion would have produced a pull request that could not pass its own
+           required check, which is the specific outcome D-13 exists to prevent.
 Context:   Section 12's T00A block says to delete `spike/` before T12A, and 17
            spike files are still tracked. D-13 already fixed the order and the
            reason: `T00A spike build` is a required status check on `master` with
@@ -595,8 +616,17 @@ Options:   A. The user removes `T00A spike build` from master's required checks,
 
 ## Q-16  The T12A verification needs a runtime model and a database that this environment does not have
 Task:      T12A
-Blocking:  yes for verification, no for implementation
-Status:    OPEN, observed on 2026-08-14
+Blocking:  was yes for verification, no for implementation
+Status:    RESOLVED on 2026-08-15 by D-52, as option C, with half of it still
+           outstanding. The database half is closed: Compose PostgreSQL was
+           running and every deterministic proof executed against it. The
+           deterministic gate drives the identical agent, prompt, six tools, and
+           transport against a FunctionModel and is what CI runs, because CI
+           holds no provider secret and BUILD_SPEC excludes network tests from
+           the default gate. The live half is not closed and is not redefined
+           away: MODEL_ID and a provider credential were still unset, so
+           **live T12A verification is pending** and T12A is not claimed as
+           completely verified.
 Context:   The prescribed verification runs the prompt `Create a task called Test
            AG-UI` and asserts exactly one committed `create_task` mutation. That
            requires a live model call and a live database.
@@ -619,3 +649,68 @@ Options:   A. Provide `MODEL_ID` and the matching key in a local `.env`, start t
               rather than the model's behavior, which the eval suite owns.
            C. Both: a deterministic gate for CI and one recorded live run as the
               observed evidence.
+
+## Q-18  History does not carry across turns, and T17 needs it
+Task:      T12A, deadline T17
+Blocking:  no
+Status:    OPEN, recorded on 2026-08-15
+Context:   D-51 fixes one `agent_runs` record as one user turn, and section 9
+           loads history from `agent_runs.message_history` by run id. Those two
+           together mean turn two of a conversation starts with empty history.
+
+           The schema has no thread column and cannot gain one without a D-31
+           re-plan, and the alternative, letting a browser-chosen thread
+           identifier select the application run, is what D-51 rejects. So the
+           gap is a property of the frozen data model rather than of the
+           transport decision.
+
+           It does not block T12A, whose six proofs are all single turn, and it
+           does not block T12B, whose continuation stays inside one application
+           run by definition. It blocks the demo beat at ARCHITECTURE part 11,
+           2:00: "Clear my tasks" produces a clarifying question, and the user's
+           answer is a second turn that needs the first turn's context to mean
+           anything.
+Options:   A. Load history for a new run from the actor's most recent runs, so a
+              turn inherits conversation context without any client identifier
+              deciding which conversation it belongs to. Server-owned, no new
+              column, and wrong the moment two conversations exist at once.
+           B. Add a thread column and a thread-scoped history read. Correct, and
+              a schema change that trips D-31 and needs a named cut to pay for
+              it.
+           C. Accept the limitation and let T17's clarification live inside one
+              application run, by treating the clarifying question and its answer
+              as one turn that the framework interrupts. Closest to how the
+              approval interrupt already works, and it is the option that costs
+              nothing if it turns out to be sufficient.
+           D. Cut the clarification beat. It is a named demo moment, so this is a
+              PROJECT_PLAN decision rather than an implementation one.
+
+## Q-19  `render_task_block` has no caller and T23 cannot add one
+Task:      T11, discovered at T12A, deadline T23
+Blocking:  no
+Status:    OPEN, recorded on 2026-08-15
+Context:   BUILD_SPEC section 10 says `render_task_block` "is the only place task
+           content enters a prompt" and that `DEMO_UNSAFE_PROMPT_MODE` is read in
+           exactly one place, here. T11 shipped the function. Nothing calls it.
+
+           T12A wires `SYSTEM_PROMPT` as the agent's instructions and does not
+           call the renderer, because part 4's provenance rule places task content
+           in a delimited data block and "never the system prompt or instruction
+           position", so a dynamic instruction carrying the task block would
+           violate the rule it exists to enforce. Where the block does belong is a
+           question about the shape of the user turn.
+
+           T23's file list is `prompts.py` and `seed.py`. Neither can add a caller
+           in `agent.py`, so as scheduled T23 cannot switch on the injection path
+           it owns. Note also that task content already reaches the model by a
+           second route the renderer does not cover: `list_tasks` returns titles
+           and notes as a tool result.
+Options:   A. T23 gains `agent.py` and adds the call: the block rides in the data
+              position when the flag is false, and in the instruction position
+              when it is true, which is what the flag is documented to do.
+           B. T12A wires it now, which means deciding the user-turn shape inside
+              a transport task and ahead of the proof list that covers it.
+           C. Decide that tool results are the only path task content takes to the
+              model, and that `render_task_block` covers the demo toggle alone.
+              Honest, but it narrows a rule section 10 states without qualification
+              and should be a recorded decision rather than a silence.
