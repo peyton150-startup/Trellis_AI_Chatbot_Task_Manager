@@ -225,6 +225,7 @@ Environment variables, `.env.example`:
 
 ```
 DATABASE_URL=postgresql://trellis:trellis@localhost:55432/trellis
+TRELLIS_API_ORIGIN=http://127.0.0.1:8000
 MODEL_ID=<set from the Day 4 bakeoff; provisional default on Day 1>
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
@@ -323,7 +324,8 @@ Create exactly this. KERNEL files are **OPUS ONLY**: their logic is specified li
   frontend/
     package.json
     tsconfig.json
-    tailwind.config.ts
+    next.config.ts           same-origin /api rewrite to FastAPI, D-61
+    tailwind.config.ts       only when required by the selected Tailwind version
     app/
       layout.tsx
       page.tsx
@@ -971,7 +973,7 @@ count(tool_invocations WHERE tool_name IN MUTATING_TOOLS AND status='completed')
 ```bash
 cd backend && ruff check .
 cd backend && pytest -m "not network"
-npm run build
+cd frontend && npm run build
 ```
 
 The working directory is part of the contract, not an incidental detail. Ruff resolves configuration by directory hierarchy, so `backend/pyproject.toml` governs files under `backend/` and nothing else; a bare `ruff check` from the repository root would lint the disposable `spike/` tree as well, which is deleted before T12A and must never be able to block a gate.
@@ -1045,7 +1047,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T12A | Integrate the proven AG-UI transport | **OPUS ONLY** | `agent.py`, `main.py` | See T12A proof list below |
 | T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py`, `runs.py`, `sql.py`, `errors.py`, `tests/test_invariants.py` | See T12B proof list below. Owns `POST /api/runs/{id}/approvals/{tool_call_id}`, approval creation and decision, and `RunDetail.pending_approval`, which is null until here under D-45. File list expanded under D-55: the invalid-run-state code D-45 records as missing became `RUN_STATE_INVALID` in KERNEL `errors.py`, and D-58's decision-forgery scenarios join the existing `test_forged_approval_rejected` rather than adding a fourteenth name. D-56 settles the multiple-approval question by freezing at most one simultaneously pending approval per application run. |
 | R2 | Blind review and execution checkpoint 2 | NON-AUTHORING MODEL + HUMAN | T10 reference tool, T11, and T12A/T12B boundary changes | See the R2 review and execution gate below. The same immutable SHA passes review, fresh-sandbox execution, lint, deterministic tests, and the production build before T13. |
-| T13 | Board and task card | SOL | `Board.tsx`, `TaskCard.tsx`, `useBoard.ts`, `api.ts`, `types.ts` | Board renders seed data |
+| T13 | Board and task card | SOL | `frontend/package.json`, `frontend/package-lock.json`, `frontend/tsconfig.json`, `frontend/next-env.d.ts`, `frontend/next.config.ts`, `frontend/app/layout.tsx`, `frontend/app/page.tsx`, `frontend/app/globals.css`, `frontend/components/Board.tsx`, `frontend/components/TaskCard.tsx`, `frontend/lib/useBoard.ts`, `frontend/lib/api.ts`, `frontend/lib/types.ts`, `.env.example`; plus the required CI, implementation-note, and CF-1 documentation companions | Board renders seed data through D-61's same-origin rewrite; `cd frontend && npm run build` passes in the cumulative `T13 frontend build` gate. File list expanded by the user's 2026-08-15 T13 handoff and D-61 because no production frontend scaffold existed before this task. |
 | T14 | Chat | SOL | `Chat.tsx` | Streaming turn visible, board refetches after tool completion. See the assistant-ui ownership note below. |
 | T15 | **UGLY DEMO BAR** | either | none | Prompt to committed board update, unstyled |
 | T16 | Approval card | SOL | `ApprovalCard.tsx`, `useRun.ts` | Delete pauses, approve and reject both work. See the assistant-ui ownership note below. |
@@ -1173,7 +1175,11 @@ R2 passes only when all of the following are true for the same immutable SHA:
 2. The reviewed SHA boots and the T12A/T12B path executes successfully in a fresh Vercel Sandbox.
 3. `cd backend && ruff check .` passes.
 4. `cd backend && pytest -m "not network"` passes.
-5. `npm run build` passes.
+5. If that SHA contains a tracked `package.json` in the designated production
+   frontend directory, `npm run build` passes from that directory. The reviewed
+   SHA `09b75db` contained no tracked production frontend, so this item was N/A
+   for the recorded R2 result. Beginning with T13, `cd frontend && npm run build`
+   is an unconditional cumulative gate.
 
 A blind-review BLOCK, Vercel Sandbox provisioning or execution failure, lint failure, test failure, or production-build failure is an R2 BLOCK.
 

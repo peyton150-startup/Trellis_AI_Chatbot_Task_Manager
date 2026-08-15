@@ -1316,3 +1316,63 @@ and assistant-ui client does not exist at `09b75db`, so every T12A claim at R2
 is protocol-level against the FastAPI surface and no browser rendering claim is
 made. Live provider verification remains carried forward from T12A and T12B and
 is not resolved by R2.
+
+## T13: Board and task card
+
+**Local role:** Introduces the production Next.js frontend scaffold and the
+first visible application surface. `api.ts` performs the typed
+`GET /api/tasks` request and rejects non-successful HTTP responses. `useBoard`
+owns only the loading, error, last-read task collection, request cancellation,
+and stable `refetch` operation needed to display the board. `Board` renders the
+loading, error, empty, stale, and populated states, while `TaskCard` displays the
+server's task fields without mutation controls or local persistence.
+
+**Whole-system role:** Makes PostgreSQL's committed task state visible without
+moving authority into the browser. Under D-61, browser code calls relative
+`/api/*` paths and Next.js forwards them to FastAPI through the server-only
+`TRELLIS_API_ORIGIN`; Next.js owns no endpoint or task state. The board is the
+committed-state surface that later chat, approval, and undo tasks will refetch
+after server-side operations complete.
+
+**Inputs and dependencies:** Consumes `GET /api/tasks` and `TasksResponse` from
+T08, the eleven-row seed and reset behavior from T09, the Pydantic `Task` shape
+from T03, R2 PASS, CF-1 through CF-3, and D-61. `frontend/package.json` pins
+Next.js 16.3.1, React and React DOM 19.2.8, TypeScript 7.0.2, Tailwind CSS
+4.3.3, assistant-ui React 0.15.14, assistant-ui AG-UI runtime 0.0.54, AG-UI
+client 0.0.58, and the matching TypeScript declaration packages. The npm 10
+lockfile is authoritative for the transitive graph and declares Node
+`^22 || ^24 || >=26`.
+
+**Outputs and consumers:** Exports the exact TypeScript `Task`, `TaskPriority`,
+`TaskStatus`, and `TasksResponse` contracts, `fetchTasks`, `useBoard`, and
+`BoardState`. `BoardState.refetch: () => Promise<void>` is the explicit
+interface T14 consumes after tool completion. The cumulative CI job is named
+`T13 frontend build`. No chat, approval, run polling, reset, undo, or optimistic
+mutation behavior was implemented in T13.
+
+**Verification:** On Node 22.23.2 with npm 10.9.8, the temporary test-first API
+probe passed two checks for the relative path, no-store reads, abort-signal
+forwarding, successful decoding, and non-2xx rejection. `npm ci --no-audit --no-fund` from
+`frontend/` installed 143 packages from `package-lock.json`. `npm run build`
+from `frontend/` compiled successfully with Next.js 16.3.1, completed strict
+TypeScript checking, generated three static pages, and exited 0. From
+`backend/`, `ruff check .` passed and `pytest -m "not network"` selected 40
+tests, deselected 13 network tests, and passed all 40. A real installed Chrome
+run loaded `http://127.0.0.1:3000` through the production Next.js server,
+observed HTTP 200, rendered exactly eleven `TaskCard` elements including the
+Task K injection payload as ordinary text, exposed the visible refresh control,
+and observed a second successful `GET /api/tasks` after clicking it. PyYAML
+loaded `.github/workflows/ci.yml`, found all 18 cumulative jobs, and confirmed
+the exact `T13 frontend build` name and build command.
+
+**Limitations and review status:** T13 is display-only. It performs no polling
+and owns no optimistic or persisted browser state. `tailwind.config.ts` is
+omitted because pinned Tailwind CSS 4.3.3 does not require it for this plain-CSS
+surface. CF-1 is closed by correcting the historical R2 build wording and the
+current frontend working directory in `CLAUDE.md` and `docs/BUILD_SPEC.md`.
+CF-2 is closed by the unconditional lockfile-based `T13 frontend build` job.
+CF-3 is therefore closed. No dedicated T13 blind review is scheduled; board
+review remains deferred to the T15 smoke and manual checkpoint. The GitHub job
+must report green once before its exact name is added to master's required
+status checks, and live provider verification remains carried from T12A and
+T12B.

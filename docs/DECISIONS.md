@@ -2001,6 +2001,26 @@ without a pricing source. `model_calls`, `tool_calls`, `input_tokens`, and
 `output_tokens` are recorded truthfully from `RunUsage`; an invented cost in an
 audit row would be worse than a zero.
 
+## Frontend origin decision recorded at T13
+
+### D-61: Next.js is the browser's same-origin facade for FastAPI
+
+**Q-20 resolves as option A.** Browser code calls the authoritative API through
+relative `/api/*` paths. Next.js rewrites those requests to the FastAPI origin
+configured by the server-only `TRELLIS_API_ORIGIN` environment variable. Its
+local default is `http://127.0.0.1:8000`.
+
+The browser therefore never receives or chooses the backend origin. T13 adds no
+FastAPI CORS policy and no Next.js route handler, and it does not duplicate any
+backend endpoint. PostgreSQL remains authoritative behind FastAPI; Next.js only
+forwards the HTTP request and owns no task state.
+
+The T13 file list is expanded by the user's 2026-08-15 approval to include
+`frontend/next.config.ts` and `.env.example`. `frontend/next.config.ts` owns the
+rewrite and `.env.example` declares `TRELLIS_API_ORIGIN`. This expansion is in
+addition to the minimum production frontend scaffold and companion files
+authorized in the T13 handoff.
+
 ---
 
 ## Approval bridge decisions recorded at T12B

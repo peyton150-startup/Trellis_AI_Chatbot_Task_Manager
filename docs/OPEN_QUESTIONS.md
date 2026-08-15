@@ -725,3 +725,37 @@ Options:   A. T23 gains `agent.py` and adds the call: the block rides in the dat
               model, and that `render_task_block` covers the demo toggle alone.
               Honest, but it narrows a rule section 10 states without qualification
               and should be a recorded decision rather than a silence.
+
+## Q-20  The production browser has no contract for reaching FastAPI
+Task:      T13
+Blocking:  yes
+Status:    RESOLVED on 2026-08-15 by D-61, as option A
+Context:   T13 must fetch the authoritative `GET /api/tasks` endpoint and visibly
+           render the seeded board, but the repository defines no production
+           frontend-to-backend origin contract. There is no FastAPI CORS policy,
+           Next.js rewrite or route handler, frontend API-origin variable, reverse
+           proxy configuration, or fixed deployment topology. The deleted spike's
+           permissive local CORS was explicitly throwaway and cannot be restored.
+
+           A browser-relative `fetch("/api/tasks")` reaches the Next.js origin,
+           not a separately started FastAPI server. A direct cross-origin fetch
+           needs both a public backend origin and a backend CORS policy. Choosing
+           either behavior would invent a contract forbidden by BUILD_SPEC section
+           0. The T13 handoff therefore requires this question to be decided before
+           frontend implementation continues.
+Options:   A. Recommended: make Next.js the browser's same-origin facade. Add
+              `frontend/next.config.ts` with a rewrite from `/api/:path*` to a
+              server-only `TRELLIS_API_ORIGIN`, defaulting locally to
+              `http://127.0.0.1:8000`. Authorize `frontend/next.config.ts` and
+              `.env.example` in T13. The browser uses relative `/api/tasks`, no
+              CORS policy or Next.js API route is added, and deployments can point
+              the server-side rewrite at FastAPI without exposing that origin to
+              browser code.
+           B. Let the browser call FastAPI directly. Add a public frontend API-base
+              variable and a narrowly configured FastAPI CORS policy. This expands
+              T13 into backend `config.py` and KERNEL `main.py`, so it also requires
+              the D-31 re-plan and a named schedule cut.
+           C. Declare that an external reverse proxy must route `/api/*` to FastAPI
+              and all other paths to Next.js. The frontend uses relative
+              `/api/tasks`, but local visible verification remains blocked until a
+              concrete proxy configuration and ownership task are specified.
