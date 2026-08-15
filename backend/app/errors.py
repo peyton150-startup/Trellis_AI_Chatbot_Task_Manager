@@ -1,8 +1,12 @@
 """KERNEL. Error codes and exception classes, from BUILD_SPEC section 6.
 
-Exactly these twelve codes. Every rejection in the system uses one of them. No
+Exactly these thirteen codes. Every rejection in the system uses one of them. No
 ad hoc strings. The code and HTTP status are fixed per class, so a raise site
 chooses a class rather than composing a code.
+
+The table closed at twelve from T04 until T12B added `RUN_STATE_INVALID` under
+D-55, which is why several older comments in this repository say twelve. Adding
+a fourteenth is a KERNEL edit and trips D-31 the same way this one did.
 """
 
 
@@ -119,10 +123,30 @@ class ValidationFailedError(PolicyError):
     http_status = 422
 
 
+class RunStateInvalidError(PolicyError):
+    """A resolved, actor-owned run whose current status forbids the action.
+
+    The thirteenth code, added at T12B under D-55. D-45 recorded that none of the
+    original twelve expressed this and that VALIDATION_ERROR, OUT_OF_SCOPE, and
+    the approval-specific codes must not be bent to fit.
+
+    Reached only after ownership has already resolved, and that ordering is the
+    point. A run that does not exist and a run belonging to another actor both
+    stay OutOfScopeError, so this class never distinguishes them and the
+    non-enumeration property section 6 step 1 establishes for tasks is unchanged
+    for runs. Raising it before an ownership check would leak which run ids are
+    real.
+    """
+
+    code = "RUN_STATE_INVALID"
+    http_status = 409
+
+
 # The complete section 6 table, in specification order. The T04 CI gate walks
-# this to assert all twelve code and status pairs, because the six T04 invariant
-# tests only ever construct five of them and an unexercised transposed status
-# would otherwise surface at T05, in a file T05 may not edit.
+# this to assert all thirteen code and status pairs, because the six T04
+# invariant tests only ever construct five of them and an unexercised transposed
+# status would otherwise surface at T05, in a file T05 may not edit. T12B added
+# the thirteenth entry and updated that gate in the same commit, under D-55.
 ERRORS_BY_CODE = {
     error.code: error
     for error in (
@@ -138,5 +162,6 @@ ERRORS_BY_CODE = {
         ToolTimeoutError,
         ModelTimeoutError,
         ValidationFailedError,
+        RunStateInvalidError,
     )
 }

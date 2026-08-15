@@ -33,11 +33,13 @@ from psycopg.types.json import Json
 from app import sql
 from app.config import settings
 from app.db import pool
-from app.errors import OutOfScopeError
+from app.errors import ApprovalAlreadyDecidedError, OutOfScopeError
 from app.models import (
     AgentRun,
     Approval,
+    ApprovalDecision,
     EventOperation,
+    PendingApproval,
     RunDetail,
     RunStatus,
     RunStep,
@@ -168,15 +170,192 @@ def load_approval(run_id: UUID, tool_call_id: str) -> Approval | None:
     return None if row is None else Approval.model_validate(row)
 
 
+def load_owned_tasks(actor_id: UUID, task_ids: list[UUID]) -> list[dict]:
+    """Complete owned task rows by id, for the T12B approval preview only.
+
+    This is not the scope check. `policy.resolve_scope` is, and it runs before
+    this function is called at all, because the disclosure the preview guard
+    prevents happens the moment a foreign title is read, not when a mutation is
+    attempted. The `owner_id` predicate in the statement is defence in depth
+    behind that, not a substitute for it.
+    """
+    if not task_ids:
+        return []
+    with pool.connection() as conn:
+        rows = conn.execute(
+            sql.SELECT_TASKS_BY_IDS_FOR_OWNER,
+            {"owner_id": actor_id, "task_ids": task_ids},
+        ).fetchall()
+        conn.commit()
+    return [dict(row) for row in rows]
+
+
+def open_approval(
+    run_id: UUID,
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    arguments: dict,
+    arguments_hash: str,
+    required_reason: str,
+    preview: dict,
+) -> Approval:
+    """Write the pending approval row and move the run to `awaiting_approval`.
+
+    Both writes happen in one transaction, and that is the whole point of this
+    function existing rather than two calls at the call site. BUILD_SPEC section
+    10's bridge requires the database row to exist before application state
+    claims there is a pending approval, and D-57 makes `awaiting_approval`
+    equivalent to "approval-controlled execution has not continued". A run left
+    in `awaiting_approval` with no row, or carrying a row while still `running`,
+    would be a state no reader of `RunDetail` could interpret.
+
+    The row is written before the interrupt is presented as real. Nothing in the
+    AG-UI stream is the approval record; the interrupt is a UI event and this row
+    is the authorization state. See D-06.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.INSERT_APPROVAL,
+            {
+                "run_id": run_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments": Json(arguments),
+                "arguments_hash": arguments_hash,
+                "required_reason": required_reason,
+                "preview": Json(preview),
+                "approval_ttl_seconds": settings.approval_ttl_seconds,
+            },
+        ).fetchone()
+        conn.execute(
+            sql.UPDATE_RUN_STATUS,
+            {
+                "run_id": run_id,
+                "status": RunStatus.AWAITING_APPROVAL.value,
+                "error": None,
+            },
+        )
+        conn.commit()
+    return Approval.model_validate(row)
+
+
+def load_pending_approval(run_id: UUID) -> Approval | None:
+    """The live card for one run, or None.
+
+    Pending and unexpired, because a decided, denied, or expired row must not
+    masquerade as something the user can still act on. D-56 freezes at most one
+    simultaneously pending approval per application run, so this returns at most
+    one row by invariant rather than by `LIMIT`.
+
+    More than one row means that invariant has been violated outside this
+    application, since `open_approval` is the only writer and it refuses to
+    create a second. Raising is the honest response: selecting one of them to
+    render is exactly the first-row-wins rule D-45 names and rejects, and no code
+    in the section 6 vocabulary describes a database that contradicts its own
+    invariant. This is a 500 by design and is not a client-facing rejection.
+    """
+    with pool.connection() as conn:
+        rows = conn.execute(
+            sql.SELECT_PENDING_APPROVALS_FOR_RUN, {"run_id": run_id}
+        ).fetchall()
+        conn.commit()
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise RuntimeError(
+            f"run {run_id} holds {len(rows)} pending approvals; D-56 permits one"
+        )
+    return Approval.model_validate(rows[0])
+
+
+def decide_approval(
+    run_id: UUID, tool_call_id: str, decision: ApprovalDecision
+) -> Approval:
+    """Persist the human decision through the guarded update, or refuse.
+
+    `DECIDE_APPROVAL` carries `AND decision = 'pending'` and that predicate is
+    the concurrency boundary, not a convenience. Replacing it with a SELECT that
+    observes `pending` followed by an unguarded UPDATE is the check-then-act race
+    section 7 calls the bug rather than a style preference: two racing decision
+    requests would both observe a pending row and both proceed, and the second
+    would silently overwrite the first human answer.
+
+    Zero rows back therefore means another request already decided it, and that
+    is `APPROVAL_ALREADY_DECIDED` rather than a retry. The caller has already
+    read the row and found it pending; this refusal is the one that survives a
+    race the read cannot see.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.DECIDE_APPROVAL,
+            {
+                "run_id": run_id,
+                "tool_call_id": tool_call_id,
+                "decision": decision.value,
+            },
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise ApprovalAlreadyDecidedError()
+    return Approval.model_validate(row)
+
+
+def resolve_continuation(tool_call_id: str, actor_id: UUID) -> Approval:
+    """D-51's mapping: a call id from `resume[].interruptId` to its approval row.
+
+    The identifier arriving from the browser is a lookup key and grants nothing,
+    in exactly the sense `{id}` is on `GET /api/runs/{id}`. What makes the
+    continuation authoritative is that the row it selects already carries a
+    decision this server persisted.
+
+    `tool_call_id` is provider generated and `approvals` is keyed
+    `(run_id, tool_call_id)`, so it is unique within a run and not across runs.
+    D-51 requires all three cardinalities to be distinguished and forbids
+    assuming uniqueness from entropy, so the statement carries no `LIMIT` and
+    this function counts what came back:
+
+        0 rows   -> refuse. No eligible approval, including the forged case
+                    where nothing was ever deferred under this id.
+        1 row    -> resolve it and its application run.
+        >1 rows  -> refuse as ambiguous. Never choose the first.
+
+    Both refusals raise the same `OutOfScopeError` the run resolver uses, so a
+    caller cannot use the response to learn whether a call id exists somewhere
+    it does not own.
+    """
+    with pool.connection() as conn:
+        rows = conn.execute(
+            sql.SELECT_APPROVAL_FOR_CONTINUATION,
+            {"tool_call_id": tool_call_id, "actor_id": actor_id},
+        ).fetchall()
+        conn.commit()
+    if len(rows) != 1:
+        raise OutOfScopeError()
+    return Approval.model_validate(rows[0])
+
+
 def detail(run_id: UUID, actor_id: UUID) -> RunDetail:
     """Assemble the section 9 RunDetail for one resolved run.
 
-    `pending_approval` is null at T08 and is not a placeholder for a read that
-    was forgotten. Nothing writes an approval row yet, and the question of what
-    the field means when a model produces more than one approval-required call
-    is genuinely unspecified. T12B owns both. See D-45.
+    `pending_approval` was null from T08 until T12B, because nothing wrote an
+    approval row and D-45 left the multiple-approval question open. D-56 settles
+    it by freezing at most one simultaneously pending approval per application
+    run, so the singular wire shape describes the state exactly rather than
+    summarising a list.
+
+    Null does not mean "not awaiting approval". Under D-57 the status spans from
+    the interrupt to the end of the continuation, so a run that is
+    `awaiting_approval` with a decision already persisted correctly reports a
+    null card: the field means something needs your decision now, and in that
+    window nothing does.
+
+    The card deliberately carries no `arguments` and no `arguments_hash`.
+    `PendingApproval` exposes the call id, tool, reason, preview, and expiry, and
+    the browser needs nothing else to render a decision it does not own.
     """
     run = load(run_id, actor_id)
+    pending = load_pending_approval(run_id)
     with pool.connection() as conn:
         invocations = conn.execute(
             sql.SELECT_INVOCATIONS_FOR_RUN, {"run_id": run_id}
@@ -190,7 +369,7 @@ def detail(run_id: UUID, actor_id: UUID) -> RunDetail:
         id=run.id,
         status=run.status,
         prompt=run.prompt,
-        pending_approval=None,
+        pending_approval=None if pending is None else _pending_card(pending),
         steps=[_step(row) for row in invocations],
         usage=RunUsage(
             model_calls=run.model_calls,
@@ -201,6 +380,25 @@ def detail(run_id: UUID, actor_id: UUID) -> RunDetail:
         ),
         can_undo=_can_undo(run, [TaskEvent.model_validate(row) for row in events]),
         error=run.error,
+    )
+
+
+def _pending_card(approval: Approval) -> PendingApproval:
+    """The browser-facing projection of one pending approval row.
+
+    A narrowing, not a rename. `Approval` carries `arguments` and
+    `arguments_hash`; `PendingApproval` does not, and section 9's wire shape
+    omits them on purpose. The client renders a decision it has no authority
+    over, so handing it the exact mutation arguments and the hash the tool body
+    will verify against would give it everything needed to reason about the
+    check rather than simply answer the question.
+    """
+    return PendingApproval(
+        tool_call_id=approval.tool_call_id,
+        tool_name=approval.tool_name,
+        required_reason=approval.required_reason,
+        preview=approval.preview,
+        expires_at=approval.expires_at,
     )
 
 

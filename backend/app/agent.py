@@ -28,9 +28,29 @@ the single most likely way a later change quietly breaks this build:
                      a client-asserted approval cannot continue a deferred call.
                      The approval bridge in BUILD_SPEC section 10 requires the
                      server to construct the resume result from its own stored
-                     decision, and T12B owns that.
+                     decision, and T12B does that below.
 - `thread_id`        the server-issued `agent_runs.id`
 - `run_id`           a fresh framework invocation id
+
+**T12B narrows one word of that, and D-58 records the narrowing rather than
+letting it happen inside a docstring edit.** A continuation request reads
+`resume[].interruptId`, so the initial turn's "reads nothing at all" is no longer
+true of every request on this route. What is true, and what the code below is
+arranged to keep greppable:
+
+```text
+initial turn    client identity, history, and resume are read for nothing
+continuation    resume[].interruptId is accepted as a lookup key only
+                resume[].payload.approved is read for nothing
+                the persisted approvals row decides ToolApproved or ToolDenied
+```
+
+`interruptId` grants nothing in exactly the sense `{id}` grants nothing on
+`GET /api/runs/{id}`: it selects a server-owned record, and the record already
+carries a decision this server persisted and verified. The `DeferredToolResults`
+handed to the agent is built from that row and passed explicitly, so
+`AGUIAdapter.deferred_tool_results`, which derives from the request payload,
+stays unread on both paths.
 
 Application run identity is server-owned. On an initial AG-UI user turn the
 server creates the `agent_runs` row from the accepted newest user message and
@@ -57,24 +77,52 @@ from uuid import UUID, uuid4
 from ag_ui.core import RunAgentInput, UserMessage
 from fastapi import Request
 from fastapi.responses import Response
-from pydantic_ai import Agent, DeferredToolRequests, RunContext
+from pydantic_ai import (
+    Agent,
+    DeferredToolRequests,
+    DeferredToolResults,
+    RunContext,
+    ToolApproved,
+    ToolDenied,
+)
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model
 from pydantic_ai.ui.ag_ui import AGUIAdapter
 from starlette.concurrency import run_in_threadpool
 
-from . import domain, prompts, runs, tools
+from . import domain, policy, prompts, runs, tools
 from .config import settings
 from .errors import ValidationFailedError
 from .models import (
+    Approval,
+    ApprovalPreview,
+    ApprovalState,
     BulkUpdateTasksArgs,
     CreateTaskArgs,
     DeleteTasksArgs,
     ListTasksArgs,
     ProposePlanArgs,
     RunStatus,
+    Task,
+    ToolName,
     UpdateTaskArgs,
 )
+
+
+# Gate A fixed the interrupt identifier as `int-<tool_call_id>`, and API fact 6
+# confirmed the framework maps a continuation back to the original call through
+# it. Stripped in exactly one place, `_continuation_interrupt_id`.
+_INTERRUPT_PREFIX = "int-"
+
+# The only two tools whose classification can require approval, and therefore the
+# only two that can produce a deferred approval request. `delete_tasks` is gated
+# declaratively; `bulk_update_tasks` raises `ApprovalRequired` from its own body
+# under D-12. Anything else arriving as an approval request is refused rather
+# than accommodated.
+_APPROVAL_ARGS_MODELS = {
+    ToolName.DELETE_TASKS.value: DeleteTasksArgs,
+    ToolName.BULK_UPDATE_TASKS.value: BulkUpdateTasksArgs,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +260,15 @@ async def handle_agui_request(request: Request) -> Response:
     6. Stream, recording failure, completion, history, and usage server-side.
     """
     run_input = AGUIAdapter.build_run_input(await request.body())
+
+    # T12B. A payload carrying `resume` is a continuation of an approval this
+    # server already decided, not a new turn. The branch is on the presence of
+    # the field alone; nothing inside it is trusted, and the initial path below
+    # is unchanged.
+    interrupt_id = _continuation_interrupt_id(run_input)
+    if interrupt_id is not None:
+        return await _handle_continuation(request, interrupt_id)
+
     user_message = _accepted_user_message(run_input)
 
     # Step 3. `runs.create` is the existing run-creation primitive that
@@ -245,6 +302,118 @@ async def handle_agui_request(request: Request) -> Response:
         on_complete=_completion_recorder(run.id),
     )
     return adapter.streaming_response(events)
+
+
+def _continuation_interrupt_id(run_input: RunAgentInput) -> str | None:
+    """The one value a continuation payload contributes, or None for a new turn.
+
+    Returns the `tool_call_id` carried by `resume[].interruptId`, which Gate A
+    fixed as `int-<tool_call_id>` and API fact 6 confirmed survives the
+    continuation. The prefix is stripped here and nowhere else.
+
+    More than one entry is refused rather than iterated. D-56 permits at most one
+    simultaneously pending approval per application run, so a payload offering
+    two continuations is describing a state this server cannot have produced, and
+    answering the first would be the first-row-wins behaviour D-45 rejects.
+
+    `status` and `payload` are not read. `payload.approved` in particular is the
+    browser's claim about what the human chose, and the server already has its
+    own record of that.
+    """
+    resume = getattr(run_input, "resume", None)
+    if not resume:
+        return None
+    if len(resume) != 1:
+        raise ValidationFailedError(
+            "a continuation carries exactly one interrupt; see D-56"
+        )
+    interrupt_id = resume[0].interrupt_id or ""
+    tool_call_id = interrupt_id.removeprefix(_INTERRUPT_PREFIX)
+    if not tool_call_id:
+        raise ValidationFailedError("continuation carries no interrupt id")
+    return tool_call_id
+
+
+async def _handle_continuation(request: Request, tool_call_id: str) -> Response:
+    """Continue one application run from the decision this server persisted.
+
+    The order is the contract, and it is the same shape as the initial turn: the
+    payload names a record, the server resolves it, and everything the model sees
+    afterwards is server owned.
+
+    1. Resolve the call id to its approval row, actor scoped. Zero eligible rows
+       and more than one both refuse, per D-51.
+    2. Build the framework result from the stored decision, never from the
+       payload.
+    3. Load canonical history for the application run the row names.
+    4. Stream a fresh framework invocation under that same application run.
+
+    Step 4 is why BUILD_SPEC proof 5 is worded the way it is. This is one more
+    invocation inside one `agent_runs` record, not a resumption of the previous
+    one, and usage accumulates across both because `record_usage` adds.
+    """
+    approval = await run_in_threadpool(
+        runs.resolve_continuation, tool_call_id, settings.actor_id
+    )
+    run_id = approval.run_id
+
+    adapter: AGUIAdapter[TrellisDeps, str | DeferredToolRequests] = AGUIAdapter(
+        get_agent(),
+        _continuation_run_input(run_id),
+        accept=request.headers.get("accept"),
+    )
+
+    history = await run_in_threadpool(runs.load_history, run_id, settings.actor_id)
+    message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(history))
+
+    native = adapter.run_stream_native(
+        message_history=message_history,
+        deferred_tool_results=_deferred_results(approval),
+        deps=TrellisDeps(actor_id=settings.actor_id, run_id=run_id),
+    )
+    events = adapter.transform_stream(
+        _record_failure(native, run_id),
+        on_complete=_completion_recorder(run_id),
+    )
+    return adapter.streaming_response(events)
+
+
+def _deferred_results(approval: Approval) -> DeferredToolResults:
+    """The stored decision, as the framework's continuation result.
+
+    This function is the entire answer to "who decides whether the deletion
+    happens". It reads one column of one server-owned row. It takes no argument
+    derived from the request, which is what makes the client's `payload.approved`
+    unable to influence the outcome in either direction.
+
+    `ToolApproved` is constructed with no `override_args`. The framework offers
+    them, and accepting any would let the continuation execute arguments the
+    approval row never covered, which is precisely what `arguments_hash` and
+    policy step 5b exist to prevent.
+    """
+    approved = approval.decision is ApprovalState.APPROVED
+    result = ToolApproved() if approved else ToolDenied()
+    return DeferredToolResults(approvals={approval.tool_call_id: result})
+
+
+def _continuation_run_input(run_id: UUID) -> RunAgentInput:
+    """The payload a continuation invocation is allowed to see.
+
+    Empty `messages`, because a continuation adds no user turn: the model is
+    resuming from history plus a tool result. Every other field matches
+    `_accepted_run_input` for the same reasons, and `resume` is absent here too,
+    so the adapter derives no deferred results of its own from a request. The
+    ones it uses are passed explicitly by `_handle_continuation`.
+    """
+    return RunAgentInput(
+        thread_id=str(run_id),
+        run_id=str(uuid4()),
+        state=None,
+        messages=[],
+        tools=[],
+        context=[],
+        forwarded_props={},
+    )
 
 
 def _accepted_user_message(run_input: RunAgentInput) -> str:
@@ -296,6 +465,104 @@ def _accepted_run_input(run_id: UUID, user_message: str) -> RunAgentInput:
         tools=[],
         context=[],
         forwarded_props={},
+    )
+
+
+def _open_approval(run_id: UUID, requests: DeferredToolRequests) -> None:
+    """Turn one deferred approval request into the authoritative pending row.
+
+    BUILD_SPEC section 10's bridge requires this to happen before application
+    state claims an approval is pending, and D-06 requires the row rather than
+    the interrupt to be the authorization record. The AG-UI interrupt is a UI
+    event; this is the thing `policy.check` will verify against later.
+
+    Every refusal below raises, and the caller marks the run failed. Failing
+    closed is the only safe direction here: the framework has already stopped the
+    tool body, so refusing to write a row means nothing executes.
+
+    **The preview scope guard is the reason this function is careful about
+    order.** `delete_tasks` is gated declaratively, so the framework defers it
+    before its body runs, which means neither the tool's own
+    `policy.resolve_scope` nor the authoritative `policy.check` has executed when
+    the card is built. `resolve_scope` therefore runs here, before any task
+    detail is fetched. Fetching first and validating afterwards would put another
+    actor's titles on screen and then discover the problem, and a disclosure that
+    already happened is not undone by refusing the mutation.
+
+    This does not replace the tool body's own check, and D-50 says so directly.
+    Ownership can move between the preview, the human decision, and the
+    continuation, so `policy.check` resolves scope again on the approved path.
+    """
+    # `calls` is for tools the client executes, which this build does not use.
+    # A non-empty list means the agent was configured with a frontend toolset,
+    # and continuing would mean approving something whose execution the server
+    # does not own.
+    if requests.calls:
+        raise ValidationFailedError("client-executed deferred calls are not supported")
+
+    # D-56, fail closed. Zero is a framework contract violation; more than one is
+    # the case D-45 left open, and the ruling is that no call is chosen, no row
+    # is written, and the turn is refused whole.
+    if len(requests.approvals) != 1:
+        raise ValidationFailedError(
+            f"{len(requests.approvals)} simultaneous approval requests; "
+            "D-56 permits one per application run"
+        )
+
+    part = requests.approvals[0]
+    args_model = _APPROVAL_ARGS_MODELS.get(part.tool_name)
+    if args_model is None:
+        raise ValidationFailedError(
+            f"{part.tool_name} cannot require approval; see policy.classify"
+        )
+    arguments = args_model.model_validate(part.args_as_dict())
+
+    # Mirrors the target and count derivation in the matching `tools.py` body
+    # exactly. The scope guard has to cover the same id set the tool will act on,
+    # and the count has to reach `classify` the same way, or the card could
+    # describe a different call from the one the approval authorizes.
+    target_ids = list(arguments.task_ids)
+    if isinstance(arguments, BulkUpdateTasksArgs):
+        if (
+            "blocked_by" in arguments.model_fields_set
+            and arguments.blocked_by is not None
+        ):
+            target_ids.append(arguments.blocked_by)
+
+    # `tools._payload` is the single canonicalization rule, and its own docstring
+    # names "the approval row T12B writes" as one of the three places the hash
+    # has to agree. Recomputing it here with a second rendering is exactly the
+    # drift it warns about, so this reuses the function rather than the idea.
+    payload = tools._payload(arguments)
+    args_hash = policy.arguments_hash(payload)
+
+    # Scope first. Everything below this line reads task content.
+    policy.resolve_scope(settings.actor_id, target_ids)
+
+    requirement = policy.classify(part.tool_name, payload, len(arguments.task_ids))
+    if not requirement.required:
+        # The framework deferred a call policy does not consider gated. Writing a
+        # row would record an approval requirement the policy layer disowns.
+        raise ValidationFailedError(
+            f"{part.tool_name} deferred without a policy requirement"
+        )
+
+    rows = runs.load_owned_tasks(settings.actor_id, list(arguments.task_ids))
+    snapshots = [Task.model_validate(row).model_dump(mode="json") for row in rows]
+    preview = (
+        ApprovalPreview(deletes=snapshots)
+        if isinstance(arguments, DeleteTasksArgs)
+        else ApprovalPreview(updates=snapshots)
+    )
+
+    runs.open_approval(
+        run_id,
+        tool_call_id=part.tool_call_id,
+        tool_name=part.tool_name,
+        arguments=payload,
+        arguments_hash=args_hash,
+        required_reason=requirement.reason.value,
+        preview=preview.model_dump(mode="json"),
     )
 
 
@@ -363,12 +630,25 @@ def _completion_recorder(run_id: UUID):
         )
 
         # A deferred output means the framework gated an approval-required call.
-        # The run is not finished and must not be marked completed. Moving it to
-        # `awaiting_approval` and writing the pending `approvals` row is the
-        # approval bridge, which T12B owns; D-50 records that nothing in the
-        # application does either today. The run therefore stays `running` until
-        # T12B, which is a stated T12A limitation rather than an oversight.
+        # The run is not finished and must not be marked completed. T12B writes
+        # the pending `approvals` row and moves the run to `awaiting_approval` in
+        # one transaction, which is the approval bridge T12A deliberately left
+        # unbuilt.
+        #
+        # A refusal here fails the run explicitly. `_record_failure` wraps the
+        # native stream and cannot see this, because `on_complete` runs after the
+        # agent finished successfully from the framework's point of view. Without
+        # this the fail-closed paths in `_open_approval` would leave a run
+        # `running` forever with no row and no error, which is the worst of the
+        # three outcomes.
         if isinstance(result.output, DeferredToolRequests):
+            try:
+                await run_in_threadpool(_open_approval, run_id, result.output)
+            except Exception as exc:
+                await run_in_threadpool(
+                    runs.set_status, run_id, RunStatus.FAILED, str(exc)
+                )
+                raise
             return
         await run_in_threadpool(runs.set_status, run_id, RunStatus.COMPLETED)
 

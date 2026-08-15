@@ -16,16 +16,21 @@ Options:   the candidate readings, if there is more than one
 
 ## Open
 
-Q-12, Q-17, Q-18, Q-19. Each is recorded in full below, in number order,
-alongside the resolved entries rather than duplicated here. This index was stale
-while Q-12 was open and is corrected as part of recording Q-14 through Q-17.
-Q-13 was withdrawn on 2026-08-15 as false when written; the entry is kept.
+Q-17, Q-18, Q-19. Each is recorded in full below, in number order, alongside the
+resolved entries rather than duplicated here. Q-13 was withdrawn on 2026-08-15
+as false when written; the entry is kept.
 
 Q-14, Q-15, and Q-16 were resolved on 2026-08-15 and moved out of this list.
 Q-14 and Q-16 by D-52; Q-15 by the user removing `T00A spike build` from
 master's required status checks, after which `spike/` and its CI job were
 deleted in D-13's order. Q-18 and Q-19 are recorded by T12A and neither blocks
 it.
+
+Q-12 was resolved on 2026-08-15 by D-54, which ratifies the merged T10 kernel
+expansion retrospectively and unpriced. Q-17 stays open on its narrower residue:
+D-50 fixed the code and D-54 records the D-31 process failure, but whether gate
+authorship should be separated from implementation authorship is a schedule
+question neither answers.
 
 ---
 
@@ -453,8 +458,8 @@ Resolution: B. D-48 records the file expansion, minimum-authority SQL,
 
 ## Q-12  The frozen tool order prevents replay after a committed delete
 Task:      T10
-Blocking:  yes
-Status:    OPEN, reproduced on 2026-08-14
+Blocking:  was yes
+Status:    RESOLVED by D-54, authorized by the user on 2026-08-15
 Context:   BUILD_SPEC section 10 and the Opus `create_task` reference require
            every tool to run `policy.check` before `idempotency.acquire`, and
            the reference explains why: a refused call must take no lease.
@@ -494,9 +499,15 @@ Options:   A. Add an Opus-owned, read-only completed-replay preflight before
            D. Declare committed delete replay unsupported. This preserves the
               printed order but weakens the task-boundary resumability and
               duplicate-call claims without a recorded architecture decision.
-Resolution: Pending. Option A is the narrowest design that preserves both
-           security and replay semantics, but it requires Opus-owned kernel
-           work and explicit authorization before T10 can continue.
+Resolution: A, ratified retrospectively by D-54 on 2026-08-15. Option A was the
+           narrowest design that preserves both security and replay semantics,
+           and `idempotency.replay_completed` shipped with T10 implementing it.
+           The authorization this entry required did not precede the code, which
+           is the D-31 process failure D-54 records. The ratification is
+           unpriced and changes no schedule number, because the work was
+           absorbed inside activity F and creates no prospective demand. It is
+           explicitly not precedent for editing a KERNEL file before the
+           re-plan D-31 requires.
 
 ## Q-13  WITHDRAWN. T12A cannot start because T11 never ran
 Task:      T12A

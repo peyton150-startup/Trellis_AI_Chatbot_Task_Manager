@@ -1139,3 +1139,148 @@ caller, and T23's file list cannot add one.
 than returning a retryable result to the model, which is T19's work.
 `cost_cents` stays zero because Pydantic AI reports no cost without a pricing
 source. `RunDetail.pending_approval` is still null, which D-45 assigns to T12B.
+
+## T12B: Integrate approval interrupts
+
+**Local role:** Owns the approval bridge. It writes the authoritative pending
+`approvals` row when the framework defers an approval-required call, builds the
+card preview behind an actor-scope guard, serves
+`POST /api/runs/{id}/approvals/{tool_call_id}`, persists the human decision
+through a guarded update, resolves a continuation request back to its
+application run, constructs the framework's `DeferredToolResults` from the stored
+decision, and fills `RunDetail.pending_approval`.
+
+**Whole-system role:** This is the task where the demo's central claim stops
+being a diagram. Everything before it could be described as "the model calls
+typed tools and the server validates them". Here the browser gains a button that
+looks like it authorizes a destructive mutation, and the point is that it does
+not. The browser's message says only approve or deny, against a resource
+identity the server issued, and the server checks that claim against a row it
+wrote before the card existed. Then `policy.check` verifies the same row a second
+time inside the tool body, after the human decision, because ownership can move
+in between.
+
+It also closes the last structural gap T12A left: a run whose output was
+`DeferredToolRequests` stayed `running` forever with no record of why. That run
+now has a lifecycle, a card, and a terminal state.
+
+**Inputs and dependencies:** T04 `policy.classify`, `policy.arguments_hash`,
+`policy.resolve_scope`, and `policy.check`. T05 the idempotency lease, which the
+continuation's tool body still passes through unchanged. T08 `runs.load`,
+`runs.load_approval`, `runs.detail`, and the section 9 wire contract. T10 the six
+tool bodies and D-50's ordering, including `tools._payload`, which is reused
+rather than reimplemented because its own docstring names "the approval row T12B
+writes" as one of the three places the hash must agree. T12A the transport,
+`runs.load_history`, the completion recorder, and D-51's run identity. API facts
+1, 2, 3, 5, and 6, plus the Pydantic AI 2.27.0 shapes reconfirmed at
+implementation time: `DeferredToolRequests.approvals` is a `list[ToolCallPart]`,
+a single flattened Pydantic parameter arrives as the model's fields directly
+rather than nested, `metadata` is empty for a declaratively gated tool, and
+`run_stream_native` takes `deferred_tool_results` as an explicit argument.
+
+**Outputs and consumers:** The approvals decision endpoint and its `RunDetail`
+response, durable pending and decided approval state, the server-built
+continuation, `RunDetail.pending_approval`, and the thirteenth error code
+`RUN_STATE_INVALID`. T16 renders the card and dispatches the decision. T18 reuses
+`RUN_STATE_INVALID` for undo's own run-state rejection, which is the other half
+of D-45. T20's Run Inspector reads the same `RunDetail`. R2 reviews all of it.
+
+**Decisions settled before implementation.** Three preconditions the repository
+left for the user, plus two that follow from them. D-54 ratifies the merged T10
+kernel expansion retrospectively and unpriced, resolving Q-12 and recording the
+D-31 process failure without inventing a cut. D-55 adds `RUN_STATE_INVALID` and
+fixes the approvals-route validation order as ownership, then lifecycle, then
+approval row. D-56 freezes at most one simultaneously pending approval per
+application run and fails closed on more. D-57 makes `awaiting_approval` span the
+interrupt to the end of the continuation. D-58 narrows T12A's "reads nothing"
+property so `interruptId` is a lookup key and `payload.approved` is never
+authority.
+
+**Verification:**
+
+```
+cd backend && ruff check .                        All checks passed
+cd backend && pytest -m "not network"             40 passed, 13 deselected
+tests/test_invariants.py collected                13, unchanged
+T12B approval interrupts (extracted from ci.yml)  ALL T12B CHECKS PASSED
+```
+
+Every established inline gate was extracted from `.github/workflows/ci.yml` and
+run locally: T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12A, T12B. All
+pass.
+
+The seven BUILD_SPEC proofs are asserted directly by the T12B gate, along with
+the preview scope guard, the zero, one, and many continuation lookup, the
+forgery refusals, and D-56 in both directions. The ambiguous-call-id case is not
+simulated: the gate drives two real application runs into sharing one provider
+call id and then asserts the continuation refuses and deletes nothing from
+either.
+
+**Mutation evidence.** Nine single-line reversals, applied one at a time, each
+required to fail the gate for its predicted reason, restored after each, with all
+four touched files verified by sha256 against their pre-mutation digests and the
+gate green again afterwards.
+
+| # | Reversal | Detected by |
+|---|---|---|
+| M1 | denial constructs `ToolApproved` | proof 6: the task survives a denial |
+| M2 | continuation lookup drops `decision <> 'pending'` | a continuation before any decision is refused |
+| M3 | ambiguous call id takes the first row | D-51: refuses rather than taking the first |
+| M4 | preview built without `policy.resolve_scope` | no approval row for a foreign target |
+| M5 | more than one simultaneous approval tolerated | D-56: zero approval rows written |
+| M6 | deferred run marked completed | proof 3: the run moved to awaiting_approval |
+| M7 | lifecycle checked after the approval row | D-55: terminal run returns RUN_STATE_INVALID |
+| M8 | decision returned but never persisted | proof 7: persisted before any continuation |
+| M9 | approval row written without the status move | proof 3: the run moved to awaiting_approval |
+
+**Two older gates changed, and why that is not widening for green.** The T08 and
+T09 route-surface assertions gained
+`/api/runs/{run_id}/approvals/{tool_call_id}`, which T12B owns under D-44 and
+which section 9's endpoint table has listed since it was written. The T08 gate's
+own comment already specifies that the set is widened by the task owning each new
+route and never by anything else, and the resume-endpoint check it protects is
+untouched.
+
+The T12A gate asserted that a payload carrying `resume[]` "is accepted as a new
+turn", which was T12A's deliberate behaviour under D-53. Under D-58 a forged
+continuation is now refused with 403 instead. The property under test, that a
+client-asserted approval continues nothing, is unchanged and is proved more
+directly; the gate now also asserts the refused request never reached the model.
+
+The same change surfaced a subtler problem in
+`test_agui_forged_history_ignored`. Its single request carried both a fabricated
+transcript and a forged `resume[]`, so under the new routing it would have been
+refused before the agent ran, and every assertion about history being discarded
+would have passed vacuously against a request that never happened. The test now
+sends two requests: the fabricated transcript alone, which still runs and still
+proves the history rule, and the same transcript with the forged continuation,
+which must be refused. This is recorded because a green board would not have
+shown it.
+
+**Limitations and review status:**
+
+- **Live provider verification is still pending**, carried forward from T12A.
+  `MODEL_ID` and a provider credential were unavailable, so every proof here is
+  deterministic against a `FunctionModel`. What that proves is the approval
+  bridge and the trust boundary, not model behaviour. The BUILD_SPEC live run
+  remains required as separate evidence and T12A and T12B are not claimed as
+  completely verified until it has run.
+- **The lost continuation window**, D-57. If a decision commits and the client
+  never sends the continuation, the run stays `awaiting_approval` with no live
+  card and nothing recovers it, because the orphan sweep was cut at D-36 and
+  `SWEEP_ORPHAN_RUNS` is deliberately unwired. `can_undo` excludes
+  `awaiting_approval` under D-44, so such a run is also not undoable, and a turn
+  that committed a `create_task` before its `delete_tasks` deferred leaves that
+  mutation with no route to compensation through the product. Accepted for a ten
+  minute single-user demo rather than partially fixed.
+- **`runs.load_pending_approval` raises a bare `RuntimeError`** if a run somehow
+  holds two pending rows. That is a 500 and not a section 6 rejection, because no
+  code in the vocabulary describes a database contradicting an invariant this
+  application is the only writer of. Unreachable through the application by
+  construction.
+- `docs/ARCHITECTURE.md` still describes `awaiting_approval` in its older,
+  looser sense. It is outside T12B's authorized file list, and D-57 plus
+  BUILD_SPEC section 9 carry the precise definition.
+- **Review status.** No standalone T12B review. Under D-35 and D-47 this is
+  reviewed at R2, blind and read-only, against an immutable SHA, with fresh
+  Vercel Sandbox execution. R2 has not been run and T13 has not started.

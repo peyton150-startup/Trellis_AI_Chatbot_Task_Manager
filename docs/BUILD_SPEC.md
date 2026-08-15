@@ -487,7 +487,7 @@ Pagination anywhere it appears is keyset, never `OFFSET`. Every list query has a
 
 ### `errors.py`
 
-Exactly these error codes. Every rejection in the system uses one of them. No ad hoc strings.
+Exactly these thirteen error codes. Every rejection in the system uses one of them. No ad hoc strings. The table closed at twelve until T12B added `RUN_STATE_INVALID` under D-55; adding a fourteenth is a KERNEL edit and trips D-31 the same way.
 
 ```python
 class PolicyError(Exception):
@@ -510,6 +510,19 @@ class PolicyError(Exception):
 | `TOOL_TIMEOUT` | 504 | Tool exceeded `TOOL_TIMEOUT_SECONDS` |
 | `MODEL_TIMEOUT` | 504 | Model call exceeded `MODEL_TIMEOUT_SECONDS` |
 | `VALIDATION_ERROR` | 422 | Pydantic schema rejection |
+| `RUN_STATE_INVALID` | 409 | A resolved, actor-owned run whose current status forbids the requested action |
+
+`RUN_STATE_INVALID` is the thirteenth code, added at T12B under D-55. D-45 had
+recorded that no legal code expressed this rejection and required it settled
+before T12B and T18, both of which reject on run state, and it explicitly
+forbade bending `VALIDATION_ERROR`, `OUT_OF_SCOPE`, or the approval-specific
+codes to fit.
+
+It is reached only after ownership has already resolved. A run that does not
+exist and a run belonging to another actor both stay `OUT_OF_SCOPE`, so this
+code never distinguishes them and the non-enumeration property is unchanged.
+The approvals route validates in that order: ownership, then lifecycle, then the
+approval row.
 
 ### `policy.py`
 
@@ -722,7 +735,7 @@ Each remaining row belongs to the task that owns its behavior, under D-44: T08 b
 - If a request body contains any key not in its model, return 422. Do not ignore the extra key. Do not merge it.
 - The server never reads message history, tool calls, approvals, or run state from a request body. It loads them from `agent_runs` and `approvals`.
 - There is no endpoint that accepts message history.
-- **The client never supplies an authoritative run id.** The server never accepts a run id it did not issue. That rule has two shapes, and D-51 separates them because the single universal wording could not describe an initial AG-UI turn, whose application run does not exist yet, and because its status clause required a rejection the twelve error codes in section 6 cannot express, which is the gap D-45 deferred to T12B and T18.
+- **The client never supplies an authoritative run id.** The server never accepts a run id it did not issue. That rule has two shapes, and D-51 separates them because the single universal wording could not describe an initial AG-UI turn, whose application run does not exist yet, and because its status clause required a rejection the twelve error codes in section 6 could not express, which is the gap D-45 deferred to T12B and T18. T12B closed it with the thirteenth code, `RUN_STATE_INVALID`, under D-55.
 
   **Operating on an existing run** (`GET /api/runs/{id}`, the approvals decision, undo): a browser thread or run identifier arriving in the request is a lookup key, not a grant. The server resolves it to an `agent_runs` row and rejects the request unless that row exists, belongs to `actor_id`, and is in a status that permits the requested action. History is then loaded from that resolved row.
 
@@ -763,6 +776,16 @@ Each remaining row belongs to the task that owns its behavior, under D-44: T08 b
 ```
 
 `status: "deduplicated"` is a display value computed when a lease returned REPLAY. It is not a database enum value.
+
+**`awaiting_approval` means approval-controlled execution has not continued yet. It does not mean a human decision is still outstanding.** Those are different, and the window between them is real: under D-58 the approvals route persists the decision and returns without executing, and the continuation arrives as a separate request. So the status spans from the interrupt to the end of the continuation, and `pending_approval` goes null the moment the decision is persisted, because that field means "something needs your decision now" and in that window nothing does.
+
+```text
+interrupt          ->  awaiting_approval, pending_approval = the card
+decision persisted ->  awaiting_approval, pending_approval = null
+continuation ends  ->  completed or failed, pending_approval = null
+```
+
+`awaiting_approval` beside `pending_approval: null` is therefore correct rather than contradictory. D-57 records why the run does not return to `running` on decision: it would make `APPROVAL_ALREADY_DECIDED` structurally unreachable on the only route that raises it. D-57 also records the accepted limitation, which is that a client that never sends the continuation strands the run in this status with no live card and no undo, because the orphan sweep was cut at D-36.
 
 ---
 
@@ -1020,7 +1043,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T10 | Tools | MIXED, see below | `tools.py` | Each tool callable directly, five-step body identical |
 | T11 | Prompts | SOL | `prompts.py` | `render_task_block` output inspected both ways |
 | T12A | Integrate the proven AG-UI transport | **OPUS ONLY** | `agent.py`, `main.py` | See T12A proof list below |
-| T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py`, `runs.py`, `sql.py` | See T12B proof list below. Owns `POST /api/runs/{id}/approvals/{tool_call_id}`, approval creation and decision, and `RunDetail.pending_approval`, which is null until here under D-45. Must also settle what that field means when one turn produces more than one approval-required call, and the invalid-run-state error code D-45 records as missing. |
+| T12B | Integrate approval interrupts | **OPUS ONLY** | `agent.py`, `main.py`, `runs.py`, `sql.py`, `errors.py`, `tests/test_invariants.py` | See T12B proof list below. Owns `POST /api/runs/{id}/approvals/{tool_call_id}`, approval creation and decision, and `RunDetail.pending_approval`, which is null until here under D-45. File list expanded under D-55: the invalid-run-state code D-45 records as missing became `RUN_STATE_INVALID` in KERNEL `errors.py`, and D-58's decision-forgery scenarios join the existing `test_forged_approval_rejected` rather than adding a fourteenth name. D-56 settles the multiple-approval question by freezing at most one simultaneously pending approval per application run. |
 | R2 | Blind review and execution checkpoint 2 | NON-AUTHORING MODEL + HUMAN | T10 reference tool, T11, and T12A/T12B boundary changes | See the R2 review and execution gate below. The same immutable SHA passes review, fresh-sandbox execution, lint, deterministic tests, and the production build before T13. |
 | T13 | Board and task card | SOL | `Board.tsx`, `TaskCard.tsx`, `useBoard.ts`, `api.ts`, `types.ts` | Board renders seed data |
 | T14 | Chat | SOL | `Chat.tsx` | Streaming turn visible, board refetches after tool completion. See the assistant-ui ownership note below. |

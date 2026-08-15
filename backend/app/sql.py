@@ -346,6 +346,78 @@ UPDATE approvals
 RETURNING *;
 """
 
+# T12B. The live card for one run, for RunDetail.pending_approval.
+#
+# SELECT_APPROVAL cannot serve: it is keyed on (run_id, tool_call_id) and a
+# RunDetail read knows only the run. Both predicates below are load bearing. A
+# decided row is not a card, and D-56 freezes at most one simultaneously pending
+# approval per application run, so a row that survived its expiry must not be
+# rendered as something the user can still act on.
+#
+# No LIMIT, on the reasoning D-39 recorded for SELECT_ALL_EVENTS_FOR_RUN and
+# D-42 repeated for SELECT_INVOCATIONS_FOR_RUN. A bound here would not return a
+# shorter answer, it would hide a violated invariant behind a plausible one. The
+# caller counts the rows and refuses rather than taking the first, because
+# taking the first is the rule D-45 names and rejects.
+SELECT_PENDING_APPROVALS_FOR_RUN = """
+SELECT *
+  FROM approvals
+ WHERE run_id = %(run_id)s
+   AND decision = 'pending'
+   AND expires_at > now()
+ ORDER BY tool_call_id;
+"""
+
+# T12B, the D-51 continuation lookup: interruptId -> tool_call_id -> approval
+# row -> agent_runs.id.
+#
+# approvals is PRIMARY KEY (run_id, tool_call_id), so a provider-generated call
+# id is unique within a run and not across runs. D-51 requires the resolution to
+# distinguish zero eligible rows, which refuses, exactly one, which resolves,
+# and more than one, which refuses as ambiguous. There is deliberately no LIMIT
+# and no appeal to identifier entropy: probability is not uniqueness.
+#
+# The join is what actor scopes it. approvals carries no actor, so without it a
+# call id would enumerate another actor's pending approval. The status predicate
+# means a replayed continuation against a run that already finished resolves
+# nothing, so a double continuation is refused at the transport rather than left
+# to the idempotency lease.
+#
+# decision <> 'pending' is the ordering rule from BUILD_SPEC section 10 stated as
+# a predicate: the server persists the human decision before it constructs any
+# framework continuation, so a continuation naming an undecided row is not
+# eligible. Expiry is deliberately not filtered here; policy.check step 5c is the
+# authority on it and runs inside the tool body on every path. See D-58.
+SELECT_APPROVAL_FOR_CONTINUATION = """
+SELECT a.*
+  FROM approvals a
+  JOIN agent_runs r ON r.id = a.run_id
+ WHERE a.tool_call_id = %(tool_call_id)s
+   AND a.decision <> 'pending'
+   AND r.actor_id = %(actor_id)s
+   AND r.status = 'awaiting_approval'
+ ORDER BY a.run_id;
+"""
+
+# T12B. The preview read, for the approval card only.
+#
+# Minimum authority on purpose. SELECT_TASKS_BY_IDS_FOR_UPDATE would serve the
+# same rows but takes row locks for a read that mutates nothing and holds them
+# for the length of an approval the user may never answer.
+# SELECT_TASKS_FOR_OWNER cannot serve: it has no id filter and carries a LIMIT.
+#
+# owner_id is defence in depth rather than the scope check. The scope check is
+# policy.resolve_scope, which runs first and refuses the whole call before any
+# task detail is fetched, because a preview built from a foreign row has already
+# disclosed it by the time an authoritative check could catch the mutation.
+SELECT_TASKS_BY_IDS_FOR_OWNER = """
+SELECT *
+  FROM tasks
+ WHERE owner_id = %(owner_id)s
+   AND id = ANY(%(task_ids)s::uuid[])
+ ORDER BY id;
+"""
+
 INSERT_RUN = """
 INSERT INTO agent_runs (actor_id, prompt, model)
 VALUES (%(actor_id)s, %(prompt)s, %(model)s)
