@@ -2,6 +2,15 @@
 
 >One-week AI budget constraint: I built this project using Claude Code on a Claude Pro plan and Codex on a ChatGPT Plus plan. I intentionally limited myself to one week of included usage from each plan, so model selection, task routing, review depth, and implementation order all had to fit inside a fixed usage budget. Managing that constraint without sacrificing the correctness-critical reviews was one of the main challenges of the project.
 
+## Development workflow
+
+This project was not built as a single-pass AI generation exercise. I used a repeated engineering loop:
+
+**Plan → challenge the plan → implement → verify → independent review → discuss findings → fix → re-verify → PR → merge**
+
+Claude Code and Codex were assigned work based on the risk of the task, while I controlled the architecture, resolved disagreements, decided which findings were valid, approved scope changes, and performed the final merges.
+
+For correctness-sensitive boundaries, implementation and review were deliberately separated. Review findings could send the work back through the loop until the relevant tests, CI gates, and architectural invariants passed.
 
 An LLM-powered todo application built as a technical interview artifact.
 
