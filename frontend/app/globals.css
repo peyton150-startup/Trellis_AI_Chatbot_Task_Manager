@@ -1,0 +1,257 @@
+:root {
+  --canvas: #eef1f4;
+  --surface: #ffffff;
+  --ink: #14212b;
+  --muted: #65717b;
+  --line: #cbd3d9;
+  --focus: #145f75;
+  --low: #7a8791;
+  --medium: #31758a;
+  --high: #c46b25;
+  --critical: #b33a32;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    linear-gradient(rgba(20, 33, 43, 0.035) 1px, transparent 1px),
+    var(--canvas);
+  background-size: 100% 24px;
+  color: var(--ink);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+button {
+  border: 1px solid var(--ink);
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  padding: 0.58rem 0.8rem;
+}
+
+button:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--surface);
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+button:focus-visible,
+summary:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 1500px;
+  padding: clamp(1rem, 3vw, 3rem);
+}
+
+.page-header {
+  align-items: end;
+  border-bottom: 3px solid var(--ink);
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 34rem);
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+}
+
+.page-header__eyebrow,
+.task-card__header,
+.task-card__facts dt,
+.task-card__record dt {
+  font-family: "Courier New", Courier, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.page-header__eyebrow {
+  color: var(--focus);
+  font-size: 0.76rem;
+  font-weight: 700;
+  margin: 0 0 0.35rem;
+}
+
+h1 {
+  font-size: clamp(2.25rem, 6vw, 5.2rem);
+  letter-spacing: -0.055em;
+  line-height: 0.85;
+  margin: 0;
+}
+
+.page-header__note {
+  color: var(--muted);
+  line-height: 1.45;
+  margin: 0;
+  max-width: 52ch;
+}
+
+.board__toolbar {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.board__toolbar p {
+  margin: 0;
+}
+
+.board__stale,
+.board-state {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  margin: 0;
+  padding: 1rem;
+}
+
+.board-state--error,
+.board__stale {
+  border-left: 5px solid var(--critical);
+}
+
+.board-state button {
+  margin-top: 0.75rem;
+}
+
+.board__grid {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+}
+
+.task-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: 6px solid var(--medium);
+  min-width: 0;
+  padding: 1rem;
+}
+
+.task-card[data-priority="low"] {
+  border-top-color: var(--low);
+}
+
+.task-card[data-priority="high"] {
+  border-top-color: var(--high);
+}
+
+.task-card[data-priority="critical"] {
+  border-top-color: var(--critical);
+}
+
+.task-card__header {
+  display: flex;
+  font-size: 0.7rem;
+  font-weight: 700;
+  justify-content: space-between;
+}
+
+.task-card__priority {
+  color: var(--muted);
+}
+
+.task-card h2 {
+  font-size: 1.12rem;
+  line-height: 1.25;
+  margin: 1rem 0 0.55rem;
+}
+
+.task-card__notes {
+  line-height: 1.4;
+  margin: 0 0 1rem;
+  min-height: 2.8em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.task-card__facts,
+.task-card__record dl {
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.task-card__facts div,
+.task-card__record dl div {
+  min-width: 0;
+}
+
+.task-card__facts dt,
+.task-card__record dt {
+  color: var(--muted);
+  font-size: 0.64rem;
+}
+
+.task-card__facts dd,
+.task-card__record dd {
+  font-size: 0.82rem;
+  margin: 0.18rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.task-card__blocked {
+  border-left: 3px solid var(--high);
+  font-size: 0.76rem;
+  margin: 1rem 0 0;
+  padding-left: 0.55rem;
+}
+
+.task-card__blocked code {
+  overflow-wrap: anywhere;
+}
+
+.task-card__record {
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.78rem;
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+}
+
+.task-card__record summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.task-card__record dl {
+  margin-top: 0.8rem;
+}
+
+@media (max-width: 720px) {
+  .page-header {
+    align-items: start;
+    grid-template-columns: 1fr;
+  }
+
+  .board__toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+  }
+}

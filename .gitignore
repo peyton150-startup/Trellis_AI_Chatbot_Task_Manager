@@ -2,3 +2,13 @@
 # and by any task that installs backend dependencies, so it appears in every
 # worktree and would otherwise be committed by a careless `git add -A`.
 .venv/
+
+# Tool-local state is never repository content. Claude Flow and its related
+# stores are prohibited for this project by the user's 2026-08-15 instruction.
+.claude-flow/
+.ruflo/
+.ruvector/
+
+# Production frontend install and build outputs.
+frontend/node_modules/
+frontend/.next/

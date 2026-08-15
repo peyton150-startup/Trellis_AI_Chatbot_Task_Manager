@@ -58,7 +58,7 @@ The required checks are named `T00 API probe`, `T00A spike build`, `T00R probe h
 ```text
 cd backend && ruff check .
 cd backend && pytest -m "not network"
-npm run build
+cd frontend && npm run build
 ```
 
 The working directory is part of the contract. Ruff resolves configuration by directory hierarchy, so `backend/pyproject.toml` governs `backend/` and nothing else, and a bare `ruff check` from the repository root would also lint the disposable `spike/` tree.
@@ -70,6 +70,9 @@ The working directory is part of the contract. Ruff resolves configuration by di
 
 ## Code and workflow conventions
 
+- Never use Claude Flow for this project. Exclude `.claude-flow/`, `.ruflo/`,
+  and `.ruvector/` from repository content, task context, verification scope,
+  commits, reviews, and pull requests.
 - One task, one commit, with message `T##: <task name>`.
 - From T07 forward, follow the compressed review schedule in `docs/BUILD_SPEC.md` section 1A. Implementation, commits, and verification stay task-local; only dedicated review is batched. Stop at the review checkpoints after T08 and T12B. R2, the checkpoint after T12B, must pass before T13 starts. After T15 is green, reduce review depth as specified there.
 - Open a separate PR after T00 and after T00A. Pause after the T00A PR for user review.
@@ -87,7 +90,7 @@ The working directory is part of the contract. Ruff resolves configuration by di
   3. **Reconcile.** Revisit the phase 1 findings against what execution showed. Confirm, withdraw, or add, and report which happened to each.
 - Read before execute, because a reviewer that sees a green board first anchors on it and stops looking. Findings the gate cannot reach are the ones worth having: the T00B review on 2026-08-13 found that `docs/DECISIONS.md` recorded fact 4 as tested across ten cases including cleared labels and a cleared project, while the shipped probe tested at most eight and cleared nothing. That is invisible to every passing test and was found by reading.
 - The execution phase runs in a Vercel Sandbox against a pinned commit SHA, never in a live worktree and never on the host. Name the Vercel Sandbox in the reviewer's prompt every time, including for a small or targeted follow-up pass. "An isolated clone" is not a substitute and does not satisfy this rule: a clone isolates the repository from the agent, while the sandbox isolates the host from whatever the agent runs. If a sandbox genuinely cannot be provisioned, the reviewer reports the failure verbatim, falls back to the pinned clone, and labels every result with the environment that produced it, so a host-run result is never mistaken for a sandboxed one.
-- The pinned-clone fallback does not apply to R2. R2 is a same-SHA review and execution gate: the blind review must have no unresolved BLOCK findings; that exact SHA must boot and complete the T12A/T12B verification path in a fresh Vercel Sandbox; `cd backend && ruff check .`, `cd backend && pytest -m "not network"`, and `npm run build` must pass. A sandbox provisioning or execution failure is an R2 BLOCK. Any fix that changes the SHA invalidates the entire R2 result and requires the blind review, fresh-sandbox execution, and all three deterministic gates to rerun before T13.
+- The pinned-clone fallback does not apply to R2. R2 is a same-SHA review and execution gate: the blind review must have no unresolved BLOCK findings; that exact SHA must boot and complete the T12A/T12B verification path in a fresh Vercel Sandbox; `cd backend && ruff check .` and `cd backend && pytest -m "not network"` must pass. At the reviewed SHA `09b75db`, the frontend build gate applied only if a tracked production `package.json` existed; none did, so that gate was N/A. Beginning with T13, `cd frontend && npm run build` is an unconditional cumulative gate. A sandbox provisioning or execution failure is an R2 BLOCK. Any fix that changes the SHA invalidates the entire R2 result and requires the blind review, fresh-sandbox execution, and all applicable deterministic gates to rerun before T13.
 - The reviewer records both the SHA reviewed and the SHA it executed against, and states plainly which claims it could not independently verify, such as anything needing a live credential the sandbox is deliberately denied. Executing in a sandbox is not an exception to the read-only rule above: the agent still must not edit, generate, stage, or commit repository content.
 - Terra review does not replace Opus when the routing table says `SOL WRITES, OPUS REVIEWS` or otherwise requires Opus review.
 - Kernel files are transcription-only. Preserve the specified check order and transaction boundaries.

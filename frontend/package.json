@@ -1,0 +1,30 @@
+{
+  "name": "trellis-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10.9.8",
+  "engines": {
+    "node": "^22 || ^24 || >=26"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@ag-ui/client": "0.0.58",
+    "@assistant-ui/react": "0.15.14",
+    "@assistant-ui/react-ag-ui": "0.0.54",
+    "next": "16.3.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2"
+  }
+}
