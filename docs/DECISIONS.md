@@ -253,6 +253,12 @@ existing decision above is amended.
 
 ### D-12: conditional approval raises at tool step 0
 
+**Superseded in part by D-59.** In the ordering sentence below, only the clause
+"ahead of `arguments_hash`" is superseded. The clause "ahead of
+`idempotency.acquire`", and the `LEASE_IN_FLIGHT` deadlock rationale this entry
+gives for it, remain in force and are restated in D-59. No sentence in this
+entry has been rewritten.
+
 API fact 4 established that `requires_approval` accepts only a boolean, so
 `delete_tasks` gates declaratively while `bulk_update_tasks` must raise
 `ApprovalRequired` from inside its own tool body, guarded by
@@ -2261,3 +2267,107 @@ collected count is meant to equal the count of proven invariants.
 `pytest.mark.parametrize` is not used: it keeps one function name but reports
 one collected item per case, so it would break the property while appearing to
 respect it.
+
+### D-59: the completed-replay preflight precedes the D-12 raise, and only D-12's `arguments_hash` clause is superseded
+
+D-12 states that the `ApprovalRequired` raise is step 0 of the tool body, "ahead
+of `arguments_hash` and ahead of `idempotency.acquire`". The shipped mutating
+tool bodies compute `arguments_hash` and run an actor-bound completed-replay
+preflight before that raise. R2's blind reviewer found the deviation and
+correctly reported that no decision ratified it, unlike the analogous
+scope-before-raise fix recorded in D-50 and D-54.
+
+This entry ratifies the implemented ordering. The supersession is narrow. D-12
+gives a stated rationale only for the second clause, that a deferring pass which
+acquires a lease deadlocks its own approved continuation with `LEASE_IN_FLIGHT`.
+That rationale is correct, that clause is untouched, and it is restated as
+invariant 2 below. The first clause, "ahead of `arguments_hash`", carries no
+stated justification anywhere in D-12 and is the only thing superseded here.
+
+The normative ordering for an approval-sensitive mutating tool body is:
+
+```text
+arguments hash
+-> actor-bound completed-replay preflight, read only. It takes no lease,
+   reacquires nothing, and steals nothing. It resolves run ownership first and
+   refuses a foreign or missing run terminally. It sits ahead of policy because
+   policy's scope load is what makes a committed result unreachable once its
+   target rows are gone, which any mutating tool can reach and `delete_tasks`
+   reaches every time.
+-> fresh-call scope resolution and approval classification
+-> `ApprovalRequired` when required and not already approved
+-> `policy.check`, the authoritative gate, run on every path including the
+   approved one, against the stored `approvals` row
+   -> on `OutOfScopeError`, one further actor-bound `replay_completed` attempt,
+      because the preflight can observe `pending` and lose a race to a lease
+      holder that commits and removes the target between the two reads. Return
+      the replay if found, otherwise re-raise. Interpretation of lease state
+      stays inside `idempotency`, and the second call remains actor bound, tool
+      bound, and hash bound, so it can only return a result this caller was
+      already authorized for.
+-> `idempotency.acquire`, strictly after `policy.check`
+-> one transaction: the mutation, its `task_events`, and `idempotency.complete`
+```
+
+Two invariants are load bearing, and neither may be relaxed by a later
+transcription:
+
+1. `idempotency.acquire` never moves ahead of `policy.check`. A refused fresh
+   call must take no lease.
+2. `idempotency.acquire` never moves ahead of the `ApprovalRequired` raise. This
+   is D-12's original property, unchanged: a deferring pass that took a lease
+   would deadlock its own approved continuation.
+
+The preflight is safe ahead of the raise because it acquires no mutation
+authority. Its only purpose is to return a result that already committed.
+
+The `OutOfScopeError` recovery branch is part of the normative structure, not an
+implementation detail. Flattening this ordering into a straight line would omit
+exactly the race the replay machinery exists to handle, and five of the six tool
+bodies were transcribed by following a printed structure.
+
+**Evidence.** R2's reviewer built an adversarial probe against
+`tools.bulk_update_tasks` rather than accepting the reference docstring's
+argument. An unapproved call raised `ApprovalRequired` with zero rows in
+`tool_invocations`, proving the deferring pass takes no lease. The same
+`tool_call_id` retried after server approval committed once, with the lease
+showing `completed` only on the approved pass. A third identical call replayed
+the stored result byte for byte with no further mutation. Recorded at reviewed
+and executed SHA `09b75db`.
+
+This entry ratifies the existing implementation. No code changes.
+
+### D-60: UTF-8 PostgreSQL is an explicit runtime assumption, recorded and not enforced
+
+The application assumes a UTF-8 PostgreSQL database.
+
+R2's reviewer reported five deterministic test failures, bytes versus str
+comparisons, under a natively initialized PostgreSQL 16 cluster whose `initdb`
+ran with the host default locale and produced `SQL_ASCII`. Reinitializing with
+`--encoding=UTF8 --locale=C.utf8` cleared all five, and the deterministic suite
+finished at 40 passed, 13 deselected. This repository has not independently
+reproduced that failure outside R2, and the account is recorded as
+reviewer-reported evidence rather than as a confirmed local result.
+
+The assumption is currently unenforced, and it is narrower than "CI covers it".
+`docker-compose.yml` sets `POSTGRES_DB`, `POSTGRES_USER`, and
+`POSTGRES_PASSWORD` and nothing else. It does not set `POSTGRES_INITDB_ARGS`, an
+encoding, or a locale, and no encoding or locale is pinned anywhere else in
+`docker-compose.yml`, `.github/workflows/ci.yml`, or `backend/`. Every green run
+of this suite therefore depends on the upstream `postgres:16` image's default
+`initdb` behaviour, which this repository never states and never asserts. No
+gate exercises a non-UTF-8 deployment.
+
+A one-line fix was identified and deliberately deferred. Adding
+`POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.utf8"` to
+`docker-compose.yml` would make the assumption enforced rather than recorded. It
+is deferred because R2's disposition was documentation only, and because the
+change belongs with deployment and restore validation, where verifying cluster
+encoding is a natural operational check. It is recorded here so a later reader
+knows the fix was considered rather than overlooked.
+
+Until then, a native PostgreSQL deployment must initialize the cluster or
+database as UTF-8 rather than relying on the host's default `initdb` encoding.
+The project records this as an assumption and does not claim it is enforced.
+
+No application code changes.
