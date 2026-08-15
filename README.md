@@ -1,5 +1,8 @@
 # Trellis AI Chatbot Task Manager
 
+>One-week AI budget constraint: I built this project using Claude Code on a Claude Pro plan and Codex on a ChatGPT Plus plan. I intentionally limited myself to one week of included usage from each plan, so model >selection, task routing, review depth, and implementation order all had to fit inside a fixed usage budget. Managing that constraint without sacrificing the correctness-critical reviews was one of the main challenges of >the project.
+
+
 An LLM-powered todo application built as a technical interview artifact.
 
 The todo list is intentionally simple. The engineering problem is not.
