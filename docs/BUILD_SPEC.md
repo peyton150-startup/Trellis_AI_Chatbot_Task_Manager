@@ -706,7 +706,9 @@ Exactly these endpoints. No others.
 | POST | `/api/demo/reset` | none | `{ "tasks": Task[] }` |
 | POST | `/api/agui` | AG-UI `RunAgentInput`: `threadId`, new `runId`, `messages`, `state`, `tools`, `context`, `forwardedProps`; continuation also includes `resume[]` | SSE event stream |
 
-The AG-UI transport row is the one unresolved item in this document. The exact HTTP method and request shape are determined by task T00A on Day 1 and written into `docs/DECISIONS.md`, and this table is then updated with the answer. Until T00A completes, do not implement that endpoint by guessing. This is the single permitted "TBD" in the spec; there are no others.
+The AG-UI transport row was the one unresolved item in this document. It is resolved. T00A recorded `GATE A: PASS` with the method, path, request shape, and interrupt payload, and T12A implemented that shape against the real agent. The row above now states the established contract: `POST /api/agui`, body an AG-UI `RunAgentInput`, response an SSE event stream. There are no remaining "TBD" entries in this spec.
+
+**Exactly one field of that body is accepted.** The transport takes the newest user message and constructs the payload the agent sees from scratch. `messages`, `state`, `tools`, `context`, `forwardedProps`, `resume`, `threadId`, and `runId` are listed above because the protocol sends them, not because the server reads them. See D-51.
 
 `POST /api/runs/{id}/resume` was removed from this table at T08 under D-44. D-36 credited resume and orphan sweep as "Activity S, removed in full" and spent that 0.25d inside the quantified payment for the Linear expansion, so an endpoint table that still listed it contradicted the ledger. Do not add it back, and do not add a not-implemented placeholder, which is still an endpoint. If it is ever reinstated it is `interrupted` only; approval continuation has its own bridge in section 10 and must not gain a second path around it.
 
@@ -720,7 +722,13 @@ Each remaining row belongs to the task that owns its behavior, under D-44: T08 b
 - If a request body contains any key not in its model, return 422. Do not ignore the extra key. Do not merge it.
 - The server never reads message history, tool calls, approvals, or run state from a request body. It loads them from `agent_runs` and `approvals`.
 - There is no endpoint that accepts message history.
-- **The client never supplies an authoritative run id.** A browser thread or run identifier arriving in a request is a lookup key, not a grant. The server resolves it to an `agent_runs` row and rejects the request unless that row exists, belongs to `actor_id`, and is in a status that permits the requested action. History is then loaded from that resolved row. The server never accepts a run id it did not issue.
+- **The client never supplies an authoritative run id.** The server never accepts a run id it did not issue. That rule has two shapes, and D-51 separates them because the single universal wording could not describe an initial AG-UI turn, whose application run does not exist yet, and because its status clause required a rejection the twelve error codes in section 6 cannot express, which is the gap D-45 deferred to T12B and T18.
+
+  **Operating on an existing run** (`GET /api/runs/{id}`, the approvals decision, undo): a browser thread or run identifier arriving in the request is a lookup key, not a grant. The server resolves it to an `agent_runs` row and rejects the request unless that row exists, belongs to `actor_id`, and is in a status that permits the requested action. History is then loaded from that resolved row.
+
+  **Creating a run** (`POST /api/runs`, and an initial `POST /api/agui` turn): the server creates the application run and issues its id. `/api/agui` reads no application identity from the client payload at all. `threadId`, `runId`, and any equivalent transport identifier are not resolved, not validated, and not consulted. Not reading a client-controlled authority input is a stronger property than resolving one, and a greppable one.
+
+  **Continuing an existing run** after an approval interrupt: the application run is recovered from server-owned continuation state, specifically the authoritative `approvals` row, never from a browser identifier. T12B owns that path.
 - **The AG-UI adapter must not reintroduce client-owned history.** AG-UI clients commonly send prior messages with each request. The transport handler extracts only the newest user message and discards everything else in the payload. Message history for the agent run is loaded from `agent_runs.message_history` by run id. A single function, `runs.load_history(run_id)`, is the only source of history anywhere in the codebase; no other code path constructs a message list from a request.
 
 `RunDetail` shape:
