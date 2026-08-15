@@ -1284,3 +1284,35 @@ shown it.
 - **Review status.** No standalone T12B review. Under D-35 and D-47 this is
   reviewed at R2, blind and read-only, against an immutable SHA, with fresh
   Vercel Sandbox execution. R2 has not been run and T13 has not started.
+
+## R2: review and execution checkpoint 2
+
+**Local role:** Records the R2 checkpoint that reviews the T09 through T12B
+window against the immutable SHA `09b75db`. Holds the pinned SHAs, the
+user-approved rulings, the reviewer handoff as issued, and the returned report.
+`docs/R2_REVIEW.md` is the full record; this entry is the pointer.
+
+**Whole-system role:** R2 is the gate that must pass before T13 starts. It is
+the checkpoint at which the AG-UI transport, the server-owned history, and the
+approval boundary are certified by a non-authoring reviewer against a frozen
+commit, so the trust boundary the demo claims is proven by someone who did not
+build it. It is also where the repository's own contradiction about the frontend
+build gate is recorded rather than quietly patched.
+
+**Inputs and dependencies:** R1 baseline `e9048a2`, the diff `e9048a2..09b75db`,
+`docs/BUILD_SPEC.md` section "R2 review and execution gate", the reviewer rules
+in `CLAUDE.md`, and the authoring allocation recorded in commit `761e00b`.
+
+**Outputs and consumers:** The R2 verdict gates T13. Carry-forward obligations
+CF-1 through CF-3 are consumed by T13, which must correct the `CLAUDE.md` and
+`docs/BUILD_SPEC.md` frontend build wording and add `npm run build` as an
+unconditional cumulative task gate when `frontend/package.json` lands.
+
+**Verification:** R2 passes only on the eight conditions listed in
+`docs/R2_REVIEW.md` section 7, evaluated against one immutable SHA.
+
+**Limitations and review status:** Not yet dispatched. The production Next.js
+and assistant-ui client does not exist at `09b75db`, so every T12A claim at R2
+is protocol-level against the FastAPI surface and no browser rendering claim is
+made. Live provider verification remains carried forward from T12A and T12B and
+is not resolved by R2.
