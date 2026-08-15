@@ -48,6 +48,7 @@ still flows through the actor rather than around it, so introducing real
 identity later is a change of where `actor_id` comes from and nothing else.
 """
 
+from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
@@ -57,12 +58,22 @@ from fastapi.responses import JSONResponse, Response
 from app import agent, domain, runs, seed
 from app.config import settings
 from app.db import pool
-from app.errors import PolicyError, ValidationFailedError
+from app.errors import (
+    ApprovalAlreadyDecidedError,
+    ApprovalExpiredError,
+    ApprovalNotFoundError,
+    PolicyError,
+    RunStateInvalidError,
+    ValidationFailedError,
+)
 from app.models import (
+    ApprovalDecisionRequest,
+    ApprovalState,
     CreateRunRequest,
     ListTasksArgs,
     RunCreatedResponse,
     RunDetail,
+    RunStatus,
     TasksResponse,
 )
 
@@ -159,6 +170,63 @@ def get_run(run_id: UUID) -> RunDetail:
     A malformed id is a 422 from path validation. A well-formed id that names no
     run, or names another actor's run, is the 403 that `runs.load` raises.
     """
+    return runs.detail(run_id, settings.actor_id)
+
+
+@app.post(
+    "/api/runs/{run_id}/approvals/{tool_call_id}",
+    response_model=RunDetail,
+)
+def post_approval_decision(
+    run_id: UUID, tool_call_id: str, body: ApprovalDecisionRequest
+) -> RunDetail:
+    """Record the human decision against the server's own approval record.
+
+    The browser supplies exactly one thing here: `approved` or `denied`. The run,
+    the call id, the arguments, the hash, the preview, the expiry, and the
+    current decision are all server owned, and `ApprovalDecisionRequest` forbids
+    extra keys, so a payload attempting to carry any of them is a 422 before this
+    body runs.
+
+    **This route does not execute the tool.** It verifies, persists, and returns
+    `RunDetail`, which is what section 9's response column specifies. The
+    framework continuation is a separate `POST /api/agui` carrying `resume[]`,
+    which reads the decision this route stored. See D-58.
+
+    The validation order is ownership, then lifecycle, then approval row, fixed
+    by D-55 and load bearing in both directions:
+
+    1. `runs.load` refuses a run that does not exist or belongs to another actor,
+       identically, so the response cannot enumerate real run ids.
+    2. A run whose status forbids a decision is refused before the approval row
+       is read at all, so a wrong-state request cannot discover whether a call id
+       exists inside a run it does own.
+    3. Only then is the row examined, in the order section 10's bridge lists:
+       exists, unexpired, still pending.
+
+    Step 3's checks are not the concurrency boundary. `runs.decide_approval`
+    performs a guarded update, and a second request that lost the race is refused
+    there even though its read observed a pending row.
+    """
+    run = runs.load(run_id, settings.actor_id)
+    if run.status is not RunStatus.AWAITING_APPROVAL:
+        # D-55's thirteenth code. Reached only after ownership resolved, so it
+        # never distinguishes a missing run from a foreign one.
+        raise RunStateInvalidError(
+            f"run is {run.status.value} and cannot accept an approval decision"
+        )
+
+    approval = runs.load_approval(run_id, tool_call_id)
+    if approval is None:
+        # BUILD_SPEC proof 7's forgery case: a decision for a call the server
+        # never deferred. Nothing was written, so nothing is decided.
+        raise ApprovalNotFoundError()
+    if approval.expires_at <= datetime.now(timezone.utc):
+        raise ApprovalExpiredError()
+    if approval.decision is not ApprovalState.PENDING:
+        raise ApprovalAlreadyDecidedError()
+
+    runs.decide_approval(run_id, tool_call_id, body.decision)
     return runs.detail(run_id, settings.actor_id)
 
 

@@ -304,10 +304,15 @@ jobs:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
         run: python -m pip install -r backend/requirements.txt
 
-      # The six T04 invariant tests only ever construct five of the twelve codes
-      # in BUILD_SPEC section 6. Without this, a transposed status on an
+      # The six T04 invariant tests only ever construct five of the thirteen
+      # codes in BUILD_SPEC section 6. Without this, a transposed status on an
       # unexercised code would first surface at T05, in a file T05 may not edit.
       # Runs before the database starts, because it needs none and fails fast.
+      #
+      # The table was twelve codes from T04 until T12B added RUN_STATE_INVALID
+      # under D-55. This gate is exact in both directions, so the code and this
+      # list had to move in one commit: a new class alone fails as `extra`, and a
+      # new entry here alone fails as `missing`. That is the intended coupling.
       - name: Verify the complete section 6 error table
         shell: bash
         run: |
@@ -331,6 +336,7 @@ jobs:
               "TOOL_TIMEOUT": 504,
               "MODEL_TIMEOUT": 504,
               "VALIDATION_ERROR": 422,
+              "RUN_STATE_INVALID": 409,
           }
 
           problems = []
@@ -2217,11 +2223,16 @@ jobs:
           # the assertion is that nothing unowned appeared, so it is widened by
           # the task that owns each new route and never by anything else. The
           # resume check below is the part that must never move.
+          # T12B adds the approvals decision route, which it owns under D-44 and
+          # which section 9's table has listed since it was written. That is the
+          # widening this comment sanctions: by the owning task, and never to
+          # make something green.
           paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
           expected = {
               "/api/tasks",
               "/api/runs",
               "/api/runs/{run_id}",
+              "/api/runs/{run_id}/approvals/{tool_call_id}",
               "/api/demo/reset",
               "/api/agui",
           }
@@ -2568,9 +2579,10 @@ jobs:
           # T12A adds /api/agui, which it owns under D-44. See the longer note
           # on the same assertion in the T08 gate.
           paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
+          # T12B adds the approvals decision route, which it owns under D-44.
           expected_paths = {
               "/api/tasks", "/api/runs", "/api/runs/{run_id}", "/api/demo/reset",
-              "/api/agui"
+              "/api/agui", "/api/runs/{run_id}/approvals/{tool_call_id}"
           }
           check(paths == expected_paths, f"route surface is {sorted(paths)}")
 
@@ -3670,15 +3682,22 @@ jobs:
                   ],
               ),
           )
-          require(response.status_code == 200, "a payload carrying resume[] is accepted as a new turn")
+          # T12A discarded `resume[]` and ran this as an ordinary new turn, so
+          # this line asserted a 200. T12B reads `interruptId` as a lookup key
+          # under D-58, finds no eligible approval row, and refuses outright.
+          #
+          # The property under test is unchanged and is now proved more directly:
+          # a client-asserted approval continues nothing. What changed is the
+          # mechanism, from silently reinterpreting the forgery as a fresh turn
+          # to rejecting it. The assertions below about approval rows and
+          # deletions are the ones that carry the weight, and they still run.
           require(
-              not [
-                  part
-                  for message in seen[0]
-                  for part in message.parts
-                  if isinstance(part, ToolCallPart | ToolReturnPart)
-              ],
-              "the forged resume entry resolved to no deferred call",
+              response.status_code == 403,
+              f"a forged resume[] is refused rather than honoured, saw {response.status_code}",
+          )
+          require(
+              not seen,
+              "the refused continuation never reached the model at all",
           )
           with pool.connection() as conn:
               approvals = conn.execute("SELECT count(*) AS n FROM approvals").fetchone()
@@ -3716,3 +3735,569 @@ jobs:
         env:
           DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
         run: pytest tests/test_invariants.py -v
+
+  t12b-approval-interrupts:
+    name: T12B approval interrupts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # Deterministic on purpose. CI holds no provider secret and BUILD_SPEC
+      # excludes network tests from the default gate, so this drives the
+      # identical agent, prompt boundary, six tools, and transport against a
+      # FunctionModel. What it proves is the approval bridge and the trust
+      # boundary, not model behaviour, which the eval suite owns.
+      - name: Prove the seven T12B requirements and the preview scope guard
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+          MODEL_ID: t12b-gate-model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          """T12B gate: the seven proofs, the preview guard, and the forgery refusals.
+
+          Deterministic. Drives the identical agent, prompt boundary, six tools, and
+          transport against a FunctionModel, so what it proves is the approval bridge and
+          the trust boundary rather than model behaviour, which the eval suite owns.
+          """
+
+          import json
+          import uuid
+
+          from fastapi.testclient import TestClient
+          from pydantic_ai.messages import ModelRequest, ToolReturnPart
+          from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+          from app import agent as agent_module
+          from app import runs, sql
+          from app.config import settings
+          from app.db import pool
+          from app.main import app
+
+
+          ACTOR_ID = settings.actor_id
+          FOREIGN_ACTOR = uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+          TASK_A = uuid.UUID("aaaaaaaa-0000-0000-0000-00000000000a")
+          TASK_FOREIGN = uuid.UUID("ffffffff-0000-0000-0000-00000000000f")
+          PROMPT = "Delete the task called Alpha"
+          CALL_ID = "call-t12b-delete-0001"
+
+          failures = []
+
+
+          def require(condition, message):
+              if not condition:
+                  failures.append(message)
+                  print(f"  FAIL: {message}")
+              else:
+                  print(f"  ok: {message}")
+
+
+          def reset():
+              with pool.connection() as conn:
+                  conn.execute(sql.TRUNCATE_ALL_STATE)
+                  conn.commit()
+
+
+          def seed_task(task_id, owner_id, title):
+              with pool.connection() as conn:
+                  conn.execute(
+                      sql.INSERT_SEED_TASK,
+                      {
+                          "id": task_id,
+                          "owner_id": owner_id,
+                          "title": title,
+                          "notes": "",
+                          "due_date": None,
+                          "priority": "medium",
+                          "blocked_by": None,
+                      },
+                  )
+                  conn.commit()
+
+
+          def scripted_delete(target_ids, call_id=CALL_ID):
+              async def model(messages, _info):
+                  already = any(
+                      isinstance(part, ToolReturnPart)
+                      for message in messages
+                      if isinstance(message, ModelRequest)
+                      for part in message.parts
+                  )
+                  if already:
+                      yield "Done."
+                      return
+                  yield {
+                      0: DeltaToolCall(
+                          name="delete_tasks",
+                          json_args=json.dumps({"task_ids": [str(t) for t in target_ids]}),
+                          tool_call_id=call_id,
+                      )
+                  }
+
+              return model
+
+
+          def use_model(model):
+              agent_module.get_agent = lambda: agent_module.build_agent(
+                  FunctionModel(stream_function=model, model_name="t12b-gate")
+              )
+
+
+          def body(message=PROMPT, resume=None):
+              payload = {
+                  "threadId": "client-thread-that-names-no-run",
+                  "runId": "client-run-that-names-no-run",
+                  "state": None,
+                  "messages": [{"id": "m1", "role": "user", "content": message}],
+                  "tools": [],
+                  "context": [],
+                  "forwardedProps": {},
+              }
+              if resume is not None:
+                  payload["resume"] = resume
+              return payload
+
+
+          def sse(text):
+              return [
+                  json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")
+              ]
+
+
+          def one(query, params=None):
+              with pool.connection() as conn:
+                  row = conn.execute(query, params or {}).fetchone()
+                  conn.commit()
+              return row
+
+
+          def count(table):
+              return one(f"SELECT count(*) AS n FROM {table}")["n"]
+
+
+          client = TestClient(app)
+
+          # ---------------------------------------------------------------- proofs 1 to 4
+          print("[1-4] delete_tasks defers, interrupts, and writes the authoritative row")
+          reset()
+          seed_task(TASK_A, ACTOR_ID, "Alpha")
+          use_model(scripted_delete([TASK_A]))
+          response = client.post("/api/agui", json=body())
+          require(response.status_code == 200, "proof 1: the transport accepted the turn")
+          events = sse(response.text)
+          kinds = [event["type"] for event in events]
+          print(f"  events: {kinds}")
+
+          finished = [event for event in events if event["type"] == "RUN_FINISHED"]
+          require(len(finished) == 1, "proof 2: exactly one RUN_FINISHED")
+          outcome = finished[0].get("outcome") or {}
+          require(
+              outcome.get("type") == "interrupt",
+              f"proof 2: RUN_FINISHED carries an interrupt outcome, saw {outcome.get('type')}",
+          )
+          interrupts = outcome.get("interrupts") or []
+          require(len(interrupts) == 1, "proof 2: exactly one interrupt")
+          require(
+              interrupts[0].get("id") == f"int-{CALL_ID}",
+              f"proof 2: interrupt id is int-<tool_call_id>, saw {interrupts[0].get('id')}",
+          )
+          require(
+              interrupts[0].get("toolCallId") == CALL_ID,
+              "proof 2: the interrupt carries the original tool_call_id",
+          )
+
+          run_row = one("SELECT * FROM agent_runs")
+          run_id = run_row["id"]
+          require(
+              run_row["status"] == "awaiting_approval",
+              f"proof 3: the run moved to awaiting_approval, saw {run_row['status']}",
+          )
+          require(
+              str(run_id) == finished[0]["threadId"],
+              "the server-issued application run id travelled outward on threadId",
+          )
+
+          approval = one("SELECT * FROM approvals")
+          require(approval is not None, "proof 4: a pending approvals row exists")
+          require(approval["decision"] == "pending", "proof 4: it is pending")
+          require(bool(approval["arguments_hash"]), "proof 4: it carries arguments_hash")
+          require(approval["expires_at"] is not None, "proof 4: it carries expires_at")
+          require(approval["required_reason"] == "destructive", "proof 4: reason is destructive")
+          require(approval["tool_call_id"] == CALL_ID, "proof 4: keyed by the deferred call id")
+          require(count("task_events") == 0, "proof 4: nothing has mutated yet")
+
+          # The hash the row stores must be the hash the tool body will recompute.
+          from app import policy, tools  # noqa: E402
+          from app.models import DeleteTasksArgs  # noqa: E402
+
+          expected_hash = policy.arguments_hash(
+              tools._payload(DeleteTasksArgs.model_validate({"task_ids": [str(TASK_A)]}))
+          )
+          require(
+              approval["arguments_hash"] == expected_hash,
+              "the stored hash equals the one policy step 5b will compare against",
+          )
+
+          detail = client.get(f"/api/runs/{run_id}").json()
+          require(detail["status"] == "awaiting_approval", "RunDetail reports awaiting_approval")
+          card = detail["pending_approval"]
+          require(card is not None, "RunDetail.pending_approval is populated, not null")
+          require(card["tool_call_id"] == CALL_ID, "the card names the deferred call")
+          require(card["required_reason"] == "destructive", "the card carries the reason")
+          require(
+              [item["id"] for item in card["preview"]["deletes"]] == [str(TASK_A)],
+              "the preview lists the owned target",
+          )
+          require(
+              "arguments" not in card and "arguments_hash" not in card,
+              "the card exposes neither arguments nor the hash",
+          )
+
+          # ------------------------------------------------------------- proofs 5 and 7
+          print("[5,7] the decision persists first, then the continuation commits")
+          forged = client.post(
+              f"/api/runs/{run_id}/approvals/no-such-call", json={"decision": "approved"}
+          )
+          require(
+              forged.status_code == 403 and forged.json()["error"]["code"] == "APPROVAL_NOT_FOUND",
+              f"proof 7: a decision for a call with no row is refused, saw {forged.status_code}",
+          )
+
+          extra = client.post(
+              f"/api/runs/{run_id}/approvals/{CALL_ID}",
+              json={"decision": "approved", "arguments_hash": "x"},
+          )
+          require(extra.status_code == 422, "the route forbids extra body keys")
+
+          decided = client.post(
+              f"/api/runs/{run_id}/approvals/{CALL_ID}", json={"decision": "approved"}
+          )
+          require(decided.status_code == 200, "proof 7: the decision was accepted")
+          require(
+              one("SELECT * FROM approvals")["decision"] == "approved",
+              "proof 7: the decision is persisted before any continuation",
+          )
+          require(count("task_events") == 0, "proof 7: persisting a decision executes nothing")
+          require(
+              decided.json()["status"] == "awaiting_approval",
+              "D-57: the run stays awaiting_approval until the continuation finishes",
+          )
+          require(
+              decided.json()["pending_approval"] is None,
+              "D-57: the card goes null the moment the decision is persisted",
+          )
+
+          again = client.post(
+              f"/api/runs/{run_id}/approvals/{CALL_ID}", json={"decision": "denied"}
+          )
+          require(
+              again.status_code == 409
+              and again.json()["error"]["code"] == "APPROVAL_ALREADY_DECIDED",
+              f"a second decision is refused, saw {again.status_code} {again.json()}",
+          )
+
+          resume = [{"interruptId": f"int-{CALL_ID}", "status": "resolved", "payload": {"approved": False}}]
+          continued = client.post("/api/agui", json=body(resume=resume))
+          require(continued.status_code == 200, "proof 5: the continuation streamed")
+          require(
+              one("SELECT count(*) AS n FROM tasks WHERE id = %(id)s", {"id": TASK_A})["n"] == 0,
+              "proof 5: the deletion committed",
+          )
+          require(
+              count("agent_runs") == 1,
+              "proof 5: the continuation ran under the same application run, not a new one",
+          )
+          after = one("SELECT * FROM agent_runs")
+          require(after["status"] == "completed", "proof 5: the run reached a terminal status")
+          require(
+              after["model_calls"] >= 2,
+              f"proof 5: usage accumulated across invocations, saw {after['model_calls']}",
+          )
+          require(
+              one("SELECT * FROM task_events")["operation"] == "deleted",
+              "proof 5: exactly the audited deletion",
+          )
+          require(
+              client.get(f"/api/runs/{run_id}").json()["pending_approval"] is None,
+              "no completed approval masquerades as a live card",
+          )
+
+          # The client claimed approved=False on that continuation and the deletion still
+          # committed, which is the stored-approval direction of D-58.
+          print("  ok: proof 5 also proved a client 'approved: false' cannot veto a stored yes")
+
+          replayed = client.post("/api/agui", json=body(resume=resume))
+          require(
+              replayed.status_code == 403,
+              f"a replayed continuation against a finished run is refused, saw {replayed.status_code}",
+          )
+
+          stale = client.post(
+              f"/api/runs/{run_id}/approvals/{CALL_ID}", json={"decision": "approved"}
+          )
+          require(
+              stale.status_code == 409 and stale.json()["error"]["code"] == "RUN_STATE_INVALID",
+              f"D-55: a decision against a terminal run is RUN_STATE_INVALID, saw {stale.json()}",
+          )
+
+          # ----------------------------------------------------------------- proof 6
+          print("[6] denial continues the same run and mutates nothing")
+          reset()
+          seed_task(TASK_A, ACTOR_ID, "Alpha")
+          use_model(scripted_delete([TASK_A]))
+          client.post("/api/agui", json=body())
+          run_id = one("SELECT * FROM agent_runs")["id"]
+          client.post(f"/api/runs/{run_id}/approvals/{CALL_ID}", json={"decision": "denied"})
+          denied_resume = [
+              {"interruptId": f"int-{CALL_ID}", "status": "resolved", "payload": {"approved": True}}
+          ]
+          denied = client.post("/api/agui", json=body(resume=denied_resume))
+          require(denied.status_code == 200, "proof 6: the denied continuation streamed")
+          require(
+              one("SELECT count(*) AS n FROM tasks WHERE id = %(id)s", {"id": TASK_A})["n"] == 1,
+              "proof 6: the task survives a denial",
+          )
+          require(count("task_events") == 0, "proof 6: no task event was written")
+          require(count("tool_invocations") == 0, "proof 6: the tool body never executed")
+          require(count("agent_runs") == 1, "proof 6: the same application run continued")
+          require(
+              one("SELECT * FROM agent_runs")["status"] == "completed",
+              "proof 6: the run reached its terminal status",
+          )
+          print("  ok: proof 6 also proved a client 'approved: true' cannot override a stored no")
+
+          # ------------------------------------------------------- the preview scope guard
+          print("[guard] a foreign target produces no preview and no approval row")
+          reset()
+          seed_task(TASK_A, ACTOR_ID, "Alpha")
+          seed_task(TASK_FOREIGN, FOREIGN_ACTOR, "Someone else's secret")
+          use_model(scripted_delete([TASK_FOREIGN]))
+          leaked = client.post("/api/agui", json=body())
+          require(count("approvals") == 0, "no approval row was written for a foreign target")
+          require(
+              "Someone else's secret" not in leaked.text,
+              "the foreign title never reached the response stream",
+          )
+          guard_run = one("SELECT * FROM agent_runs")
+          require(
+              guard_run["status"] == "failed",
+              f"the run failed closed, saw {guard_run['status']}",
+          )
+          require(count("task_events") == 0, "nothing mutated")
+
+          print("[guard] a mixed owned and foreign target set is refused whole")
+          reset()
+          seed_task(TASK_A, ACTOR_ID, "Alpha")
+          seed_task(TASK_FOREIGN, FOREIGN_ACTOR, "Someone else's secret")
+          use_model(scripted_delete([TASK_A, TASK_FOREIGN]))
+          mixed = client.post("/api/agui", json=body())
+          require(count("approvals") == 0, "no row for a partially foreign target set")
+          require("Someone else's secret" not in mixed.text, "no foreign title leaked")
+          require("Alpha" not in mixed.text, "not even the owned half produced a preview")
+
+          print("[guard] a nonexistent target is indistinguishable from a foreign one")
+          reset()
+          use_model(scripted_delete([uuid.uuid4()]))
+          client.post("/api/agui", json=body())
+          require(count("approvals") == 0, "no row for a nonexistent target")
+
+          # ------------------------------------------------------------- forged lookups
+          print("[forgery] continuation identity cannot be invented")
+          reset()
+          seed_task(TASK_A, ACTOR_ID, "Alpha")
+          use_model(scripted_delete([TASK_A]))
+          client.post("/api/agui", json=body())
+          run_id = one("SELECT * FROM agent_runs")["id"]
+
+          undecided = client.post(
+              "/api/agui",
+              json=body(resume=[{"interruptId": f"int-{CALL_ID}", "status": "resolved", "payload": {"approved": True}}]),
+          )
+          require(
+              undecided.status_code == 403,
+              f"a continuation before any decision is refused, saw {undecided.status_code}",
+          )
+          require(count("task_events") == 0, "and nothing mutated")
+
+          unknown = client.post(
+              "/api/agui",
+              json=body(resume=[{"interruptId": "int-never-deferred", "status": "resolved", "payload": {"approved": True}}]),
+          )
+          require(unknown.status_code == 403, "a continuation naming no row is refused")
+
+          two = client.post(
+              "/api/agui",
+              json=body(
+                  resume=[
+                      {"interruptId": f"int-{CALL_ID}", "status": "resolved", "payload": {"approved": True}},
+                      {"interruptId": "int-other", "status": "resolved", "payload": {"approved": True}},
+                  ]
+              ),
+          )
+          require(two.status_code == 422, f"two interrupts in one payload is refused, saw {two.status_code}")
+
+          foreign_run = client.post(
+              f"/api/runs/{uuid.uuid4()}/approvals/{CALL_ID}", json={"decision": "approved"}
+          )
+          require(
+              foreign_run.status_code == 403
+              and foreign_run.json()["error"]["code"] == "OUT_OF_SCOPE",
+              "a decision against a run that does not exist is OUT_OF_SCOPE, not RUN_STATE_INVALID",
+          )
+
+          # ------------------------------------------------- ambiguous call id, D-51 many
+          print("[forgery] a duplicated call id across runs refuses rather than choosing")
+          client.post(f"/api/runs/{run_id}/approvals/{CALL_ID}", json={"decision": "approved"})
+          seed_task(TASK_FOREIGN, ACTOR_ID, "Beta")
+          use_model(scripted_delete([TASK_FOREIGN]))
+          client.post("/api/agui", json=body())
+          second_run = one(
+              "SELECT * FROM agent_runs WHERE id <> %(id)s ORDER BY started_at DESC",
+              {"id": run_id},
+          )
+          require(second_run is not None, "a second application run exists")
+          client.post(
+              f"/api/runs/{second_run['id']}/approvals/{CALL_ID}", json={"decision": "approved"}
+          )
+          rows = one(
+              "SELECT count(*) AS n FROM approvals WHERE tool_call_id = %(c)s", {"c": CALL_ID}
+          )
+          require(rows["n"] == 2, f"two runs now share one provider call id, saw {rows['n']}")
+          ambiguous = client.post(
+              "/api/agui",
+              json=body(resume=[{"interruptId": f"int-{CALL_ID}", "status": "resolved", "payload": {"approved": True}}]),
+          )
+          require(
+              ambiguous.status_code == 403,
+              f"D-51: an ambiguous call id refuses rather than taking the first, saw {ambiguous.status_code}",
+          )
+          require(
+              one("SELECT count(*) AS n FROM tasks")["n"] == 2,
+              "and neither run's target was deleted",
+          )
+
+          # --------------------------------------------------------- D-56, fail closed
+          print("[D-56] two simultaneous approval requests fail the turn closed")
+          reset()
+          seed_task(TASK_A, ACTOR_ID, "Alpha")
+          seed_task(TASK_FOREIGN, ACTOR_ID, "Beta")
+
+
+          async def two_deletes(messages, _info):
+              already = any(
+                  isinstance(part, ToolReturnPart)
+                  for message in messages
+                  if isinstance(message, ModelRequest)
+                  for part in message.parts
+              )
+              if already:
+                  yield "Done."
+                  return
+              yield {
+                  0: DeltaToolCall(
+                      name="delete_tasks",
+                      json_args=json.dumps({"task_ids": [str(TASK_A)]}),
+                      tool_call_id="call-a",
+                  ),
+                  1: DeltaToolCall(
+                      name="delete_tasks",
+                      json_args=json.dumps({"task_ids": [str(TASK_FOREIGN)]}),
+                      tool_call_id="call-b",
+                  ),
+              }
+
+
+          use_model(two_deletes)
+          client.post("/api/agui", json=body())
+          require(count("approvals") == 0, "D-56: zero approval rows were written")
+          require(count("task_events") == 0, "D-56: zero mutations")
+          require(
+              one("SELECT * FROM agent_runs")["status"] == "failed",
+              "D-56: the application run failed rather than choosing a first call",
+          )
+
+          # --------------------------------------------------------- sequential is legal
+          print("[D-56] sequential approvals on one run remain legal")
+          reset()
+          seed_task(TASK_A, ACTOR_ID, "Alpha")
+          seed_task(TASK_FOREIGN, ACTOR_ID, "Beta")
+
+
+          async def two_turns(messages, _info):
+              returned = sum(
+                  1
+                  for message in messages
+                  if isinstance(message, ModelRequest)
+                  for part in message.parts
+                  if isinstance(part, ToolReturnPart)
+              )
+              if returned == 0:
+                  yield {
+                      0: DeltaToolCall(
+                          name="delete_tasks",
+                          json_args=json.dumps({"task_ids": [str(TASK_A)]}),
+                          tool_call_id="seq-1",
+                      )
+                  }
+                  return
+              if returned == 1:
+                  yield {
+                      0: DeltaToolCall(
+                          name="delete_tasks",
+                          json_args=json.dumps({"task_ids": [str(TASK_FOREIGN)]}),
+                          tool_call_id="seq-2",
+                      )
+                  }
+                  return
+              yield "Both done."
+
+
+          use_model(two_turns)
+          client.post("/api/agui", json=body())
+          run_id = one("SELECT * FROM agent_runs")["id"]
+          client.post(f"/api/runs/{run_id}/approvals/seq-1", json={"decision": "approved"})
+          client.post(
+              "/api/agui",
+              json=body(resume=[{"interruptId": "int-seq-1", "status": "resolved", "payload": {"approved": True}}]),
+          )
+          pending = one(
+              "SELECT count(*) AS n FROM approvals WHERE run_id = %(r)s AND decision = 'pending'",
+              {"r": run_id},
+          )
+          require(
+              one("SELECT count(*) AS n FROM approvals WHERE run_id = %(r)s", {"r": run_id})["n"]
+              == 2,
+              "two approval rows exist on one application run",
+          )
+          require(pending["n"] == 1, f"exactly one of them is pending, saw {pending['n']}")
+          require(
+              runs.detail(run_id, ACTOR_ID).pending_approval.tool_call_id == "seq-2",
+              "the singular card describes the one that is pending",
+          )
+
+          print()
+          if failures:
+              print(f"T12B GATE FAILED: {len(failures)} check(s)")
+              for item in failures:
+                  print(f"  - {item}")
+              raise SystemExit(1)
+          print("ALL T12B CHECKS PASSED")
+          PY

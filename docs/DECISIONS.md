@@ -1994,3 +1994,270 @@ T19's degraded-state work, not transport.
 without a pricing source. `model_calls`, `tool_calls`, `input_tokens`, and
 `output_tokens` are recorded truthfully from `RunUsage`; an invented cost in an
 audit row would be worse than a zero.
+
+---
+
+## Approval bridge decisions recorded at T12B
+
+Recorded on 2026-08-15, before any T12B code was written, in the order the T04,
+T05, T07, T08, and T12A blocks established. D-54 through D-58. The three
+preconditions D-45 and D-50 left for the user were settled first, in session,
+and D-54 through D-56 record those rulings.
+
+### D-54: the merged T10 kernel expansion is ratified retrospectively, unpriced
+
+D-50 closed by stating that "the merged T10 kernel expansion under Q-12 remains
+unratified" and that the D-31 payment was the user's to settle before T12B and
+R2. This decision settles it. Authorized by the user on 2026-08-15.
+
+**What is ratified.** Two KERNEL edits that merged with T10 and were never
+priced under D-31:
+
+```text
+idempotency.replay_completed()   backend/app/idempotency.py, roughly 90 lines,
+                                 called from all six tools, and reaching into
+                                 runs.load for the actor resolution that a
+                                 lease read cannot perform on its own
+policy.resolve_scope()           backend/app/policy.py, promoted from private
+                                 to public and called by the two tools whose
+                                 classification can require approval
+```
+
+The first is Q-12 option A. The second is D-50's fix, and it is the `policy.py`
+change D-12 asserted was unnecessary.
+
+**The process failure, recorded rather than smoothed over.** D-31 requires an
+explicit re-plan and a named cut *before* a KERNEL file is edited. Neither
+happened. Q-12 recorded that option A "requires Opus-owned kernel work and
+explicit authorization before T10 can continue", and T10 continued anyway. Q-17
+records the matching rule 0.1 failure on the ordering question. Both were found
+by review after the fact rather than by the gate, which is the same shape as the
+finding D-21 recorded at T04: the defects that mattered were invisible to a
+green board.
+
+**No price is reconstructed and no cut is invented.** D-36 had an independent
+1.50d estimate sitting in `docs/LINEAR_INTEGRATION.md` to adopt, and it still
+described reconstructing the funding audit afterwards as the thing D-31 exists
+to prevent. This expansion has no separable historical estimate at all: it was
+absorbed inside activity F, typed tools, at 0.50d, and no honest decomposition
+of that number exists. It also creates no prospective demand, because the work
+is delivered and merged.
+
+Therefore the expansion is **unpriced**, and D-36's ledger is **unchanged** at
+roughly 0.83d of remaining unoffset schedule pressure. Naming a future cut, such
+as the OTel instrumentation in activity U, was considered and rejected. Cutting
+a capability that has not been built yet does not fund work that already
+happened; it would only debit a real future feature to make a retrospective
+entry balance, which is the laundering D-36 refused to do.
+
+Charging an invented number against the R5 contingency was rejected for the same
+reason. A charge implies something measurable was absorbed, and it would turn R5
+into a sink that any later kernel edit could be waved through against.
+
+**This is not precedent.** A retrospective ratification is available once, for
+work already merged, and only because reversing it is worse: Q-12 measured
+options B, C, and D as an unrecorded workaround, a lease taken on refused calls,
+and dropping the duplicate-call guarantee outright. The next KERNEL edit is
+priced when it is proposed, which is what D-31 says and what this decision did
+not have available.
+
+**Q-12 is resolved as option A** and the open index in `docs/OPEN_QUESTIONS.md`
+is updated. Q-17's process half remains open, because whether gate authorship
+should be separated from implementation authorship is a schedule question this
+decision does not answer.
+
+### D-55: `RUN_STATE_INVALID` is the thirteenth error code
+
+D-45 recorded that no legal code exists for a valid, actor-owned run whose
+current status forbids the requested action, and required it resolved before
+T12B and T18. T12B meets it on the approvals decision route, because section 9
+requires the server to reject unless the resolved run "exists, belongs to
+`actor_id`, and is in a status that permits the requested action".
+
+**The code.** `RUN_STATE_INVALID`, HTTP 409, class `RunStateInvalidError`.
+
+**What was rejected, and why the cheaper option is worse.** The alternative was
+to derive the state condition instead of asserting it: T12B is the only writer
+of approval rows and moves the run to `awaiting_approval` in the same
+transaction, so a pending row could stand as proof that the run is in an
+approvable state, and every rejection would fall out as `APPROVAL_NOT_FOUND` or
+`APPROVAL_ALREADY_DECIDED` with no kernel edit at all. That was rejected on two
+grounds. It implements two of section 9's three conditions and infers the third
+from an invariant T12B itself maintains, which is the weaker construction to put
+on a trust boundary. And it closes only T12B's half of D-45: T18's undo rejects
+on run state with no approval row to reason through, so the same vocabulary gap
+would arrive again one task later.
+
+**Validation order on the approvals route is ownership, then lifecycle, then
+approval row.** It is the order section 9's bullet lists, and it is what keeps
+the non-enumeration property: a request naming a missing or foreign run gets
+`OUT_OF_SCOPE` and learns nothing, and a request against an owned run in the
+wrong lifecycle state is refused before it can discover whether an approval row
+exists for that call id.
+
+A consequence worth stating, because it is what makes the ordering observable:
+while the run is still `awaiting_approval` and the row is already decided, a
+second decision POST returns `APPROVAL_ALREADY_DECIDED`. Once the continuation
+has carried the run to a terminal status, the same request returns
+`RUN_STATE_INVALID` instead, without reading the row. Both are 409 and they are
+not interchangeable. See D-57, which is what keeps the first of those reachable.
+
+**The four artifacts move together.** `backend/app/errors.py`, including its
+module docstring, which said "Exactly these twelve codes"; BUILD_SPEC section
+6's code table and its introduction; the exact T04 vocabulary gate in
+`.github/workflows/ci.yml`, which walks `ERRORS_BY_CODE` asserting every code
+and status pair; and this decision. Leaving "twelve" anywhere would ship a
+KERNEL file whose docstring contradicts its own contents.
+
+**T12B's file list gains `backend/app/errors.py`** and the T04 gate, on top of
+the `agent.py`, `main.py`, `runs.py`, and `sql.py` section 12 lists, the
+`.github/workflows/ci.yml` and `IMPLEMENTATION_NOTES.md` companions CLAUDE.md
+requires of every task, `tests/test_invariants.py` for the forgery scenarios
+D-58 requires, and the BUILD_SPEC, DECISIONS, and OPEN_QUESTIONS edits this
+block records. This KERNEL edit is priced inside the same D-31 re-plan as D-54,
+on the same terms: it is a thirteenth exception class and a table row, it adds
+no task to section 12, and no cut is invented to pay for it.
+
+### D-56: at most one simultaneously pending approval per application run
+
+D-45 left `RunDetail.pending_approval` singular while Pydantic AI's
+`DeferredToolRequests.approvals` is a list, and refused to invent a
+first-row-wins rule. This freezes the invariant instead of widening the wire
+shape.
+
+**The rule.** At most one approval row per application run may be `pending` at
+any moment. If one framework invocation produces more than one
+approval-required deferred call, T12B fails closed: zero approval rows are
+written, zero mutations are performed, no call is selected as the first, and the
+application run fails through the existing run-error path.
+
+**Simultaneously is the load-bearing word.** Sequential approval rows on one
+application run stay legal, and the demo may need them: a continuation
+invocation can defer a fresh approval-required call after the first row is
+decided, which leaves one decided row and one pending row, so exactly one thing
+is pending and `pending_approval` still describes it. Written as "one approval
+row per run" the invariant would refuse a legal multi-step turn. The test
+asserts the simultaneous form specifically.
+
+**What this costs.** A model that proposes two approval-required calls in one
+turn gets the whole turn refused rather than two cards. The practical cost is
+near zero, because `delete_tasks` already takes a list of `task_ids`, so bulk
+deletion is a single call and the refused shape is not one the demo produces.
+
+Changing `pending_approval` to a list was rejected: `models.py` is not in T12B's
+file list, section 9's wire shape is frozen, and T16's approval card consumes
+it. Persisting every row and exposing the earliest was rejected because it is
+the first-row-wins rule D-45 names and refuses, and it leaves later rows
+invisible to the client.
+
+### D-57: `awaiting_approval` spans the interrupt to the end of the continuation
+
+The status means **approval-controlled execution has not yet continued**, not
+that a human decision is still outstanding. The two are different, and the
+window between them is real, because under D-58 the decision route persists and
+returns without executing while the continuation arrives as a separate request.
+
+```text
+interrupt          -> status awaiting_approval, pending_approval = the card
+decision persisted -> status awaiting_approval, pending_approval = null
+continuation ends  -> status completed or failed, pending_approval = null
+```
+
+**Why the run does not leave `awaiting_approval` when the decision is
+persisted.** The tidier alternative returns the run to `running` on decision, so
+that `status == awaiting_approval` is exactly equivalent to "a pending approval
+row exists" and `RunDetail` can never show the status beside a null card. It was
+rejected. Under D-55's ownership, lifecycle, approval row ordering, a run
+returned to `running` makes every already-decided replay fail the lifecycle
+check first, and `APPROVAL_ALREADY_DECIDED` becomes structurally unreachable on
+the only endpoint that can raise it. That is the defect class D-43 recorded for
+`deduplicated`, and trading a specified error code away for a cosmetically
+tidier field pairing is a bad exchange.
+
+`awaiting_approval` beside `pending_approval: null` is therefore correct and
+must be documented wherever the status is defined, or it reads as a
+contradiction. The field means "something needs your decision now". In that
+window nothing does.
+
+**Accepted limitation: the lost continuation.** If the decision commits and the
+client never issues the continuation request, the run stays `awaiting_approval`
+with no live card and nothing recovers it. The durable resume and orphan sweep
+that would have was cut at D-36 and credited as activity S; `SWEEP_ORPHAN_RUNS`
+sits in `sql.py` deliberately unwired, and its presence is not a bug.
+
+The consequence runs one step further than a stalled card, and is recorded
+rather than fixed. `can_undo` excludes `awaiting_approval` under D-44, so a
+stranded run is also not undoable. A turn may legitimately commit a
+`create_task` before its `delete_tasks` call defers, and that committed mutation
+then has no route to compensation through the product. This is accepted for a
+ten minute single-user demo. It is not implied to be recoverable, and no partial
+recovery is invented at T12B to make it look smaller.
+
+### D-58: `interruptId` is a lookup key, and the T12A "reads nothing" property is narrowed
+
+**The approval route does not execute anything.**
+`POST /api/runs/{id}/approvals/{tool_call_id}` verifies, persists the decision,
+and returns `RunDetail`. The framework continuation is a separate
+`POST /api/agui` carrying `resume[]`. This is the only reading that satisfies
+both section 9, whose response column for that route is `RunDetail` rather than
+an event stream, and D-51, which assigns the `interruptId` mapping to T12B and
+says the lookup needs a new statement in `sql.py`.
+
+**What T12A wrote, and what is now true.** `agent.py` stated categorically that
+`resume` is absent "so `AGUIAdapter.deferred_tool_results` is None and a
+client-asserted approval cannot continue a deferred call", and the module's
+whole argument is that not reading a client authority input is a property a
+reader checks by grep rather than by reasoning. T12B reads
+`resume[].interruptId`. That property is narrowed here deliberately rather than
+edited quietly into a docstring, because a stated invariant that erodes through
+maintenance is worse than one that was never claimed.
+
+The narrowed contract:
+
+```text
+initial turn    client identity, history, and resume are read for nothing
+continuation    resume[].interruptId is accepted as a lookup key only
+                resume[].payload.approved is read for nothing
+                the persisted approvals row decides ToolApproved or ToolDenied
+```
+
+`interruptId` is a lookup key in exactly the sense `{id}` is on
+`GET /api/runs/{id}`: it selects a server-owned record and grants nothing. The
+`DeferredToolResults` handed to the agent is constructed from the stored
+decision and passed explicitly, so `AGUIAdapter.deferred_tool_results`, which
+derives from the request payload, stays unused and unread.
+
+**The lookup, and why it counts rows.** `approvals` is keyed
+`PRIMARY KEY (run_id, tool_call_id)`, so one provider-generated call id can
+legitimately exist under several runs and D-51's warning is a real collision
+rather than a theoretical one. The statement resolves a call id to rows whose
+run belongs to the actor and is in `awaiting_approval`, and whose decision is no
+longer `pending`. Zero rows refuses, exactly one resolves, more than one refuses
+as ambiguous. There is no `LIMIT` and no appeal to identifier entropy.
+
+Requiring `awaiting_approval` in the lookup also means a replayed continuation
+against a run that already finished resolves nothing, so the refusal happens at
+the transport boundary rather than being left to the idempotency lease.
+
+**Expiry is not filtered in the lookup**, deliberately. `policy.check` step 5c
+is the authority on approval expiry and runs inside the tool body on every path,
+so an approved continuation arriving after `expires_at` executes no mutation and
+ends the run with `APPROVAL_EXPIRED`. Filtering expiry at the transport too
+would create a second expiry semantic in a file that is not the kernel, and it
+would silently strand denied continuations, which have no mutation to protect.
+
+**Proving it needs both directions.** `test_agui_forged_history_ignored`
+fabricates history, not a decision, and after T12B begins reading `interruptId`
+that boundary has no pin. Two scenarios join `test_forged_approval_rejected`: a
+stored `denied` against a client claiming `approved: true`, which must not
+mutate, and a stored `approved` against a client claiming `approved: false`,
+which must still mutate. The second is not symmetry for its own sake. Without it
+an implementation that ignored client input by always denying would pass every
+other assertion, which is exactly the one-sided suite D-21 found at T04.
+
+They are added as sequential scenarios inside the existing test rather than as
+new names, following D-40. Section 11 fixes the count at thirteen and the
+collected count is meant to equal the count of proven invariants.
+`pytest.mark.parametrize` is not used: it keeps one function name but reports
+one collected item per case, so it would break the property while appearing to
+respect it.
