@@ -1025,6 +1025,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | T21 | Resume and orphan sweep | SOL | `runs.py`, `main.py` | **Cut.** D-36 credited this as "Activity S, removed in full" and spent the 0.25d against the Linear expansion, so the earlier "if retained" wording is settled: it was not retained. D-44 removes `/api/runs/{id}/resume` from section 9 to match. `SWEEP_ORPHAN_RUNS` stays in `sql.py` as an unused statement rather than being deleted, so reinstating the task is a decision rather than a rewrite. |
 | T22 | OTel | SOL | `telemetry.py`, `tests/test_telemetry.py`, `requirements.txt` | `pytest tests/test_telemetry.py` passes: at least one `chat` span and at least one `execute_tool` span, captured at the exporter. See the T22 note below and D-30. |
 | T23 | Injection path | SOL | `prompts.py`, `seed.py` | Flag true wrecks the board, flag false does not. Opus reviews the startup guard only if time remains after T15 is green. |
+| **R3** | **BLIND REVIEW CHECKPOINT 3** | **NON-AUTHORING MODEL + HUMAN** | **T17 + T23; include any kernel/boundary diff since R2** | Pin the review to an immutable SHA. Resolve every BLOCK finding and rerun the review against the new SHA before starting T24. T21 is cut and is not part of R3. |
 | T24 | Eval suite | SOL | `test_evals.py`, `fixtures/cases.py` | 15 cases run, pass rate recorded |
 | T25 | Polish, README, restore drill | SOL | `README.md` | Clean clone plus compose up reproduces the app |
 
