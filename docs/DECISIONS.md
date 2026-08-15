@@ -2337,37 +2337,52 @@ and executed SHA `09b75db`.
 
 This entry ratifies the existing implementation. No code changes.
 
-### D-60: UTF-8 PostgreSQL is an explicit runtime assumption, recorded and not enforced
+### D-60: UTF-8 PostgreSQL is an explicit runtime assumption, reproduced and now pinned
 
-The application assumes a UTF-8 PostgreSQL database.
+The application assumes a UTF-8 PostgreSQL database. Before this entry the
+assumption was real, load bearing, and stated nowhere.
 
 R2's reviewer reported five deterministic test failures, bytes versus str
 comparisons, under a natively initialized PostgreSQL 16 cluster whose `initdb`
-ran with the host default locale and produced `SQL_ASCII`. Reinitializing with
-`--encoding=UTF8 --locale=C.utf8` cleared all five, and the deterministic suite
-finished at 40 passed, 13 deselected. This repository has not independently
-reproduced that failure outside R2, and the account is recorded as
-reviewer-reported evidence rather than as a confirmed local result.
+ran with the host default locale and produced `SQL_ASCII`.
 
-The assumption is currently unenforced, and it is narrower than "CI covers it".
-`docker-compose.yml` sets `POSTGRES_DB`, `POSTGRES_USER`, and
-`POSTGRES_PASSWORD` and nothing else. It does not set `POSTGRES_INITDB_ARGS`, an
-encoding, or a locale, and no encoding or locale is pinned anywhere else in
-`docker-compose.yml`, `.github/workflows/ci.yml`, or `backend/`. Every green run
-of this suite therefore depends on the upstream `postgres:16` image's default
-`initdb` behaviour, which this repository never states and never asserts. No
-gate exercises a non-UTF-8 deployment.
+**That report has been independently reproduced in this repository**, so it is
+recorded as a confirmed result rather than as reviewer testimony. A `postgres:16`
+container was started with `POSTGRES_INITDB_ARGS="--encoding=SQL_ASCII
+--locale=C"`, `SHOW server_encoding` confirmed `SQL_ASCII`, and
+`pytest -m "not network"` returned **5 failed, 35 passed, 13 deselected**. The
+same suite against a container started with
+`POSTGRES_INITDB_ARGS="--encoding=UTF8 --locale=C.utf8"` returned **40 passed,
+13 deselected**. Same code, same tests, encoding the only variable. The five are
+`test_duplicate_tool_call_commits_once`,
+`test_reused_key_different_args_conflicts`,
+`test_expired_pending_lease_is_stolen`, `test_stale_undo_refused`, and
+`test_agui_forged_history_ignored`, and the failure is literal: `assert
+b'Create a task called Test AG-UI' == 'Create a task called Test AG-UI'`.
 
-A one-line fix was identified and deliberately deferred. Adding
-`POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.utf8"` to
-`docker-compose.yml` would make the assumption enforced rather than recorded. It
-is deferred because R2's disposition was documentation only, and because the
-change belongs with deployment and restore validation, where verifying cluster
-encoding is a natural operational check. It is recorded here so a later reader
-knows the fix was considered rather than overlooked.
+**What was previously unenforced.** `docker-compose.yml` set `POSTGRES_DB`,
+`POSTGRES_USER`, and `POSTGRES_PASSWORD` and nothing else. It set no
+`POSTGRES_INITDB_ARGS`, encoding, or locale, and no encoding or locale was
+pinned anywhere else in `docker-compose.yml`, `.github/workflows/ci.yml`, or
+`backend/`. Every green run of this suite depended on the upstream `postgres:16`
+image's default `initdb` behaviour, which this repository never stated and never
+asserted.
 
-Until then, a native PostgreSQL deployment must initialize the cluster or
-database as UTF-8 rather than relying on the host's default `initdb` encoding.
-The project records this as an assumption and does not claim it is enforced.
+**The fix is applied rather than deferred.** `docker-compose.yml` now sets
+`POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.utf8"`. This pins what was
+previously inherited. It is a one-line configuration change and no application
+code changes.
 
-No application code changes.
+Two consequences worth stating plainly. First, this also dissolves the
+provisioning substitution R2 disclosed: the reviewer installed PostgreSQL 16
+natively with `dnf` because the Vercel Sandbox microVM has no Docker daemon, and
+once encoding is explicit rather than inherited, a native cluster initialized the
+same way is equivalent rather than a substitution. Second, the pin takes effect
+at `initdb`, which runs only against an empty data directory, so an existing
+volume created before this change keeps its original encoding until it is
+recreated.
+
+Still not enforced: no gate asserts the encoding, and no CI job exercises a
+non-UTF-8 deployment. The pin makes the declared path correct by construction;
+it does not detect a deployment that ignores it. Verifying cluster encoding
+belongs with deployment and restore validation.
