@@ -450,21 +450,111 @@ condition of passing.
 
 ## R2 result
 
-Not yet dispatched. This section is filled in from the reviewer's returned
-report, in this pull request, without modifying `09b75db`.
+Dispatched and returned on 2026-08-15. One Sonnet reviewer, blind, read-only,
+three phases in order.
 
 ```text
-R1 baseline:                     e9048a2
-Reviewed SHA:                    pending
-Executed SHA:                    pending
-Sandbox identity:                pending
-Routing decision recorded:       pending
-Interpretation recorded:         pending
-READ findings:                   pending
-Execution results:               pending
-Independent probes:              pending
-Reconciliation:                  pending
-Claims not independently verified: pending
-Carry-forward obligations emitted: pending
-R2 verdict:                      pending
+R1 baseline:                       e9048a2
+Reviewed SHA:                      09b75dbb7ae6a07759fa66bb74ae91aeba8704c3
+Executed SHA:                      09b75dbb7ae6a07759fa66bb74ae91aeba8704c3
+Sandbox identity:                  tomato-objective-grasshopper-qrh2q2
+                                   (Amazon Linux 2023 microVM, @vercel/sandbox)
+Routing decision recorded:         yes, single Sonnet reviewer, user approved
+Interpretation recorded:           yes, conditional build gate, user approved
+R2 verdict:                        PASS
 ```
+
+### Pre-review verification
+
+`git cat-file -e 09b75db` resolved. `git merge-base --is-ancestor e9048a2
+09b75db` succeeded. `09b75db` was the tip of `origin/master` with zero commits
+ahead, because this pull request was deliberately left unmerged. The review ran
+from a fresh clone on a detached HEAD, never the `r2-review-record` worktree.
+`docs/R2_REVIEW.md`, pull request #34, and all CI check statuses were withheld
+and confirmed unread.
+
+### The eight PASS conditions
+
+| # | Condition | Result |
+| --- | --- | --- |
+| 1 | No unresolved blind-review BLOCK | Met, one NON-BLOCKING finding only |
+| 2 | Same SHA reviewed and executed | Met, verified inside the sandbox |
+| 3 | Fresh Vercel Sandbox exercises T12A and T12B at the protocol boundary | Met |
+| 4 | Cumulative T09 through T12B verification | Met, all five gates PASS |
+| 5 | `cd backend && ruff check .` | PASS |
+| 6 | `cd backend && pytest -m "not network"` | PASS, 40 passed, 13 deselected, 0 failed |
+| 7 | Frontend build gate | N/A branch, enumeration command and empty output recorded |
+| 8 | Carry-forward obligations emitted verbatim | Met |
+
+Gate detail: `T09 seed and reset`, `T10 tools`, `T11 prompts`, `T12A AG-UI
+transport`, `T12B approval interrupts` all PASS using each gate's exact `ci.yml`
+script rather than a substitute. T12A covered all eight proof sections including
+forged transcript, tools, state, and context discarded, forged `resume[]`
+refused with 403, and server-owned run identity. T12B covered all seven
+BUILD_SPEC proofs plus the preview-leakage guard against foreign, mixed, and
+nonexistent targets, D-58's two forgery directions, D-51 ambiguous call id
+refusal, D-56 in both directions, and D-55 `RUN_STATE_INVALID` ordering.
+
+### F1, NON-BLOCKING: undocumented deviation from D-12's literal ordering
+
+The five mutating tool bodies in `backend/app/tools.py` compute `arguments_hash`
+and run the completed-replay preflight before the D-12 `ApprovalRequired` raise.
+D-12 states the raise is step 0 of the tool body, ahead of `arguments_hash` and
+ahead of `idempotency.acquire`. The `create_task` docstring flags the departure
+and argues the deadlock property survives because `idempotency.acquire` still
+strictly follows the raise. No `docs/DECISIONS.md` entry ratifies the
+reordering, unlike the analogous scope-before-raise fix recorded as D-50 and
+D-54.
+
+The reviewer built a probe to attack it rather than accept the docstring's
+argument: an unapproved `bulk_update_tasks` call raised `ApprovalRequired` with
+zero rows in `tool_invocations`, proving the deferring pass takes no lease; the
+same `tool_call_id` retried after server approval committed and showed the lease
+`completed` only on the approved pass; a third identical call replayed the
+stored result byte for byte with no re-mutation.
+
+Disposition: CONFIRMED as a real documentation-conformance gap, MODIFIED in
+severity by the probe, classified NON-BLOCKING. It is not a trust-boundary
+violation and does not block T13.
+
+### Recorded OBSERVATIONS
+
+1. **Required.** The source-of-truth documents require an unconditional
+   production frontend build at R2 while the reviewed SHA contains no Node
+   package. Confirmed verbatim at the reviewed SHA at `CLAUDE.md` line 90 and
+   `docs/BUILD_SPEC.md` lines 1170 to 1178 item 5. This is what CF-1 corrects.
+2. **Provisioning substitution.** The Vercel Sandbox microVM has no Docker
+   daemon, so PostgreSQL 16 was installed natively with `dnf` rather than from
+   the repository's `docker-compose.yml`. Every gate therefore passed against a
+   database provisioned differently than the repository declares.
+3. **Encoding correction during execution.** The first `initdb` under the
+   default locale produced `SQL_ASCII`, which surfaced as five bytes-versus-str
+   comparison failures. The reviewer reinitialized with `--encoding=UTF8
+   --locale=C.utf8`, matching the `postgres:16` image's effective behavior, and
+   the five failures cleared. This is the one point at which the environment was
+   changed in response to a red result. The reasoning is sound, but whether
+   those five tests carry an encoding dependency that should be pinned
+   explicitly is an open question for the author, not a reviewer decision.
+
+### Claims not independently verified
+
+- **Live provider behavior.** No `MODEL_ID` or provider credential was available
+  or used. Every T12A and T12B proof, the author's and the reviewer's, runs
+  against a deterministic `FunctionModel`. This proves the transport and the
+  trust boundary, not model behavior. The gap predates R2, is already disclosed
+  in `IMPLEMENTATION_NOTES.md`, and R2 does not close it.
+- **Browser and frontend rendering.** Out of scope by the stated scope limit; no
+  frontend exists at `09b75db`.
+- **The sandbox identity itself.** Recorded on the reviewer's report. The
+  coordinator did not independently confirm the sandbox existed.
+
+### Reviewer conduct, verified by the coordinator
+
+The reviewer's clone was independently inspected after the report returned. Its
+tracked tree was clean and its HEAD was exactly
+`09b75dbb7ae6a07759fa66bb74ae91aeba8704c3`, so the tree it executed is
+bit-identical to the reviewed SHA and no repository content was edited. Files it
+authored, `extract_jobs.py`, `jobsteps/`, `r2diffs/`, and `sandboxrunner/`, sit
+beside the clone rather than inside it, which is the additive probe work section
+4 requires. The `r2-review-record` worktree and `origin/master` were both
+unchanged.
