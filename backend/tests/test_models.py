@@ -1,5 +1,8 @@
 import json
+import os
+import subprocess
 import sys
+import textwrap
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -287,3 +290,104 @@ def test_decision_enum_excludes_pending_state() -> None:
     assert ApprovalDecision.APPROVED.value == "approved"
     assert ApprovalDecision.DENIED.value == "denied"
     assert {decision.value for decision in ApprovalDecision} == {"approved", "denied"}
+
+
+def _run_isolated_python(source: str, *, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(source)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _provider_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["MODEL_ID"] = "z-ai/glm-5.2"
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("OPENAI_API_KEY", None)
+    return env
+
+
+def test_default_agent_uses_nvidia_glm_without_network() -> None:
+    env = _provider_env()
+    env["NVIDIA_API_KEY"] = "dummy-secret"
+
+    result = _run_isolated_python(
+        """
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        from app.agent import NVIDIA_BASE_URL, build_agent
+
+        built = build_agent()
+        assert isinstance(built.model, OpenAIChatModel)
+        assert built.model.model_name == "z-ai/glm-5.2"
+        assert isinstance(built.model.provider, OpenAIProvider)
+        assert built.model.provider.base_url == "https://integrate.api.nvidia.com/v1/"
+        assert NVIDIA_BASE_URL == "https://integrate.api.nvidia.com/v1"
+        """,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_default_agent_requires_nvidia_key_without_openai_fallback() -> None:
+    env = _provider_env()
+    env["NVIDIA_API_KEY"] = ""
+    env["OPENAI_API_KEY"] = "fallback-must-not-be-used"
+
+    result = _run_isolated_python(
+        """
+        from app.agent import build_agent
+
+        build_agent()
+        """,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "NVIDIA_API_KEY" in result.stderr
+
+
+def test_injected_agent_needs_no_provider_key_and_keeps_six_tools() -> None:
+    env = _provider_env()
+    env["NVIDIA_API_KEY"] = ""
+
+    result = _run_isolated_python(
+        """
+        from pydantic_ai.models.function import FunctionModel
+
+        from app.agent import build_agent
+
+        async def respond(messages, info):
+            return "ok"
+
+        injected = FunctionModel(respond)
+        built = build_agent(model=injected)
+        assert built.model is injected
+        assert set(built.toolsets[0].tools) == {
+            "list_tasks",
+            "create_task",
+            "update_task",
+            "bulk_update_tasks",
+            "delete_tasks",
+            "propose_plan",
+        }
+        """,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_importing_main_needs_no_nvidia_key() -> None:
+    env = _provider_env()
+    env["NVIDIA_API_KEY"] = ""
+
+    result = _run_isolated_python("import app.main", env=env)
+
+    assert result.returncode == 0, result.stderr
