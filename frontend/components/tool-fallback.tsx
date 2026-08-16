@@ -139,7 +139,12 @@ function ToolFallbackTrigger({
     status?.type === "incomplete" && status.reason === "cancelled";
 
   const Icon = statusIconMap[statusType];
-  const label = isCancelled ? "Cancelled tool" : "Used tool";
+const isRequiresAction = statusType === "requires-action";
+const label = isRequiresAction
+  ? "Approval required"
+  : isCancelled
+    ? "Cancelled tool"
+    : "Used tool";
 
   return (
     <CollapsibleTrigger
@@ -349,6 +354,16 @@ function ToolFallbackApproval({
   }) {
   const [submitted, setSubmitted] = useState(false);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  if (submitted) {
+  return (
+    <div className="flex flex-col gap-1 pt-2">
+      <p className="font-semibold">Approval submitted</p>
+      <p className="text-muted-foreground text-sm">
+        Waiting for Trellis to complete the action…
+      </p>
+    </div>
+  );
+}
 
   if (
     approval != null &&
@@ -550,26 +565,43 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   }
 
   return (
-    <ToolFallbackRoot open={open} onOpenChange={setOpen}>
-      <ToolFallbackTrigger toolName={toolName} status={status} />
-      <ToolFallbackContent>
-        <ToolFallbackError status={status} />
-        <ToolFallbackArgs
-          argsText={argsText}
-          className={cn(isCancelled && "opacity-60")}
+  <ToolFallbackRoot open={open} onOpenChange={setOpen}>
+    <ToolFallbackTrigger toolName={toolName} status={status} />
+
+    {isRequiresAction && (
+      <div className="flex flex-col gap-2 rounded-md border p-3">
+        <div>
+          <p className="font-semibold">Approval required</p>
+          <p className="text-muted-foreground text-sm">
+            Trellis needs your permission before completing this action.
+          </p>
+        </div>
+
+        <ToolFallbackApproval
+          addResult={addResult}
+          resume={resume}
+          interrupt={interrupt}
+          approval={approval}
+          respondToApproval={respondToApproval}
         />
-        {isRequiresAction && (
-          <ToolFallbackApproval
-            addResult={addResult}
-            resume={resume}
-            interrupt={interrupt}
-            approval={approval}
-            respondToApproval={respondToApproval}
-          />
-        )}
-        {!isCancelled && <ToolFallbackResult result={result} />}
-      </ToolFallbackContent>
-    </ToolFallbackRoot>
+      </div>
+    )}
+
+    {toolName === "delete_tasks" && status?.type === "complete" && (
+      <div className="rounded-md border p-3">
+        <p className="font-semibold">✓ Deletion completed successfully</p>
+      </div>
+    )}
+
+    <ToolFallbackContent>
+      <ToolFallbackError status={status} />
+      <ToolFallbackArgs
+        argsText={argsText}
+        className={cn(isCancelled && "opacity-60")}
+      />
+      {!isCancelled && <ToolFallbackResult result={result} />}
+    </ToolFallbackContent>
+  </ToolFallbackRoot>
   );
 };
 
