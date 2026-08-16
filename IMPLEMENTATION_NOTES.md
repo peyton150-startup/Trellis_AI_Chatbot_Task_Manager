@@ -1672,3 +1672,84 @@ that NVIDIA's hosted free endpoint will stop returning 429 responses. Hosted
 smoke must still confirm that a real post-commit provider failure leaves the
 board showing committed PostgreSQL state. T16-T18 remain deferred rather than
 skipped under D-65 and resume immediately after T19.
+
+## T16: Approval card
+
+**Local role:** Supplies the browser half of the approval bridge. `useRun.ts`
+learns the server-issued `agent_runs.id` from `RUN_STARTED.threadId`, loads the
+authoritative card from `GET /api/runs/{id}`, and on a decision posts to
+`POST /api/runs/{id}/approvals/{tool_call_id}` **before** submitting the AG-UI
+interrupt response that carries `resume[]`. `ApprovalCard.tsx` renders that
+server record and nothing it derived itself. `api.ts` gains the two requests.
+`Chat.tsx` mounts the card directly under the transcript. `tool-fallback.tsx`
+stops mounting the generated approval bar.
+
+**Whole-system role:** Until this task the demo's central claim was false in the
+browser. The approvals row is the authorization record under D-06, and the
+shipped UI answered only the framework interrupt, so no decision was ever
+persisted. Continuation eligibility requires a decided row, so the continuation
+was refused with 403 before the agent was reached: `delete_tasks` was never
+entered, nothing was written to `tool_invocations`, and the run stayed
+`awaiting_approval`. Approve and Reject were indistinguishable. T16 closes that
+gap without touching the trust boundary, and it makes the boundary visible: the
+consequence is on screen before the decision, and the confirmation comes from
+the continued agent reacting to a real tool result rather than from the browser
+asserting an outcome.
+
+**Inputs and dependencies:** T12B's approval creation, decision route, and
+`RunDetail.pending_approval`; T12A's AG-UI transport and the `int-<tool_call_id>`
+interrupt identity from Gate A; D-58's split between the decision route and the
+continuation; D-61's same-origin rewrite and T14I's ngrok bypass header, which
+now cover a third browser transport; the pinned `@assistant-ui/react-ag-ui`
+0.0.54 hooks `useAgUiInterrupts` and `useAgUiSubmitInterruptResponses`. The
+`unstable_getPendingInterrupts` and `unstable_submitInterruptResponses` runtime
+methods exist in this version but are deprecated in favour of those hooks.
+
+**Outputs and consumers:** `PendingApproval` and `RunDetail` wire types and the
+`useRun` hook, which T20's Run Inspector can reuse for run identity; a single
+approval dispatch path that later tasks must not duplicate; the
+`T16 approval bridge` CI job, which gates both the mutation proof and the
+structural properties (one surface, decision before continuation).
+
+**Verification:**
+
+```
+cd backend && pytest tests/test_approval_bridge.py
+cd backend && ruff check .
+cd backend && pytest -m "not network"
+cd frontend && npm run build
+```
+
+Seven bridge tests pass, 51 deterministic backend tests pass, ruff is clean, and
+the production build succeeds. The bridge tests assert mutations rather than
+status codes: the approved path leaves `tool_invocations` at `['completed']` with
+exactly one `deleted` event and the task gone; the denied path leaves zero of
+each with the task present; a continuation against an undecided row is the 403
+that reproduces the shipped defect; `resume[].payload.approved` claiming approval
+over a persisted denial deletes nothing; a second decision is refused 409; and a
+replayed continuation does not produce a second deletion.
+
+Browser acceptance, run against the real FastAPI app, real policy, real
+idempotency, and real PostgreSQL with a deterministic model standing in for the
+provider, since `NVIDIA_API_KEY` was not available in this environment. Approve:
+the card appeared automatically at 212px with zero collapsed or hidden
+ancestors, naming Task D from the server preview; the request sequence was
+`POST /api/agui` then `GET /api/runs/{id}` then
+`POST /api/runs/{id}/approvals/{call}` then `POST /api/agui` then
+`GET /api/tasks`, all against one run id; the board went 11 to 10, Task D was
+absent from `GET /api/tasks`, and the chat showed the agent's confirmation
+quoting the real tool result. Reject: the card appeared, three rapid clicks
+produced exactly one decision request and one continuation, the board stayed at
+11, Task D remained, and the chat read "Deletion cancelled. No tasks were
+changed."
+
+**Limitations and review status:** The end-to-end browser proof used a
+deterministic model rather than NVIDIA `z-ai/glm-5.2`, so the wording of a real
+model's confirmation is unverified; the mechanism carrying the tool result to
+the model is proven, the prose it produces is not. Expiry is enforced only
+server-side by design: the card displays nothing about remaining time and a
+decision on an expired approval is refused by `main.py` rather than pre-empted in
+the browser. Chat memory spans one `agent_runs.id`, so it holds across the
+approval boundary and not across separate user turns; D-66 records this as a run
+identity question rather than a T16 defect. T16 carries no blind-review
+requirement under BUILD_SPEC section 1A.

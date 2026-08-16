@@ -4800,3 +4800,102 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  t16-approval-bridge:
+    name: T16 approval bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      - name: Prove the approval bridge executes and commits the deletion
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest tests/test_approval_bridge.py -v
+
+      - name: Prove the client-side approval surface is single and authoritative
+        working-directory: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The defect T16 fixes was a second approval control that answered the
+          # framework interrupt without persisting a decision. Grep is the right
+          # instrument here: the property is "no other component dispatches an
+          # approval", and that is a statement about the whole tree rather than
+          # about the behaviour of any one component a unit test could mount.
+
+          if grep -rn "respondToApproval\|resume?.(\|addResult?.(" \
+              --include=*.tsx --include=*.ts \
+              components lib app \
+            | grep -v "^components/tool-fallback.tsx"; then
+            echo "FAIL a component outside tool-fallback.tsx answers the interrupt directly"
+            exit 1
+          fi
+
+          # tool-fallback.tsx may still export the generated approval bar, but it
+          # must not mount it. A mounted bar is the bypass.
+          if grep -n "<ToolFallbackApproval" components/tool-fallback.tsx; then
+            echo "FAIL tool-fallback.tsx mounts the non-authoritative approval bar"
+            exit 1
+          fi
+
+          # The authoritative decision request has to exist and has to be the
+          # thing useRun calls before it submits the continuation.
+          grep -q "approvals/" lib/api.ts \
+            || { echo "FAIL api.ts has no approval decision request"; exit 1; }
+          grep -q "postApprovalDecision" lib/useRun.ts \
+            || { echo "FAIL useRun.ts does not post the decision"; exit 1; }
+          grep -q "submitInterruptResponses" lib/useRun.ts \
+            || { echo "FAIL useRun.ts does not submit the continuation"; exit 1; }
+
+          # Ordering, checked structurally: the POST must appear before the
+          # continuation submission inside decide().
+          post_line=$(grep -n "await postApprovalDecision" lib/useRun.ts | cut -d: -f1)
+          resume_line=$(grep -n "await submitInterruptResponses" lib/useRun.ts | cut -d: -f1)
+          if [ "$post_line" -ge "$resume_line" ]; then
+            echo "FAIL the continuation is submitted before the decision is persisted"
+            exit 1
+          fi
+
+          echo "PASS one authoritative approval surface, decision persisted before continuation"
+
+      - name: Run non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
