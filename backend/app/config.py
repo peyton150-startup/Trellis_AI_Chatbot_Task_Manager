@@ -13,7 +13,7 @@ class Settings(BaseModel):
 
     database_url: str
     model_id: str
-    anthropic_api_key: str
+    nvidia_api_key: str
     actor_id: UUID
     demo_unsafe_prompt_mode: bool
     app_env: str
@@ -31,7 +31,7 @@ settings = Settings(
         "postgresql://trellis:trellis@localhost:55432/trellis",
     ),
     model_id=os.getenv("MODEL_ID", ""),
-    anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+    nvidia_api_key=os.getenv("NVIDIA_API_KEY", ""),
     actor_id=os.getenv("ACTOR_ID", "00000000-0000-0000-0000-000000000001"),
     demo_unsafe_prompt_mode=os.getenv("DEMO_UNSAFE_PROMPT_MODE", "false"),
     app_env=os.getenv("APP_ENV", "dev"),

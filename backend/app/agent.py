@@ -87,6 +87,8 @@ from pydantic_ai import (
 )
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.ui.ag_ui import AGUIAdapter
 from starlette.concurrency import run_in_threadpool
 
@@ -113,6 +115,8 @@ from .models import (
 # confirmed the framework maps a continuation back to the original call through
 # it. Stripped in exactly one place, `_continuation_interrupt_id`.
 _INTERRUPT_PREFIX = "int-"
+
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 # The only two tools whose classification can require approval, and therefore the
 # only two that can produce a deferred approval request. `delete_tasks` is gated
@@ -141,23 +145,36 @@ class TrellisDeps:
     run_id: UUID
 
 
-def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
-    """Construct the agent from the configured runtime model.
+def _runtime_model() -> Model:
+    """Construct the configured model against NVIDIA hosted inference."""
+    if not settings.nvidia_api_key:
+        raise RuntimeError(
+            "NVIDIA_API_KEY is required to construct the production runtime model"
+        )
 
-    BUILD_SPEC section 1 fixes the construction: `Agent(settings.model_id)`.
-    Pydantic AI resolves the provider from the `MODEL_ID` prefix and reads the
-    matching credential from the environment, so there is no provider branch
-    here, no provider router, no hardcoded model name, and no second selector.
+    provider = OpenAIProvider(
+        base_url=NVIDIA_BASE_URL,
+        api_key=settings.nvidia_api_key,
+    )
+    return OpenAIChatModel(settings.model_id, provider=provider)
+
+
+def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
+    """Construct the six-tool agent from production or injected model state.
+
+    NVIDIA hosted inference is the sole production provider. `_runtime_model`
+    owns its OpenAI-compatible endpoint and credential, while `MODEL_ID`
+    remains the only model selector and the identity stored with each run.
 
     The `model` parameter is an injection point, not a selector. `MODEL_ID`
-    remains the only configured runtime model, and the default path is exactly
-    the line section 1 prints. The parameter exists so the deterministic gate can
-    drive this identical toolset and prompt against a `FunctionModel`, proving
-    the transport and the trust boundary without a provider call. BUILD_SPEC
-    keeps model behaviour in the eval suite, which is where a provider belongs.
+    and `NVIDIA_API_KEY` are not read through the production construction path
+    when a model is supplied. The parameter lets deterministic gates drive this
+    identical toolset and prompt against a `FunctionModel` without credentials
+    or a provider call.
     """
+    runtime_model = _runtime_model() if model is None else model
     agent = Agent(
-        settings.model_id if model is None else model,
+        runtime_model,
         deps_type=TrellisDeps,
         instructions=prompts.SYSTEM_PROMPT,
         # `DeferredToolRequests` is what lets an approval-required call surface
@@ -234,9 +251,9 @@ def get_agent() -> Agent[TrellisDeps]:
 
     Deliberately lazy. `db.py` opens its pool at import time and `policy.py`,
     `idempotency.py`, and `tools.py` all went out of their way to keep importing
-    a module from requiring a live service. `Agent(settings.model_id)` raises
-    when `MODEL_ID` is unset, so constructing it at import would make importing
-    `app.main` require a configured runtime model, and every deterministic test
+    a module from requiring a live service. Production construction requires
+    `NVIDIA_API_KEY`, so constructing it at import would make importing
+    `app.main` require a provider credential, and every deterministic test
     imports `app.main`.
 
     Callers reach this through the module attribute rather than a `from` import,

@@ -492,7 +492,7 @@ Primary technologies:
 - pytest and Ruff
 - GitHub Actions
 
-The runtime model is selected through `MODEL_ID`. Provider selection is encoded in that value rather than in provider-specific application branches.
+The sole runtime provider is NVIDIA hosted inference. `MODEL_ID` selects the runtime model and is stored with each run; the current value is `z-ai/glm-5.2`. `NVIDIA_API_KEY` is the server-owned provider credential, and production constructs Pydantic AI's `OpenAIChatModel` against NVIDIA's code-owned OpenAI-compatible endpoint. There is no runtime provider failover. Deterministic tests inject a `FunctionModel` through `build_agent(model=...)` and require no provider credential.
 
 ## Local verification surface
 
@@ -509,7 +509,7 @@ The cumulative deterministic commands are:
 ```bash
 cd backend && ruff check .
 cd backend && pytest -m "not network"
-npm run build
+cd frontend && npm run build
 ```
 
 Use each task's specific verification from `docs/BUILD_SPEC.md` while implementing. Secrets belong in environment variables only.
