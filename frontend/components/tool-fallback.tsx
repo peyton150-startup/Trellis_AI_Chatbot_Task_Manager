@@ -139,12 +139,7 @@ function ToolFallbackTrigger({
     status?.type === "incomplete" && status.reason === "cancelled";
 
   const Icon = statusIconMap[statusType];
-const isRequiresAction = statusType === "requires-action";
-const label = isRequiresAction
-  ? "Approval required"
-  : isCancelled
-    ? "Cancelled tool"
-    : "Used tool";
+  const label = isCancelled ? "Cancelled tool" : "Used tool";
 
   return (
     <CollapsibleTrigger
@@ -354,16 +349,6 @@ function ToolFallbackApproval({
   }) {
   const [submitted, setSubmitted] = useState(false);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
-  if (submitted) {
-  return (
-    <div className="flex flex-col gap-1 pt-2">
-      <p className="font-semibold">Approval submitted</p>
-      <p className="text-muted-foreground text-sm">
-        Waiting for Trellis to complete the action…
-      </p>
-    </div>
-  );
-}
 
   if (
     approval != null &&
@@ -565,43 +550,33 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   }
 
   return (
-  <ToolFallbackRoot open={open} onOpenChange={setOpen}>
-    <ToolFallbackTrigger toolName={toolName} status={status} />
-
-    {isRequiresAction && (
-      <div className="flex flex-col gap-2 rounded-md border p-3">
-        <div>
-          <p className="font-semibold">Approval required</p>
-          <p className="text-muted-foreground text-sm">
-            Trellis needs your permission before completing this action.
-          </p>
-        </div>
-
-        <ToolFallbackApproval
-          addResult={addResult}
-          resume={resume}
-          interrupt={interrupt}
-          approval={approval}
-          respondToApproval={respondToApproval}
+    <ToolFallbackRoot open={open} onOpenChange={setOpen}>
+      <ToolFallbackTrigger toolName={toolName} status={status} />
+      <ToolFallbackContent>
+        <ToolFallbackError status={status} />
+        <ToolFallbackArgs
+          argsText={argsText}
+          className={cn(isCancelled && "opacity-60")}
         />
-      </div>
-    )}
+        {/*
+          T16. The generated fallback's own approval bar is deliberately not
+          mounted here, and `ToolFallbackApproval` stays exported so the rest of
+          the generated registry surface is unchanged.
 
-    {toolName === "delete_tasks" && status?.type === "complete" && (
-      <div className="rounded-md border p-3">
-        <p className="font-semibold">✓ Deletion completed successfully</p>
-      </div>
-    )}
+          It answers the framework interrupt directly, through `resume` or
+          `respondToApproval`, and nothing else. In this build that is not an
+          approval: the `approvals` row is the authorization record under D-06,
+          and a continuation whose row is still `pending` is refused with 403
+          before it reaches the agent. Mounting these buttons is what made
+          Approve behave identically to Reject.
 
-    <ToolFallbackContent>
-      <ToolFallbackError status={status} />
-      <ToolFallbackArgs
-        argsText={argsText}
-        className={cn(isCancelled && "opacity-60")}
-      />
-      {!isCancelled && <ToolFallbackResult result={result} />}
-    </ToolFallbackContent>
-  </ToolFallbackRoot>
+          `ApprovalCard` is the one approval surface, and it posts the decision
+          to the server before submitting the interrupt response. Two surfaces
+          would mean two paths, only one of them authoritative.
+        */}
+        {!isCancelled && <ToolFallbackResult result={result} />}
+      </ToolFallbackContent>
+    </ToolFallbackRoot>
   );
 };
 

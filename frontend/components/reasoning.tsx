@@ -52,13 +52,12 @@ export type ReasoningRootProps = Omit<
     onOpenChange?: (open: boolean) => void;
     defaultOpen?: boolean;
     /**
-     * Whether the reasoning is currently streaming. While `true` the
-     * disclosure is held open with a bottom-pinned live preview; when
-     * streaming ends it returns to `defaultOpen`, and the first manual
-     * toggle takes over the open/close state permanently. The live preview
-     * keeps following the newest tokens while the disclosure is open during
-     * streaming, even after a manual toggle, and pauses while the reader is
-     * scrolled up.
+     * Whether the reasoning is currently streaming. This no longer opens the
+     * disclosure on its own: the resting state is `defaultOpen` whether or not
+     * tokens are arriving, and the trigger stays clickable throughout. What
+     * `streaming` still selects is how an open panel behaves, namely the
+     * bottom-pinned live preview that follows the newest tokens and pauses
+     * while the reader is scrolled up.
      */
     streaming?: boolean;
   };
@@ -79,9 +78,16 @@ function ReasoningRoot({
   const lockScroll = useScrollLock(collapsibleRef, ANIMATION_DURATION);
 
   const isControlled = controlledOpen !== undefined;
+  // Streaming no longer forces the disclosure open. The generated behaviour
+  // expanded reasoning automatically while tokens arrived, which pushed the
+  // transcript, the tool call, and any approval card down the viewport for the
+  // whole of a turn. The trigger stays live throughout, so a reader who wants
+  // the live preview clicks once and gets it, including mid-stream: `isPreview`
+  // below still keys off `isOpen`, so the bottom-pinned preview follows the
+  // newest tokens exactly as before once it is open.
   const isOpen = isControlled
     ? controlledOpen
-    : (userOpen ?? (streaming || initialOpenRef.current));
+    : (userOpen ?? initialOpenRef.current);
   const isPreview = streaming === true && isOpen;
 
   const prevStreamingRef = useRef(streaming);

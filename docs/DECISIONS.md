@@ -2542,3 +2542,72 @@ T19 must preserve these boundaries:
 - Existing policy, approval, idempotency, and domain transaction boundaries remain unchanged.
 - No new run status, endpoint, table, column, provider fallback, or CORS path is introduced.
 - NVIDIA hosted `z-ai/glm-5.2` remains the sole runtime provider.
+
+### D-66: T16 owns the browser half of the approval bridge, and it is the only approval surface
+
+T12B built the server half of the bridge and left the browser half unbuilt.
+Nothing between then and now supplied it, so the shipped approval UI answered the
+framework interrupt and never wrote a decision. The observable defect was that
+Approve deleted nothing and said nothing.
+
+The stopping point is worth recording exactly, because the plausible reading is
+the wrong one. `SELECT_APPROVAL_FOR_CONTINUATION` carries `decision <> 'pending'`,
+so an undecided row is not an eligible continuation. `runs.resolve_continuation`
+matched zero rows and raised `OutOfScopeError`, and `POST /api/agui` answered 403
+before the adapter was built. Nothing denied the tool. The continuation never
+reached the agent at all, `delete_tasks` was never entered, no
+`tool_invocations` row was written, and the run stayed `awaiting_approval`
+forever. A fix aimed at "the framework denied the call" would have gone to the
+wrong layer.
+
+No backend or kernel change was required. `policy.py`, `idempotency.py`,
+`runs.py`, `agent.py`, `main.py`, and `sql.py` are unchanged by T16, and
+`backend/tests/test_approval_bridge.py` proves the server half was already
+correct: with a decision persisted first, `delete_tasks` executes, commits once,
+and survives a replayed continuation.
+
+**Ruling 1: two operations, in one fixed order.** The authoritative
+`POST /api/runs/{id}/approvals/{tool_call_id}` persists the decision, and only
+then does the AG-UI continuation carry `resume[]`. Reversing them reproduces the
+defect exactly. The order is asserted structurally by the `T16 approval bridge`
+CI job rather than left to a comment.
+
+**Ruling 2: one approval surface.** The generated `tool-fallback.tsx` approval
+bar answers the interrupt directly and persists nothing, so it is no longer
+mounted. `ToolFallbackApproval` stays exported, so the generated registry surface
+is unchanged, but a second dispatch path would mean two paths with only one of
+them authoritative. The CI job greps for both conditions.
+
+**Ruling 3: the card is always expanded.** BUILD_SPEC section 12 already forbids
+the client from deriving the preview; this adds that the server's preview must be
+visible without interaction. No dropdown, accordion, disclosure triangle,
+popover, modal, or collapsed tool-call UI may stand between a pending approval
+and the list of tasks it covers. A user who must click to discover what they are
+approving is approving blind.
+
+**Ruling 4: no optimistic mutation and no fabricated confirmation.** The board
+changes only when the existing `thread.runEnd` refetch observes committed state,
+and the confirmation is the continued agent's own response to the real tool
+result. A failure at either step leaves the card on screen carrying the error
+rather than removing the thing that asked the question.
+
+**Ruling 5: file-ownership expansion.** T16's recorded files were
+`ApprovalCard.tsx` and `useRun.ts`, which is smaller than the change the task
+actually requires. The browser cannot reach the decision route without an HTTP
+client, cannot mount the card without the chat surface, and cannot have one
+approval path while a second one is still mounted. T16 adds
+`frontend/components/Chat.tsx`, `frontend/lib/api.ts`,
+`frontend/components/tool-fallback.tsx`, and
+`backend/tests/test_approval_bridge.py`, plus the standard CI and
+implementation-note companions.
+
+`frontend/lib/types.ts` is deliberately not expanded. Board types stay in T13's
+file and the run and approval wire types live in `useRun.ts`, so the two wire
+shapes do not accumulate in one module owned by an earlier task.
+
+**Known limitation, not fixed here.** History is scoped to one `agent_runs.id`,
+and every new user message opens a new run with empty history. Memory therefore
+holds across the approval boundary, which is what T16 needed, and does not hold
+across separate user turns. That is a property of `runs.create` and
+`_accepted_run_input`, not a T16 defect, and changing it is a spec-level decision
+about run identity rather than an approval-UI change.
