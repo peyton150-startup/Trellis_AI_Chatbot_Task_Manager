@@ -2510,3 +2510,35 @@ retire T14I without changing the application topology.
 Normal CI never contacts ngrok. Its deterministic gate constructs real Web API
 `Headers` and `Request` objects to prove the bypass header is present and that
 caller headers survive the merge, then runs the production build.
+
+---
+
+## T15 live-smoke sequencing decision
+
+### D-65: advance T19 reliability work before T16-T18
+
+On 2026-08-16, the user explicitly authorized T19 to run immediately after the
+hosted T15 smoke instead of waiting for T16, T17, and T18.
+
+The reason is implementation evidence from the live runtime, not speculative
+reordering. NVIDIA hosted `z-ai/glm-5.2` returned HTTP 429 during ordinary demo
+traffic. At least one `create_task` and one `update_task` committed successfully
+before a later model request returned 429, leaving the enclosing application run
+failed even though authoritative PostgreSQL task state had changed.
+
+This is directly within T19's existing timeout, retry, and degraded-state scope.
+No new task is created and no T19 file ownership is expanded.
+
+The temporary execution order is:
+
+`T15 live smoke -> T19 timeout, retry, degraded state -> T16 -> T17 -> T18 -> T20`
+
+T16, T17, and T18 are deferred, not skipped or marked complete.
+
+T19 must preserve these boundaries:
+
+- PostgreSQL remains authoritative.
+- Provider retry must never replay an entire user request after a mutation has committed.
+- Existing policy, approval, idempotency, and domain transaction boundaries remain unchanged.
+- No new run status, endpoint, table, column, provider fallback, or CORS path is introduced.
+- NVIDIA hosted `z-ai/glm-5.2` remains the sole runtime provider.

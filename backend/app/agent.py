@@ -70,13 +70,14 @@ constructs a message list from a request.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from uuid import UUID, uuid4
 
 from ag_ui.core import RunAgentInput, UserMessage
 from fastapi import Request
 from fastapi.responses import Response
+from openai import AsyncOpenAI
 from pydantic_ai import (
     Agent,
     DeferredToolRequests,
@@ -118,6 +119,10 @@ _INTERRUPT_PREFIX = "int-"
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
+# T19. Retry only the failed provider HTTP request. Never replay the
+# whole agent turn or an already-committed tool mutation.
+_MODEL_REQUEST_MAX_RETRIES = 2
+
 # The only two tools whose classification can require approval, and therefore the
 # only two that can produce a deferred approval request. `delete_tasks` is gated
 # declaratively; `bulk_update_tasks` raises `ApprovalRequired` from its own body
@@ -127,6 +132,11 @@ _APPROVAL_ARGS_MODELS = {
     ToolName.DELETE_TASKS.value: DeleteTasksArgs,
     ToolName.BULK_UPDATE_TASKS.value: BulkUpdateTasksArgs,
 }
+
+
+@dataclass(slots=True)
+class RunEffects:
+    mutation_committed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +153,7 @@ class TrellisDeps:
 
     actor_id: UUID
     run_id: UUID
+    effects: RunEffects = field(default_factory=RunEffects)
 
 
 def _runtime_model() -> Model:
@@ -152,10 +163,13 @@ def _runtime_model() -> Model:
             "NVIDIA_API_KEY is required to construct the production runtime model"
         )
 
-    provider = OpenAIProvider(
+    client = AsyncOpenAI(
         base_url=NVIDIA_BASE_URL,
         api_key=settings.nvidia_api_key,
+        timeout=settings.model_timeout_seconds,
+        max_retries=_MODEL_REQUEST_MAX_RETRIES,
     )
+    provider = OpenAIProvider(openai_client=client)
     return OpenAIChatModel(settings.model_id, provider=provider)
 
 
@@ -177,6 +191,10 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
         runtime_model,
         deps_type=TrellisDeps,
         instructions=prompts.SYSTEM_PROMPT,
+        model_settings={"timeout": settings.model_timeout_seconds},
+        retries={"tools": settings.max_tool_retries},
+        tool_timeout=settings.tool_timeout_seconds,
+        max_concurrency=1,
         # `DeferredToolRequests` is what lets an approval-required call surface
         # as an AG-UI interrupt rather than raise. It is transport shape, proven
         # at Gate A. It is not the approval bridge: T12A writes no approval row
@@ -207,21 +225,27 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
         ctx: RunContext[TrellisDeps], arguments: CreateTaskArgs
     ) -> list[domain.TaskSnapshot]:
         """Create one task with typed title, notes, due date, priority, and dependency fields."""
-        return tools.create_task(_tool_context(ctx), arguments)
+        result = tools.create_task(_tool_context(ctx), arguments)
+        ctx.deps.effects.mutation_committed = True
+        return result
 
     @agent.tool
     def update_task(
         ctx: RunContext[TrellisDeps], arguments: UpdateTaskArgs
     ) -> list[domain.TaskSnapshot]:
         """Update one task using its identifier and expected version."""
-        return tools.update_task(_tool_context(ctx), arguments)
+        result = tools.update_task(_tool_context(ctx), arguments)
+        ctx.deps.effects.mutation_committed = True
+        return result
 
     @agent.tool
     def bulk_update_tasks(
         ctx: RunContext[TrellisDeps], arguments: BulkUpdateTasksArgs
     ) -> list[domain.TaskSnapshot]:
         """Apply the same typed changes to a list of task identifiers."""
-        return tools.bulk_update_tasks(_tool_context(ctx), arguments)
+        result = tools.bulk_update_tasks(_tool_context(ctx), arguments)
+        ctx.deps.effects.mutation_committed = True
+        return result
 
     # The one declarative gate. API fact 2 established `requires_approval=True`,
     # and fact 4 established that it accepts only a boolean, which is why
@@ -233,7 +257,9 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
         ctx: RunContext[TrellisDeps], arguments: DeleteTasksArgs
     ) -> list[domain.TaskSnapshot]:
         """Delete a list of tasks through the required approval path."""
-        return tools.delete_tasks(_tool_context(ctx), arguments)
+        result = tools.delete_tasks(_tool_context(ctx), arguments)
+        ctx.deps.effects.mutation_committed = True
+        return result
 
     @agent.tool
     def propose_plan(
@@ -310,12 +336,13 @@ async def handle_agui_request(request: Request) -> Response:
     history = await run_in_threadpool(runs.load_history, run.id, settings.actor_id)
     message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(history))
 
+    deps = TrellisDeps(actor_id=settings.actor_id, run_id=run.id)
     native = adapter.run_stream_native(
         message_history=message_history,
-        deps=TrellisDeps(actor_id=settings.actor_id, run_id=run.id),
+        deps=deps,
     )
     events = adapter.transform_stream(
-        _record_failure(native, run.id),
+        _record_failure(native, run.id, deps.effects),
         on_complete=_completion_recorder(run.id),
     )
     return adapter.streaming_response(events)
@@ -383,13 +410,14 @@ async def _handle_continuation(request: Request, tool_call_id: str) -> Response:
     history = await run_in_threadpool(runs.load_history, run_id, settings.actor_id)
     message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(history))
 
+    deps = TrellisDeps(actor_id=settings.actor_id, run_id=run_id)
     native = adapter.run_stream_native(
         message_history=message_history,
         deferred_tool_results=_deferred_results(approval),
-        deps=TrellisDeps(actor_id=settings.actor_id, run_id=run_id),
+        deps=deps,
     )
     events = adapter.transform_stream(
-        _record_failure(native, run_id),
+        _record_failure(native, run_id, deps.effects),
         on_complete=_completion_recorder(run_id),
     )
     return adapter.streaming_response(events)
@@ -600,24 +628,26 @@ def _tool_context(ctx: RunContext[TrellisDeps]) -> tools.ToolContext:
     )
 
 
-async def _record_failure(stream, run_id: UUID):
-    """Mark the run failed before the adapter converts the error into an event.
-
-    `UIEventStream.transform_stream` catches exceptions and emits `RUN_ERROR`, so
-    an exception raised inside the agent is not visible to a caller wrapping the
-    protocol stream. Wrapping the native stream instead puts this ahead of that
-    handler. The exception is re-raised, so the client still receives the
-    `RUN_ERROR` event it would have received anyway.
-    """
+async def _record_failure(stream, run_id: UUID, effects: RunEffects):
+    """Persist failure while distinguishing pre-commit from post-commit failure."""
     try:
         async for event in stream:
             yield event
     except Exception as exc:
+        if effects.mutation_committed:
+            stored_error = f"mutation_committed=true; response_error={exc}"
+            await run_in_threadpool(
+                runs.set_status, run_id, RunStatus.FAILED, stored_error
+            )
+            raise RuntimeError(
+                "At least one task change was committed, but the assistant response "
+                "could not finish. The board will refresh from committed state."
+            ) from exc
+
         await run_in_threadpool(
             runs.set_status, run_id, RunStatus.FAILED, str(exc)
         )
         raise
-
 
 def _completion_recorder(run_id: UUID):
     """Persist server-owned history, usage, and terminal status on success."""

@@ -1622,3 +1622,53 @@ the automatic board refetch, cumulative GitHub CI, and branch-protection update
 remain required before the pull request is ready. T14I changes no backend,
 provider, approval, policy, idempotency, tool, database, CORS, route-handler, or
 SSE-framing behavior.
+
+## T19: Timeout, retry, degraded state
+
+**Local role:** Bounds NVIDIA-compatible model requests with the OpenAI client's
+HTTP retry policy and configured model timeout, applies the existing tool timeout,
+and limits the agent to one concurrent run. Each AG-UI invocation carries a
+run-local `RunEffects` tracker. A successful mutating tool return marks that at
+least one mutation committed. If a later model request fails, `_record_failure`
+keeps the run `FAILED`, records `mutation_committed=true`, and emits a deterministic
+degraded error instead of making the committed database change appear to have
+failed. `Chat.tsx` refetches the authoritative board on both `thread.runEnd` and
+AG-UI `RUN_ERROR`.
+
+**Whole-system role:** Preserves PostgreSQL as authoritative while separating the
+success of a committed task mutation from the success of the assistant's final
+response. Provider retries remain below the agent/tool boundary, so T19 never
+replays an entire user request after a tool has committed. Existing policy,
+approval, idempotency, tool, and transaction boundaries remain unchanged.
+
+**Inputs and dependencies:** Consumes D-65's temporary sequencing decision, the
+T14N NVIDIA runtime, existing model/tool timeout settings, T12A/T12B tool and
+approval boundaries, and D-61's relative `/api/*` transport. NVIDIA hosted
+`z-ai/glm-5.2` remains the sole production provider. Provider HTTP retries are
+bounded at two retries and agent concurrency is limited to one run.
+
+**Outputs and consumers:** Produces run-local committed-mutation tracking,
+post-commit degraded error semantics, bounded provider behavior, and a frontend
+`RUN_ERROR` board refetch. Successful runs retain the existing `thread.runEnd`
+refetch. The cumulative GitHub job is named
+`T19 timeout retry degraded state`.
+
+**Verification:**
+
+```text
+backend ruff + pytest -m "not network"    44 passed, 13 deselected
+frontend npm run build                    compiled and type-checked
+post-commit forced failure                mutation committed exactly once
+post-commit run                           FAILED + mutation_committed=true
+whole user-request replay                 none
+pre-commit failure                        zero mutations
+forced TimeoutError                       PASS deterministic degraded-state checks
+CI YAML parse                             PASS ci.yml YAML
+```
+
+**Limitations and review status:** Deterministic tests prove the timeout and
+post-commit failure boundary without consuming NVIDIA quota. They do not prove
+that NVIDIA's hosted free endpoint will stop returning 429 responses. Hosted
+smoke must still confirm that a real post-commit provider failure leaves the
+board showing committed PostgreSQL state. T16-T18 remain deferred rather than
+skipped under D-65 and resume immediately after T19.

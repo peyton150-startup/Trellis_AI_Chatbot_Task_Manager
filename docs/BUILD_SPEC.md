@@ -1066,6 +1066,9 @@ Execute in order. Each task lists its files and its verification command. Do not
 | **R3** | **BLIND REVIEW CHECKPOINT 3** | **NON-AUTHORING MODEL + HUMAN** | **T17 + T23; include any kernel/boundary diff since R2** | Pin the review to an immutable SHA. Resolve every BLOCK finding and rerun the review against the new SHA before starting T24. T21 is cut and is not part of R3. |
 | T24 | Eval suite | SOL | `test_evals.py`, `fixtures/cases.py` | 15 cases run, pass rate recorded |
 | T25 | Polish, README, restore drill | SOL | `README.md` | Clean clone plus compose up reproduces the app |
+T19 is temporarily advanced ahead of T16-T18 under D-65 after the
+hosted T15 smoke exposed provider-rate-limit and post-commit response-failure
+behavior. T16-T18 remain pending and resume immediately after T19.
 
 The diagnosis-only hosted transport handoff for the T15 checkpoint is recorded
 in `docs/T15_HOSTED_TRANSPORT_HANDOFF.md`. It is evidence and procedure, not an
