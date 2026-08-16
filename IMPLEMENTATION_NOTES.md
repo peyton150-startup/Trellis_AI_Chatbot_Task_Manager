@@ -1463,3 +1463,60 @@ frontend-to-backend verification are deliberately deferred by the user's
 has not yet been inspected for the new name, and no push or draft PR has been
 performed. No T16 approval UI or T15 work was implemented. T14 has no dedicated
 blind review; visible review remains assigned to T15.
+
+## T14N: NVIDIA GLM-5.2 runtime provider retrofit
+
+**Local role:** Replaces prefix-inferred runtime-provider construction with one
+explicit NVIDIA path. `config.py` reads the server-owned `NVIDIA_API_KEY` and
+removes the unused Anthropic setting. `agent.py` owns the fixed NVIDIA endpoint,
+constructs `OpenAIProvider` plus `OpenAIChatModel(settings.model_id)`, and fails
+clearly when the production path has no NVIDIA key. The existing
+`build_agent(model=...)` injection seam and lazy cached `get_agent()` remain.
+
+**Whole-system role:** Makes the T14 chat surface capable of reaching the
+user-selected NVIDIA GLM-5.2 runtime without changing the trust boundary,
+application run identity, server-owned history, approval bridge, or six tool
+contracts. `MODEL_ID` remains the value recorded in `agent_runs`, so model audit
+identity stays stable while provider authentication remains a server concern.
+The explicit construction removes the obsolete Day 4 bakeoff and pays for the
+retrofit with activity AB's unchanged 0.25-day budget.
+
+**Inputs and dependencies:** Consumes pinned Pydantic AI 2.27.0, the live Ubuntu
+evidence that NVIDIA authentication, GLM-5.2 inference, tool selection, and
+tool-result continuation work through NVIDIA's OpenAI-compatible endpoint, the
+T12A six-tool agent, T12B approval continuation, and D-63. The production
+environment contract is `MODEL_ID=z-ai/glm-5.2` plus `NVIDIA_API_KEY`, with no
+OpenAI or Anthropic fallback and no configurable provider endpoint.
+
+**Outputs and consumers:** Produces an NVIDIA-backed `OpenAIChatModel` only for
+default production construction. Injected `FunctionModel` instances bypass the
+provider and key entirely, preserving deterministic T12A/T12B tests and normal
+CI. Importing `app.main` still constructs no agent. T15 consumes the resulting
+runtime path for the ugly-demo smoke. The cumulative GitHub job is named
+`T14N NVIDIA runtime provider` and runs the 31 no-network model tests.
+
+**Verification:** Test-first evidence recorded two expected failures before
+implementation: the default path had no `NVIDIA_BASE_URL` or NVIDIA model
+constructor, and missing `NVIDIA_API_KEY` raised Pydantic AI's `Unknown model`
+instead of naming the required credential. After implementation:
+
+```text
+cd backend && pytest tests/test_models.py      31 passed
+cd backend && ruff check .                     All checks passed
+cd backend && pytest -m "not network"          44 passed, 13 deselected
+cd frontend && npm run build                   compiled, type-checked, 3 static pages
+CI YAML probe                                  20 jobs, exact T14N name, no provider secret
+```
+
+The focused tests create real Pydantic AI provider and model objects with a
+dummy key but make no request. They prove the model name, provider class, model
+class, NVIDIA base URL, missing-key refusal even when `OPENAI_API_KEY` exists,
+provider-independent injection, unchanged six-tool surface, and import safety.
+
+**Limitations and review status:** T14N does not repeat the already completed
+live NVIDIA compatibility probes and does not put a real key in CI. The full
+prompt to committed-board live smoke remains T15's gate. Because T14N changes
+`agent.py` after R2, R2 did not review this provider construction. R3 must
+include the T14N boundary-adjacent diff under its existing carry-forward rule.
+No KERNEL file, `main.py`, tool wrapper, approval behavior, deployment
+configuration, or production secret changed.

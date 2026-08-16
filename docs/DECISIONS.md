@@ -227,7 +227,7 @@ If Next.js, AG-UI, FastAPI, and Pydantic AI are not talking end to end by end of
 
 ## Runtime model selection (Day 4 bakeoff)
 
-**Result:** PENDING
+**Result:** SUPERSEDED BY [D-63](#d-63-nvidia-hosted-glm-52-is-the-sole-runtime-provider)
 
 Ten prompts, both candidates, scored on correct tool behavior, clarification where appropriate, latency, and cost. Table goes in the README when complete. `MODEL_ID` is set from this, not from reputation.
 
@@ -2425,3 +2425,57 @@ Still not enforced: no gate asserts the encoding, and no CI job exercises a
 non-UTF-8 deployment. The pin makes the declared path correct by construction;
 it does not detect a deployment that ignores it. Verifying cluster encoding
 belongs with deployment and restore validation.
+
+---
+
+## NVIDIA runtime decision recorded at T14N
+
+### D-63: NVIDIA hosted GLM-5.2 is the sole runtime provider
+
+The user selected NVIDIA hosted inference and `z-ai/glm-5.2` as the final
+runtime provider and model before T15. This decision supersedes the pending Day
+4 model bakeoff and the earlier contract in which Pydantic AI inferred a
+provider from a prefix in `MODEL_ID`.
+
+Live compatibility evidence already exists from the Ubuntu deployment
+environment against pinned Pydantic AI 2.27.0. `OpenAIProvider` constructed
+with NVIDIA's OpenAI-compatible endpoint and `OpenAIChatModel("z-ai/glm-5.2")`
+returned the exact basic-inference sentinel `GLM_TRELLIS_TEST_OK`. A separate
+real tool loop selected the tool, returned `TOOL_CALLED`, and continued with
+`RESULT: There are exactly 11 Trellis tasks.` T14N does not repeat those network
+experiments in deterministic CI.
+
+The runtime contract is:
+
+```text
+MODEL_ID=z-ai/glm-5.2
+NVIDIA_API_KEY=<server-owned secret>
+NVIDIA endpoint=https://integrate.api.nvidia.com/v1
+```
+
+`MODEL_ID` remains the single runtime model selector and the model identity
+stored in `agent_runs`. `NVIDIA_API_KEY` is the sole provider credential. The
+base URL is code-owned because exactly one provider is supported; making it an
+environment option would imply flexibility the project deliberately rejects.
+
+There is no OpenAI or Anthropic fallback, no provider registry, and no runtime
+provider failover. Production constructs Pydantic AI's `OpenAIChatModel`
+through `OpenAIProvider`. `build_agent(model=...)` bypasses provider
+construction for deterministic tests, and lazy `get_agent()` keeps importing
+`app.main` safe without credentials. Default production construction without
+`NVIDIA_API_KEY` fails clearly before Pydantic AI can consult any fallback
+credential.
+
+Activity AB, the 0.25-day model bakeoff, is cut and replaced in full by this
+0.25-day retrofit. The total planned effort does not increase. The replacement
+is valid because the user made the final runtime decision after the live
+compatibility probes, so comparing the two repository-authoring models as
+runtime candidates is obsolete rather than deferred.
+
+The coding-model restriction is unchanged. Only Claude Opus 5 and Sol 5.6
+write or review repository content according to the routing table. GLM-5.2 is
+runtime software behavior only. T15 remains the next gate after T14N.
+
+T14N changes `agent.py` after the immutable R2 checkpoint. R2 is not claimed to
+have reviewed this code. The provider-construction diff is carried into R3,
+which already owns every kernel or boundary diff since R2.

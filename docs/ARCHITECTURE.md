@@ -49,7 +49,7 @@ Everything after Day 3 is hardening and polish, not new plumbing.
 
 - **DBOS is cut permanently.** Runs are resumable at tool boundaries, not automatically recoverable. That limitation is a talking point, not a gap.
 - **Signature moment 4 is the lost-response retry.** Committed now. Not revisited on Day 4 when the crash demo starts looking cooler in your head.
-- **A provisional model is configured today**, behind one env var. The real runtime choice is the Day 4 bakeoff. Cheap model while iterating on evals, strong model for the demo, and a ten second swap if the provider is degraded on demo morning. Not a router.
+- **The runtime provider is NVIDIA hosted inference**, with `z-ai/glm-5.2` selected through `MODEL_ID` and authenticated by `NVIDIA_API_KEY`. Production constructs Pydantic AI's `OpenAIChatModel` against NVIDIA's code-owned OpenAI-compatible endpoint. There is no provider failover or runtime router. `build_agent(model=...)` remains the credential-free deterministic test seam. Repository authoring still uses only Claude Opus 5 and Sol 5.6 under the routing table; GLM-5.2 is runtime behavior, not an authoring model.
 
 ---
 
@@ -348,8 +348,7 @@ Decided in advance so it is not decided at 2am. If you fall behind, cut in this 
 2. Resume affordance and orphan sweep.
 3. Undo. Keep single-run revert with version guards if it survives; the concurrency refusal is the interesting half. Cut anything partial or cross-run first.
 4. Behavioral eval count, 15 down to 8 to 10.
-5. Model bakeoff breadth, 10 prompts down to 5.
-6. Injection unsafe-mode comparison. Keep the defense, drop the on-camera before-and-after. Last because it costs a demo beat.
+5. Injection unsafe-mode comparison. Keep the defense, drop the on-camera before-and-after. Last because it costs a demo beat.
 
 If Gate A failed, AG-UI-native approval is already replaced by the fallback endpoint and is not a cut option.
 

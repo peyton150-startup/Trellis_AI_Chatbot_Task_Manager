@@ -61,8 +61,8 @@ Construction quality is capped by what came before it, so before scheduling anyt
 | Issue | Approach |
 |---|---|
 | assistant-ui interrupt API is experimental and may not work as documented | Timeboxed spike on Day 1 with a designed fallback that costs about two hours |
-| Model tool-selection reliability is unknown until tested | Narrow schemas, enums, required fields; model behind an env var so a stronger model can be swapped in |
-| Provider may be degraded or rate-limited on demo day | Env var swap, plus a backup recording |
+| Model tool-selection reliability is unknown until tested | Narrow schemas, enums, required fields, and behavioral evals against the selected NVIDIA GLM-5.2 runtime |
+| Provider may be degraded or rate-limited on demo day | No runtime failover; validate the NVIDIA key before the demo and keep a backup recording |
 | Demo machine could fail | Repo pushed daily, docker compose reproducible, backup recording on a second device |
 | Estimate may be optimistic | Pre-agreed cut order, applied without renegotiation |
 
@@ -114,7 +114,7 @@ Construction quality is capped by what came before it, so before scheduling anyt
        1.5.1 DEMO_UNSAFE_PROMPT_MODE toggle and injection path
        1.5.2 Deterministic invariant suite in CI
        1.5.3 Behavioral eval suite
-       1.5.4 Model bakeoff against 10 representative prompts
+       1.5.4 NVIDIA GLM-5.2 runtime-provider retrofit
    1.6 Delivery
        1.6.1 Visual polish
        1.6.2 README and decision record
@@ -171,7 +171,7 @@ Effort in days. Solo project, so nearly everything is serial and the critical pa
 | Y | Visual polish | 0.50 | V | 0 |
 | Z | README and backup recording | 0.50 | Y | 0.5 |
 | AA | Rehearsal, five passes | 0.50 | Y | 0 |
-| AB | Model bakeoff, 10 prompts | 0.25 | T | 0.50 |
+| AB | NVIDIA runtime-provider retrofit | 0.25 | T | 0.50 |
 | AC | Surprise-change drill | 0.25 | W | 0.25 |
 | AD | Linear integration expansion: T00B, T00L, T26 through T29 | 1.50 | see sequence below | 0 |
 
@@ -240,18 +240,18 @@ That is the most important number in this plan and it should not be softened. At
 | 1 | Gate A resolved, provisional model configured, skeleton running | Decision record written |
 | 2 | Domain, tools, policy, wire contract, seed | **Hard stop:** seam works end to end or collapse to AI SDK |
 | 3 | Approvals, reject, clarification. Undo after the gate | **Complete ugly demo:** prompt to committed board update |
-| 4 | Idempotency, retry, Run Inspector, model bakeoff | Reliability beats demonstrable |
+| 4 | Idempotency, retry, Run Inspector, NVIDIA runtime retrofit | Reliability beats demonstrable |
 | 5 | Injection toggle, both test suites | Proof beats demonstrable |
 | 6 | Polish, README, backup recording, change drill | Feature freeze at end of day |
 | 7 | Five rehearsals, buffer | Demo ready |
 
-### Two drills
+### Runtime decision and surprise-change drill
 
-Neither adds a feature. Both rehearse something the demo may require.
+The provider retrofit is the explicit implementation re-plan that replaces the
+obsolete bakeoff. The surprise-change drill still rehearses something the demo
+may require.
 
-**Model bakeoff, Day 4 evening, 0.25 days.** This chooses `MODEL_ID`, the model the agent calls at runtime, which is a separate decision from which model writes the code. The candidates are the same two models used to build the project and no others. Do not pick from reputation. Once the six tools exist, run 10 representative prompts through each candidate: simple create, single update, multi-task request, ambiguous request, destructive request, malicious task content, date movement, dependency reasoning, irrelevant request, awkward phrasing. Score correct tool behavior, clarification where appropriate, latency, and cost. Record the table in the README.
-
-This is scheduled on Day 4 rather than Day 1 because on Day 1 there is one tool and nothing meaningful to measure. Day 1 picks a provisional default to unblock the skeleton; Day 4 makes the real choice against the actual workload. The interview answer that comes out of it is worth the 0.25 days on its own: the model was chosen against this agent's workload, not against a general benchmark.
+**NVIDIA runtime-provider retrofit, 0.25 days.** The user made the final runtime decision before T15 after live Ubuntu probes established NVIDIA authentication, GLM-5.2 inference, Pydantic AI provider construction, tool selection, and tool-result continuation. This replaces the model bakeoff rather than adding effort. `MODEL_ID` remains the runtime model identity and run audit value, while production constructs the sole supported provider from `NVIDIA_API_KEY` and NVIDIA's code-owned OpenAI-compatible endpoint. Repository authoring remains restricted to Opus 5 and Sol 5.6.
 
 **Surprise-change drill, Day 6 evening, 0.25 days.** Only two models touch this project, so the change requests are sealed rather than outsourced. On Day 2, before the policy layer is deeply familiar, have Opus write five candidate change requests to `docs/DRILL.md` and do not read the file until Day 6. Examples of the shape: "bulk updates require approval at 2 tasks instead of 3," "completed tasks may never be deleted," "undo must also be blocked if the run is older than one hour."
 
@@ -269,8 +269,7 @@ Referenced throughout this plan and now stated once, here, so the evening contro
 2. Resume affordance and orphan sweep
 3. Undo
 4. Behavioral eval count, 15 down to 8 to 10
-5. Model bakeoff breadth, 10 prompts down to 5
-6. Injection unsafe-mode comparison (keep the defense, drop the on-camera before-and-after)
+5. Injection unsafe-mode comparison (keep the defense, drop the on-camera before-and-after)
 
 **Never cut:**
 
@@ -283,9 +282,9 @@ Referenced throughout this plan and now stated once, here, so the evening contro
 - Seed fixture and reset
 - Rehearsal
 
-Cutting item 6 costs a demo beat, so it is last. Cutting item 3 shortens the human-control beat to approve and reject, which still stands on its own.
+Cutting item 5 costs a demo beat, so it is last. Cutting item 3 shortens the human-control beat to approve and reject, which still stands on its own.
 
-**Already taken, on 2026-08-13, to fund the Linear expansion:** items 1, 2, 4, and 5. The ledger and the credit each one actually earns are in D-36; items 1 and 5 credit zero and are recorded as scope reductions rather than schedule savings. Item 3, undo, is deliberately not cut and would be incoherent to cut, because the Linear expansion adds kernel logic to `undo.py`.
+**Already taken, on 2026-08-13, to fund the Linear expansion:** items 1, 2, and 4. The earlier model-bakeoff reduction credited zero and is superseded by D-63: activity AB now pays in full for the NVIDIA runtime-provider retrofit. Item 3, undo, is deliberately not cut and would be incoherent to cut, because the Linear expansion adds kernel logic to `undo.py`.
 
 **Linear-specific contingency.** If schedule pressure requires another reduction after T25 is green, T28, the reconciler, is cut before anything on the never-cut list and before any further reduction of the core demo. The reconciliation and divergence design stays documented as designed but not built. This is defensible because Linear is a projected surface and never the authority, so the outbound projection path stands without it. No schedule credit is claimed for this in advance, because the 1.50 day figure is an aggregate and T28 has no recorded individual estimate. The credit is recorded when T28 is estimated or cut, not before.
 
@@ -344,15 +343,15 @@ The kernel and bulk split is the process already proven on Ratchet and Datum. Th
 |---|---|---|---|---|
 | R1 | AG-UI interrupt API does not behave as documented | Medium | Medium | Timeboxed spike, fallback endpoint designed in advance |
 | R2 | Four-technology seam does not integrate by Day 2 | Medium | High | Hard stop, collapse to AI SDK plus plain FastAPI |
-| R3 | Model picks wrong tools, demo looks unreliable | Medium | High | Narrow schemas, enums, required fields, env var to swap to a stronger model |
-| R4 | Provider degraded on demo day | Low | High | Env var swap, backup recording |
+| R3 | Model picks wrong tools, demo looks unreliable | Medium | High | Narrow schemas, enums, required fields, and behavioral evals against NVIDIA GLM-5.2 |
+| R4 | NVIDIA provider degraded on demo day | Low | High | Validate the key and hosted endpoint before the demo; keep a backup recording |
 | R5 | Estimate overruns (11.0 days into 7) | High | Medium | Pre-agreed cut order applied without renegotiation, same evening the slip appears |
 | R6 | Scope creep from continued architecture improvement | High | High | Architecture frozen; new ideas filed STRETCH and stay there |
 | R7 | Demo machine or environment failure | Low | High | Daily push, reproducible compose, tested restore, backup recording on a second device |
 | R8 | Invariant tests become slow or flaky and get disabled | Medium | Medium | They must not call the LLM; CI gates on this suite only |
 | R9 | A live external dependency sits in the demo path | Medium | High | Linear is a projected surface, never the authority. The local board renders committed Postgres state independently, so a Linear outage degrades the demo to a narrated projection queue rather than a failure, and no invariant test touches the network. Gate B on 2026-08-13 is the early detection and passed; the fallback if it had failed was to cut Linear and describe the projection design in the README. |
 
-**Actions:** resolve R1 by end of Day 1. Confirm R3 mitigation once 10 real prompts have been run. R9's detection is closed by Gate B; its mitigation stays live through rehearsal, because the projector is what has to degrade gracefully rather than the gate.
+**Actions:** resolve R1 by end of Day 1. Confirm R3 mitigation when the behavioral eval suite runs against NVIDIA GLM-5.2. R9's detection is closed by Gate B; its mitigation stays live through rehearsal, because the projector is what has to degrade gracefully rather than the gate.
 
 **Issues:** none open at baseline.
 

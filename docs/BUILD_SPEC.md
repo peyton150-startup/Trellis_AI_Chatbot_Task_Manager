@@ -74,9 +74,9 @@ Anything Sol must not change: <files or invariants>
 Two different choices, do not conflate them:
 
 - **Coding model** is who writes the repository. Opus 5 and Sol 5.6, per the table above.
-- **Runtime model** is `MODEL_ID`, the model the agent itself calls during the demo. The candidates are the same two, and the choice between them is made empirically by the Day 4 bakeoff, not by reputation.
+- **Runtime model** is `MODEL_ID`, the model the agent itself calls during the demo. The current and sole runtime model is NVIDIA hosted `z-ai/glm-5.2`.
 
-A file may be written by one and executed against the other. Nothing in the codebase names a model except `MODEL_ID` in the environment.
+Repository authoring still uses only Opus 5 and Sol 5.6. GLM-5.2 is runtime software behavior and never writes or reviews repository content.
 
 ### Budget triage
 
@@ -226,9 +226,8 @@ Environment variables, `.env.example`:
 ```
 DATABASE_URL=postgresql://trellis:trellis@localhost:55432/trellis
 TRELLIS_API_ORIGIN=http://127.0.0.1:8000
-MODEL_ID=<set from the Day 4 bakeoff; provisional default on Day 1>
-ANTHROPIC_API_KEY=
-OPENAI_API_KEY=
+MODEL_ID=z-ai/glm-5.2
+NVIDIA_API_KEY=
 ACTOR_ID=00000000-0000-0000-0000-000000000001
 DEMO_UNSAFE_PROMPT_MODE=false
 APP_ENV=dev
@@ -240,21 +239,25 @@ APPROVAL_TTL_SECONDS=300
 LEASE_TTL_SECONDS=120
 ```
 
-`MODEL_ID` is the only place a model is named. No model string appears anywhere else in the codebase.
-
-The runtime supports both `anthropic:<model>` with `ANTHROPIC_API_KEY` and
-`openai:<model>` with `OPENAI_API_KEY`. The provider prefix is part of
-`MODEL_ID`, not a second selector. When `agent.py` is built, construct the
-Pydantic AI agent directly from the configured value:
+`MODEL_ID` is the only runtime model selector and remains the model identity
+stored in `agent_runs`. The provider is fixed to NVIDIA hosted inference and
+`NVIDIA_API_KEY` is its server-owned credential. The endpoint is code-owned
+because there is one supported runtime provider:
 
 ```python
-agent = Agent(settings.model_id)
+provider = OpenAIProvider(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=settings.nvidia_api_key,
+)
+model = OpenAIChatModel(settings.model_id, provider=provider)
+agent = Agent(model)
 ```
 
-Do not branch on the provider in `agent.py`. Pydantic AI resolves the provider
-from the `MODEL_ID` prefix and reads the matching credential from the
-environment. Do not add a provider SDK pin unless the installed `pydantic-ai`
-version requires one; its dependency graph is authoritative.
+There is no OpenAI or Anthropic fallback, provider registry, configurable base
+URL, or provider selector. `build_agent(model=...)` bypasses this construction
+entirely for deterministic tests, and `get_agent()` remains lazy so importing
+`app.main` requires no provider credential. A default production construction
+without `NVIDIA_API_KEY` fails clearly before any provider fallback is possible.
 
 ---
 
@@ -1049,6 +1052,7 @@ Execute in order. Each task lists its files and its verification command. Do not
 | R2 | Blind review and execution checkpoint 2 | NON-AUTHORING MODEL + HUMAN | T10 reference tool, T11, and T12A/T12B boundary changes | See the R2 review and execution gate below. The same immutable SHA passes review, fresh-sandbox execution, lint, deterministic tests, and the production build before T13. |
 | T13 | Board and task card | SOL | `frontend/package.json`, `frontend/package-lock.json`, `frontend/tsconfig.json`, `frontend/next-env.d.ts`, `frontend/next.config.ts`, `frontend/app/layout.tsx`, `frontend/app/page.tsx`, `frontend/app/globals.css`, `frontend/components/Board.tsx`, `frontend/components/TaskCard.tsx`, `frontend/lib/useBoard.ts`, `frontend/lib/api.ts`, `frontend/lib/types.ts`, `.env.example`; plus the required CI, implementation-note, and CF-1 documentation companions | Board renders seed data through D-61's same-origin rewrite; `cd frontend && npm run build` passes in the cumulative `T13 frontend build` gate. File list expanded by the user's 2026-08-15 T13 handoff and D-61 because no production frontend scaffold existed before this task. |
 | T14 | Chat | SOL | `Chat.tsx`, `page.tsx`, `Board.tsx`, `package.json`, `package-lock.json` | Streaming turn visible, board refetches after tool completion. `page.tsx` owns the one `BoardState`; `Board` consumes it and `Chat` calls its `refetch` on `thread.runEnd`. Package files are included only for D-62's exact AG-UI client alignment. See the assistant-ui ownership note below. |
+| T14N | NVIDIA GLM-5.2 runtime provider retrofit | SOL | `backend/app/config.py`, `backend/app/agent.py`, `backend/tests/test_models.py`, `.env.example`, `docs/ARCHITECTURE.md`, `docs/BUILD_SPEC.md`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, `README.md`, `.github/workflows/ci.yml`, `IMPLEMENTATION_NOTES.md`; `CLAUDE.md` only if its runtime-provider wording becomes false | Default `build_agent()` constructs NVIDIA-backed `OpenAIChatModel` for `settings.model_id`; injected `build_agent(model=...)` bypasses provider construction; missing `NVIDIA_API_KEY` fails clearly at production construction; deterministic gates stay green; no normal CI test makes a network call. Activity AB pays for the task under D-63. |
 | T15 | **UGLY DEMO BAR** | either | none | Prompt to committed board update, unstyled |
 | T16 | Approval card | SOL | `ApprovalCard.tsx`, `useRun.ts` | Delete pauses, approve and reject both work. See the assistant-ui ownership note below. |
 | T17 | Clarifying question | SOL | `prompts.py` | "Clear my tasks" asks rather than deletes. Review with T23 only if that optional review is taken. |
@@ -1061,6 +1065,11 @@ Execute in order. Each task lists its files and its verification command. Do not
 | **R3** | **BLIND REVIEW CHECKPOINT 3** | **NON-AUTHORING MODEL + HUMAN** | **T17 + T23; include any kernel/boundary diff since R2** | Pin the review to an immutable SHA. Resolve every BLOCK finding and rerun the review against the new SHA before starting T24. T21 is cut and is not part of R3. |
 | T24 | Eval suite | SOL | `test_evals.py`, `fixtures/cases.py` | 15 cases run, pass rate recorded |
 | T25 | Polish, README, restore drill | SOL | `README.md` | Clean clone plus compose up reproduces the app |
+
+T14N changes `agent.py` after R2. The recorded R2 result does not cover this
+provider-construction diff. Carry the T14N `agent.py` change into R3, whose
+scope already includes every kernel or boundary diff since R2, and record the
+review finding or explicit no-findings result there. Do not rewrite R2 history.
 
 ### Optional Linear expansion: after T25 only
 
@@ -1194,6 +1203,24 @@ The only product behaviour `Chat.tsx` adds is the board refetch on tool completi
 At T16, D-06 already settles who owns an approval, and this task does not revisit it. The client may render the server record and dispatch approve or deny. It may not independently derive the approval identity, the authorization, the preview contents, the expiry, or the mutation arguments, and it may not treat a rendered card as evidence that an approval exists. Section 10 and the T12B proof list are authoritative for all of it. If a decision about approval behaviour appears to live in `ApprovalCard.tsx`, it is in the wrong file.
 
 Writing a chat system by hand here is the most likely way to lose an evening after the ugly demo bar is already green.
+
+### T14N: NVIDIA GLM-5.2 runtime provider retrofit
+
+The runtime provider is fixed to NVIDIA hosted inference. The normal CI gate
+uses only a dummy credential to inspect constructed objects and never issues a
+provider request. Run:
+
+```bash
+cd backend && pytest tests/test_models.py
+cd backend && ruff check .
+cd backend && pytest -m "not network"
+cd frontend && npm run build
+```
+
+The focused model test proves the default model and provider classes, model
+name, code-owned NVIDIA base URL, missing-key failure with no `OPENAI_API_KEY`
+fallback, credential-free injected `FunctionModel`, unchanged six-tool surface,
+and import safety for `app.main`.
 
 ### T22: instrumentation
 
