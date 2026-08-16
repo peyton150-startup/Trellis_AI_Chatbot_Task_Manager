@@ -759,3 +759,34 @@ Options:   A. Recommended: make Next.js the browser's same-origin facade. Add
               and all other paths to Next.js. The frontend uses relative
               `/api/tasks`, but local visible verification remains blocked until a
               concrete proxy configuration and ownership task are specified.
+
+## Q-21  T13 pinned incompatible direct and adapter-owned AG-UI client versions
+Task:      T14
+Blocking:  yes
+Status:    RESOLVED on 2026-08-16 by D-62, as option A
+Context:   Before D-62, a clean `npm ci` from `frontend/package-lock.json`
+           installed the app's direct `@ag-ui/client@0.0.58` and installed
+           `@ag-ui/client@0.0.57` beneath `@assistant-ui/react-ag-ui@0.0.54`.
+           The adapter declares `^0.0.57`, which does not include 0.0.58 under
+           semver rules for a `0.0.x` version. The official integration shape
+           constructs `HttpAgent` from the direct package and passes it to
+           `useAgUiRuntime`, but the production build rejects that exact shape:
+
+               Type 'HttpAgent' is not assignable to type 'AbstractAgent'.
+               Types have separate declarations of a private property '_debug'.
+
+           The T14 handoff says not to update T13's pinned dependencies unless a
+           verified incompatibility requires a user decision. This is that
+           incompatibility. A type cast would conceal it rather than resolve it.
+Options:   A. Recommended: align the direct `@ag-ui/client` pin to 0.0.57, the
+              exact class version `@assistant-ui/react-ag-ui@0.0.54` consumes,
+              and regenerate the lockfile. This is the smallest dependency
+              change and follows the adapter's installed contract.
+           B. Move `@assistant-ui/react-ag-ui` to a version whose declared client
+              dependency accepts 0.0.58, after probing that version against the
+              pinned React and assistant-ui packages. This expands the dependency
+              change and requires a fresh compatibility check.
+           C. Keep both versions and explicitly cast the direct `HttpAgent` at
+              the adapter boundary. Runtime shapes may currently agree, but this
+              suppresses the private-class mismatch and leaves two AG-UI client
+              implementations in the production bundle.

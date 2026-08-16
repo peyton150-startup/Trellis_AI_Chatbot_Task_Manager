@@ -1,10 +1,14 @@
 "use client";
 
 import { TaskCard } from "./TaskCard";
-import { useBoard } from "../lib/useBoard";
+import type { BoardState } from "../lib/useBoard";
 
-export function Board() {
-  const { tasks, isLoading, error, refetch } = useBoard();
+interface BoardProps {
+  state: BoardState;
+}
+
+export function Board({ state }: BoardProps) {
+  const { tasks, isLoading, error, refetch } = state;
 
   if (isLoading && tasks.length === 0) {
     return <p className="board-state">Loading committed tasks...</p>;

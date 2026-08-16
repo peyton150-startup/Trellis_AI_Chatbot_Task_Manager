@@ -2021,6 +2021,25 @@ rewrite and `.env.example` declares `TRELLIS_API_ORIGIN`. This expansion is in
 addition to the minimum production frontend scaffold and companion files
 authorized in the T13 handoff.
 
+### D-62: T14 aligns the direct AG-UI client to the adapter's exact class version
+
+T14 pins the direct `@ag-ui/client` dependency to 0.0.57. That is the exact
+version consumed by `@assistant-ui/react-ag-ui@0.0.54`, so npm installs one
+deduplicated `HttpAgent` class for both the application and adapter.
+
+The T13 graph pinned the direct client to 0.0.58 while the adapter declared
+`^0.0.57`. Under semver rules for a `0.0.x` package, that range excludes
+0.0.58, so a clean install produced two clients. The official integration
+shape then failed TypeScript checking because each `HttpAgent` declaration owns
+its own private `_debug` member. Matching public methods do not make classes
+with different private-member origins assignable.
+
+The resolution changes only the direct client pin and regenerated lock graph.
+It does not cast across the mismatch, override the adapter's declared range, or
+upgrade the adapter. A clean `npm ci` now deduplicates both consumers to 0.0.57,
+and the production build accepts the documented `HttpAgent` to
+`useAgUiRuntime` boundary. This resolves Q-21 as option A.
+
 ---
 
 ## Approval bridge decisions recorded at T12B

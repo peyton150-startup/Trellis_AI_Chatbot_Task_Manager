@@ -1376,3 +1376,90 @@ review remains deferred to the T15 smoke and manual checkpoint. The GitHub job
 must report green once before its exact name is added to master's required
 status checks, and live provider verification remains carried from T12A and
 T12B.
+
+## T14: Chat
+
+**Local role:** Adds the production assistant-ui chat surface and connects its
+run lifecycle to the existing committed-state board. `Chat.tsx` constructs one
+`HttpAgent` for the relative `/api/agui` endpoint, adapts it with
+`useAgUiRuntime`, and renders the thread, messages, composer input, and send
+control with assistant-ui primitives. A provider-scoped `useAuiEvent` listener
+handles `thread.runEnd` by calling the supplied completion callback. `page.tsx`
+now owns the one `useBoard()` instance, passes that `BoardState` to `Board`, and
+passes `board.refetch` to `Chat`. `Board` preserves all T13 rendering behavior
+while consuming the supplied state rather than creating a second store.
+
+**Whole-system role:** This is the visible client half of the prompt to
+committed-board flow. The browser owns neither task state nor message-history
+authority: assistant-ui manages local thread, composer, streaming, and scroll
+mechanics; D-61's same-origin facade forwards `/api/agui` and `/api/tasks` to
+FastAPI; PostgreSQL remains authoritative; and the run-completion event causes
+a fresh read of committed state rather than an optimistic task mutation. The
+same refetch occurs after non-mutating and failed runs, which is safe because it
+is read-only. T16 still owns approval UI and T19 still owns degraded-state
+presentation.
+
+**Inputs and dependencies:** Consumes T12A/T12B's `POST /api/agui` transport,
+D-51 through D-53 and D-58's server-owned trust boundary, D-61's relative API
+rewrite, and T13's `BoardState.refetch: () => Promise<void>` interface. D-62
+resolves Q-21 by aligning the direct `@ag-ui/client` pin to 0.0.57, the exact
+version consumed by `@assistant-ui/react-ag-ui@0.0.54`. The regenerated npm
+lock graph deduplicates both consumers to one `HttpAgent` class. No type cast,
+adapter upgrade, backend change, CORS policy, Next.js API route, polling, local
+persistence, or new frontend state library is introduced.
+
+**Outputs and consumers:** Exports `Chat`, whose `onRunComplete` callback is the
+only Trellis-specific addition to assistant-ui's runtime. The T14 composition
+produces one browser path:
+
+```text
+assistant-ui composer
+-> HttpAgent POST /api/agui
+-> D-61 Next.js rewrite
+-> FastAPI and PostgreSQL
+-> thread.runEnd
+-> BoardState.refetch()
+-> GET /api/tasks
+-> visible committed board
+```
+
+The cumulative CI job is named `T14 chat integration`. It installs the locked
+frontend graph on Node 22.23.2, checks the one-store, relative transport,
+assistant-ui primitive, and run-end wiring, then runs the production build.
+T15 consumes this unstyled surface for the deployed smoke and manual checkpoint.
+
+**Verification:** Q-21 was proved red and green against clean installs. With the
+T13 direct 0.0.58 pin, `npm run build` compiled JavaScript but failed TypeScript
+with `HttpAgent` not assignable to the adapter's `AbstractAgent` because the two
+classes declared separate private `_debug` fields. After D-62, `npm ls
+@ag-ui/client --all` reported the direct and adapter consumers both at 0.0.57,
+with the adapter copy deduplicated. A clean `npm ci --no-audit --no-fund`
+installed 137 packages, and `npm run build` compiled, type-checked, generated
+three static pages, and exited 0. The exact inline T14 wiring probe printed:
+
+```text
+PASS T14: one board store, assistant-ui chat, relative AG-UI transport, and run-end refetch are wired
+```
+
+Against Compose PostgreSQL 16, `cd backend && ruff check .` passed and
+`cd backend && pytest -m "not network"` passed 40 tests with 13 network tests
+deselected. The demo reset returned 11 tasks, and
+`GET http://127.0.0.1:3000/api/tasks` returned those same 11 through D-61's
+rewrite. A real in-app browser loaded the production Next.js server, rendered
+the visible assistant chat and exactly 11 task cards, enabled and submitted
+`Create a task called T14 Preview`, and displayed that user turn. FastAPI
+recorded same-origin `POST /api/agui`, followed by `GET /api/tasks`, which proves
+the runtime completion path triggered the board refetch.
+
+**Limitations and review status:** No `MODEL_ID` or provider credential was
+configured. The local AG-UI request therefore returned 500 with Pydantic AI's
+`Unknown model` error before an assistant response or tool call, and the board
+correctly remained at 11 tasks with zero `T14 Preview` task cards. Live streaming,
+one committed create, and automatic display of that committed task are not
+claimed. The backend was not weakened or substituted to manufacture live
+evidence. Vercel Preview build, deployment, URL, deployed SHA, and hosted
+frontend-to-backend verification are deliberately deferred by the user's
+2026-08-15 instruction. The GitHub job has not yet reported, branch protection
+has not yet been inspected for the new name, and no push or draft PR has been
+performed. No T16 approval UI or T15 work was implemented. T14 has no dedicated
+blind review; visible review remains assigned to T15.
