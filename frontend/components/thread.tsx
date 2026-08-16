@@ -532,13 +532,32 @@ const UserMessage: FC = () => {
   );
 };
 
+// Row rather than column, because the bar was single-button when it was
+// generated and stacking Copy above Edit would read as two separate controls
+// rather than one action bar.
 const UserActionBar: FC = () => {
   return (
     <ActionBarPrimitive.Root
       hideWhenRunning
       autohide="not-last"
-      className="aui-user-action-bar-root flex flex-col items-end"
+      className="aui-user-action-bar-root flex flex-row items-center gap-1"
     >
+      {/*
+        Copy sits beside Edit on a past prompt, using the same
+        `ActionBarPrimitive.Copy` the assistant bar uses. The copied state is
+        read from `message.isCopied` rather than tracked locally, so the tick
+        and its timeout follow the same rules on both roles.
+      */}
+      <ActionBarPrimitive.Copy asChild>
+        <TooltipIconButton tooltip="Copy" className="aui-user-action-copy">
+          <AuiIf condition={(s) => s.message.isCopied}>
+            <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
+          </AuiIf>
+          <AuiIf condition={(s) => !s.message.isCopied}>
+            <CopyIcon className="animate-in zoom-in-75 fade-in duration-150" />
+          </AuiIf>
+        </TooltipIconButton>
+      </ActionBarPrimitive.Copy>
       <ActionBarPrimitive.Edit asChild>
         <TooltipIconButton tooltip="Edit" className="aui-user-action-edit">
           <PencilIcon />
