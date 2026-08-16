@@ -27,7 +27,12 @@ export function Chat({ onRunComplete }: ChatProps) {
       }),
     [],
   );
-  const runtime = useAgUiRuntime({ agent });
+  const runtime = useAgUiRuntime({
+    agent,
+    onError: () => {
+      void onRunComplete();
+    },
+  });
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>

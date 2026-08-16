@@ -4408,7 +4408,11 @@ jobs:
             /new HttpAgent\s*\(\s*\{[\s\S]*?url:\s*["']\/api\/agui["']/,
             "Chat.tsx must create one HttpAgent for the relative /api/agui endpoint",
           );
-          requireMatch(chat, /useAgUiRuntime\s*\(\s*\{\s*agent\s*\}\s*\)/, "Chat.tsx must use the AG-UI runtime");
+          requireMatch(
+            chat,
+            /useAgUiRuntime\s*\(\s*\{\s*agent(?:\s*,[\s\S]*?)?\}\s*\)/,
+            "Chat.tsx must use the AG-UI runtime",
+          );
           requireMatch(
             chat,
             /useAuiEvent\s*\(\s*["']thread\.runEnd["'][\s\S]*?onRunComplete\s*\(/,
@@ -4457,3 +4461,342 @@ jobs:
       - name: Build production frontend
         working-directory: frontend
         run: npm run build
+
+  t19-reliability:
+    name: T19 timeout retry degraded state
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      - name: Prove timeout and post-commit degraded-state behavior
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+
+          from fastapi.testclient import TestClient
+          from pydantic_ai.messages import ModelRequest, ToolReturnPart
+          from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+          from app import agent as agent_module
+          from app import sql
+          from app.db import pool
+          from app.main import app
+
+
+          PROMPT = "Create a task called T19 Forced Timeout"
+          CALL_ID = "call-t19-create-0001"
+          model_calls = []
+
+
+          def reset():
+              model_calls.clear()
+              with pool.connection() as conn:
+                  conn.execute(sql.TRUNCATE_ALL_STATE)
+                  conn.commit()
+
+
+          def body(message=PROMPT):
+              return {
+                  "threadId": "client-owned-thread",
+                  "runId": "client-owned-run",
+                  "state": None,
+                  "messages": [
+                      {
+                          "id": "m1",
+                          "role": "user",
+                          "content": message,
+                      }
+                  ],
+                  "tools": [],
+                  "context": [],
+                  "forwardedProps": {},
+              }
+
+
+          def sse(text):
+              return [
+                  json.loads(line[6:])
+                  for line in text.splitlines()
+                  if line.startswith("data: ")
+              ]
+
+
+          async def post_commit_timeout(messages, _info):
+              model_calls.append(list(messages))
+
+              tool_completed = any(
+                  isinstance(part, ToolReturnPart)
+                  for message in messages
+                  if isinstance(message, ModelRequest)
+                  for part in message.parts
+              )
+
+              if tool_completed:
+                  raise TimeoutError("forced provider timeout after commit")
+
+              yield {
+                  0: DeltaToolCall(
+                      name="create_task",
+                      json_args=json.dumps(
+                          {"title": "T19 Forced Timeout"}
+                      ),
+                      tool_call_id=CALL_ID,
+                  )
+              }
+
+
+          client = TestClient(app)
+
+          print("[1] timeout after committed mutation")
+          reset()
+
+          agent_module.get_agent = lambda: agent_module.build_agent(
+              FunctionModel(
+                  stream_function=post_commit_timeout,
+                  model_name="t19-post-commit-timeout",
+              )
+          )
+
+          response = client.post("/api/agui", json=body())
+
+          assert response.status_code == 200, response.text
+
+          events = sse(response.text)
+          kinds = [event["type"] for event in events]
+
+          assert "TOOL_CALL_RESULT" in kinds, kinds
+          assert "RUN_ERROR" in kinds, kinds
+          assert "RUN_FINISHED" not in kinds, kinds
+
+          assert (
+              "At least one task change was committed, but the assistant response "
+              "could not finish."
+              in response.text
+          ), response.text
+
+          with pool.connection() as conn:
+              tasks = conn.execute(
+                  "SELECT title FROM tasks ORDER BY created_at"
+              ).fetchall()
+
+              invocations = conn.execute(
+                  """
+                  SELECT tool_name, status
+                  FROM tool_invocations
+                  ORDER BY created_at
+                  """
+              ).fetchall()
+
+              task_events = conn.execute(
+                  """
+                  SELECT operation
+                  FROM task_events
+                  ORDER BY created_at
+                  """
+              ).fetchall()
+
+              run = conn.execute(
+                  """
+                  SELECT status, error
+                  FROM agent_runs
+                  """
+              ).fetchone()
+
+              conn.commit()
+
+          assert [row["title"] for row in tasks] == [
+              "T19 Forced Timeout"
+          ], tasks
+
+          completed_creates = [
+              row
+              for row in invocations
+              if row["tool_name"] == "create_task"
+              and row["status"] == "completed"
+          ]
+
+          assert len(completed_creates) == 1, invocations
+          assert [row["operation"] for row in task_events] == [
+              "created"
+          ], task_events
+
+          assert run["status"] == "failed", run
+          assert "mutation_committed=true" in run["error"], run
+          assert "forced provider timeout after commit" in run["error"], run
+
+          # Initial model request plus the failed post-tool model request.
+          assert len(model_calls) == 2, len(model_calls)
+
+          print("  PASS mutation committed exactly once")
+          print("  PASS run remains FAILED")
+          print("  PASS durable error records mutation_committed=true")
+          print("  PASS deterministic degraded RUN_ERROR reached client")
+          print("  PASS the whole user request was not replayed")
+
+
+          print("[2] timeout before any mutation")
+          reset()
+
+
+          async def pre_commit_timeout(messages, _info):
+              model_calls.append(list(messages))
+              raise TimeoutError("forced provider timeout before commit")
+
+              if False:
+                  yield ""
+
+
+          agent_module.get_agent = lambda: agent_module.build_agent(
+              FunctionModel(
+                  stream_function=pre_commit_timeout,
+                  model_name="t19-pre-commit-timeout",
+              )
+          )
+
+          response = client.post(
+              "/api/agui",
+              json=body("Create a task that must never commit"),
+          )
+
+          assert response.status_code == 200, response.text
+
+          events = sse(response.text)
+          kinds = [event["type"] for event in events]
+
+          assert "RUN_ERROR" in kinds, kinds
+
+          with pool.connection() as conn:
+              task_count = conn.execute(
+                  "SELECT count(*) AS n FROM tasks"
+              ).fetchone()["n"]
+
+              event_count = conn.execute(
+                  "SELECT count(*) AS n FROM task_events"
+              ).fetchone()["n"]
+
+              invocation_count = conn.execute(
+                  "SELECT count(*) AS n FROM tool_invocations"
+              ).fetchone()["n"]
+
+              run = conn.execute(
+                  """
+                  SELECT status, error
+                  FROM agent_runs
+                  """
+              ).fetchone()
+
+              conn.commit()
+
+          assert task_count == 0
+          assert event_count == 0
+          assert invocation_count == 0
+          assert run["status"] == "failed", run
+          assert "forced provider timeout before commit" in run["error"], run
+          assert "mutation_committed=true" not in run["error"], run
+
+          print("  PASS pre-commit timeout mutated nothing")
+          print("  PASS pre-commit timeout remains ordinary FAILED run")
+          print()
+          print("PASS T19 deterministic degraded-state gate")
+          PY
+
+      - name: Verify bounded provider policy and frontend error refetch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path("backend/app/agent.py").read_text(encoding="utf-8")
+
+          required = [
+              "_MODEL_REQUEST_MAX_RETRIES = 2",
+              "max_concurrency=1",
+              "timeout=settings.model_timeout_seconds",
+              "tool_timeout=settings.tool_timeout_seconds",
+              "max_retries=_MODEL_REQUEST_MAX_RETRIES",
+          ]
+
+          for fragment in required:
+              if fragment not in source:
+                  raise SystemExit(
+                      f"T19 backend reliability wiring is missing {fragment!r}"
+                  )
+
+          print("PASS bounded provider retry, timeout, tool timeout, and one-run concurrency wiring")
+          PY
+
+          node --input-type=module <<'JS'
+          import fs from "node:fs";
+
+          const chat = fs.readFileSync(
+            "frontend/components/Chat.tsx",
+            "utf8",
+          );
+
+          const requireMatch = (pattern, message) => {
+            if (!pattern.test(chat)) {
+              throw new Error(message);
+            }
+          };
+
+          requireMatch(
+            /onError\s*:\s*\(\)\s*=>\s*\{[\s\S]*?onRunComplete\s*\(\s*\)/,
+            "RUN_ERROR must trigger the authoritative board refetch callback",
+          );
+
+          requireMatch(
+            /useAuiEvent\s*\(\s*["']thread\.runEnd["'][\s\S]*?onRunComplete\s*\(/,
+            "successful thread.runEnd must still trigger the board refetch callback",
+          );
+
+          console.log(
+            "PASS both successful runs and RUN_ERROR refresh authoritative board state",
+          );
+          JS
+
+      - name: Run non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
