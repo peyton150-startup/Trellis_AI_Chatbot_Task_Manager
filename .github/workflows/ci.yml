@@ -4324,3 +4324,90 @@ jobs:
       - name: Build production frontend
         working-directory: frontend
         run: npm run build
+
+  t14-chat-integration:
+    name: T14 chat integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Verify the chat and board completion wiring
+        working-directory: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import fs from "node:fs";
+
+          const load = (path) => {
+            if (!fs.existsSync(path)) {
+              throw new Error(`${path} does not exist`);
+            }
+            return fs.readFileSync(path, "utf8");
+          };
+          const requireMatch = (source, pattern, message) => {
+            if (!pattern.test(source)) {
+              throw new Error(message);
+            }
+          };
+
+          const page = load("app/page.tsx");
+          const board = load("components/Board.tsx");
+          const chat = load("components/Chat.tsx");
+
+          if ((page.match(/useBoard\s*\(/g) ?? []).length !== 1) {
+            throw new Error("page.tsx must own one useBoard instance");
+          }
+          requireMatch(page, /<Board\s+state=\{board\}\s*\/>/, "page.tsx must pass the board state to Board");
+          requireMatch(
+            page,
+            /<Chat\s+onRunComplete=\{board\.refetch\}\s*\/>/,
+            "page.tsx must connect Chat completion to board.refetch",
+          );
+          if (/useBoard\s*\(/.test(board)) {
+            throw new Error("Board.tsx must consume BoardState rather than create a second board store");
+          }
+
+          requireMatch(
+            chat,
+            /new HttpAgent\s*\(\s*\{\s*url:\s*["']\/api\/agui["']\s*\}\s*\)/,
+            "Chat.tsx must create one HttpAgent for the relative /api/agui endpoint",
+          );
+          requireMatch(chat, /useAgUiRuntime\s*\(\s*\{\s*agent\s*\}\s*\)/, "Chat.tsx must use the AG-UI runtime");
+          requireMatch(
+            chat,
+            /useAuiEvent\s*\(\s*["']thread\.runEnd["'][\s\S]*?onRunComplete\s*\(/,
+            "thread.runEnd must trigger the board completion callback",
+          );
+          for (const primitive of [
+            "AssistantRuntimeProvider",
+            "ThreadPrimitive.Root",
+            "ThreadPrimitive.Messages",
+            "ComposerPrimitive.Root",
+            "ComposerPrimitive.Input",
+            "ComposerPrimitive.Send",
+            "MessagePrimitive.Content",
+          ]) {
+            if (!chat.includes(`<${primitive}`)) {
+              throw new Error(`Chat.tsx must render ${primitive}`);
+            }
+          }
+          console.log("PASS T14: one board store, assistant-ui chat, relative AG-UI transport, and run-end refetch are wired");
+          JS
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build

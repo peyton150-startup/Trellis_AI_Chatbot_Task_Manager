@@ -1,6 +1,12 @@
+"use client";
+
 import { Board } from "../components/Board";
+import { Chat } from "../components/Chat";
+import { useBoard } from "../lib/useBoard";
 
 export default function HomePage() {
+  const board = useBoard();
+
   return (
     <main>
       <header className="page-header">
@@ -13,7 +19,8 @@ export default function HomePage() {
           with the latest committed database state.
         </p>
       </header>
-      <Board />
+      <Chat onRunComplete={board.refetch} />
+      <Board state={board} />
     </main>
   );
 }
