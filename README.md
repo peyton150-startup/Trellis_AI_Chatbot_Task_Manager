@@ -61,6 +61,9 @@ Instead:
 
 The LLM chooses **what it wants to do**. The application decides **whether that action is valid and whether it actually happened**.
 
+**Deployment:** Use a named Cloudflare Tunnel with a persistent hostname for the Ubuntu FastAPI backend; configure that same HTTPS origin in Vercel (`TRELLIS_API_ORIGIN`) and Linear's agent webhook so server reboots do not require URL reconfiguration.
+
+
 ## System flow
 
 ```mermaid
