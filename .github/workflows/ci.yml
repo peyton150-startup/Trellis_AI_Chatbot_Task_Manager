@@ -4405,7 +4405,7 @@ jobs:
 
           requireMatch(
             chat,
-            /new HttpAgent\s*\(\s*\{\s*url:\s*["']\/api\/agui["']\s*\}\s*\)/,
+            /new HttpAgent\s*\(\s*\{[\s\S]*?url:\s*["']\/api\/agui["']/,
             "Chat.tsx must create one HttpAgent for the relative /api/agui endpoint",
           );
           requireMatch(chat, /useAgUiRuntime\s*\(\s*\{\s*agent\s*\}\s*\)/, "Chat.tsx must use the AG-UI runtime");
@@ -4414,21 +4414,45 @@ jobs:
             /useAuiEvent\s*\(\s*["']thread\.runEnd["'][\s\S]*?onRunComplete\s*\(/,
             "thread.runEnd must trigger the board completion callback",
           );
-          for (const primitive of [
-            "AssistantRuntimeProvider",
-            "ThreadPrimitive.Root",
-            "ThreadPrimitive.Messages",
-            "ComposerPrimitive.Root",
-            "ComposerPrimitive.Input",
-            "ComposerPrimitive.Send",
-            "MessagePrimitive.Content",
-          ]) {
-            if (!chat.includes(`<${primitive}`)) {
-              throw new Error(`Chat.tsx must render ${primitive}`);
-            }
+          requireMatch(
+            chat,
+            /import\s*\{\s*Thread\s*\}\s*from\s*["']@\/components\/thread["']/,
+            "Chat.tsx must import the official generated assistant-ui Thread",
+          );
+          requireMatch(chat, /<AssistantRuntimeProvider\s+runtime=\{runtime\}>/, "Chat.tsx must provide the runtime");
+          requireMatch(chat, /<Thread\s*\/>/, "Chat.tsx must render the official generated assistant-ui Thread");
+          if (/\b(?:Thread|Composer|Message)Primitive\b/.test(chat)) {
+            throw new Error("Chat.tsx must not hand-compose thread, composer, or message primitives");
           }
-          console.log("PASS T14: one board store, assistant-ui chat, relative AG-UI transport, and run-end refetch are wired");
+          console.log("PASS T14: one board store, official assistant-ui Thread, relative AG-UI transport, and run-end refetch are wired");
           JS
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+
+  t14i-ngrok-ingress-compatibility:
+    name: T14I ngrok ingress compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Verify the free-ngrok compatibility header
+        working-directory: frontend
+        run: npm run test:ingress
 
       - name: Build production frontend
         working-directory: frontend

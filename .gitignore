@@ -12,3 +12,8 @@
 # Production frontend install and build outputs.
 frontend/node_modules/
 frontend/.next/
+
+# Vercel's local project link and pulled environment files can contain tokens.
+frontend/.vercel/
+frontend/.env.local
+frontend/.env.*.local

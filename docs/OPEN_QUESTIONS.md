@@ -790,3 +790,25 @@ Options:   A. Recommended: align the direct `@ag-ui/client` pin to 0.0.57, the
               the adapter boundary. Runtime shapes may currently agree, but this
               suppresses the private-class mismatch and leaves two AG-UI client
               implementations in the production bundle.
+
+## Q-22  Vercel reported one upstream DNS resolution failure during hosted smoke
+Task:      T15, discovered during the T14I diagnosis
+Blocking:  no; becomes blocking if it recurs during the hosted T15 gate
+Status:    OPEN, recorded on 2026-08-16
+Context:   Vercel returned `DNS_HOSTNAME_NOT_FOUND` once for both `/api/agui` and
+           the subsequent `/api/tasks` refetch, and the corresponding Ubuntu
+           journal window contained no Uvicorn entry. The event was directly
+           observed and is not disputed.
+
+           T14I did not reproduce it. Twenty alternating direct-ngrok and Vercel
+           rewrite reads all reached ngrok, and the separate reproducible failure
+           was ngrok's free-plan interstitial. Adding ngrok's documented bypass
+           header restored 11-task JSON and a complete AG-UI SSE run through the
+           unchanged rewrite. No causal relationship between the observed DNS
+           event and the interstitial has been established.
+Options:   A. Keep this as an operational observation and require repeated hosted
+              T15 verification. If it recurs, correlate the exact Vercel request
+              id with ngrok endpoint and DNS evidence before changing code.
+           B. Move to a paid or independently managed stable ingress if repeated
+              DNS evidence shows the free development domain cannot meet the demo
+              reliability bar. This is deployment work, not a route-handler fix.

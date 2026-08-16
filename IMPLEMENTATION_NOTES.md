@@ -1382,8 +1382,10 @@ T12B.
 **Local role:** Adds the production assistant-ui chat surface and connects its
 run lifecycle to the existing committed-state board. `Chat.tsx` constructs one
 `HttpAgent` for the relative `/api/agui` endpoint, adapts it with
-`useAgUiRuntime`, and renders the thread, messages, composer input, and send
-control with assistant-ui primitives. A provider-scoped `useAuiEvent` listener
+`useAgUiRuntime`, and renders the official generated assistant-ui `Thread`.
+That registry component owns the thread viewport, messages, composer, streaming,
+scrolling, attachment, markdown, reasoning, and fallback-tool presentation. A
+provider-scoped `useAuiEvent` listener
 handles `thread.runEnd` by calling the supplied completion callback. `page.tsx`
 now owns the one `useBoard()` instance, passes that `BoardState` to `Board`, and
 passes `board.refetch` to `Chat`. `Board` preserves all T13 rendering behavior
@@ -1391,8 +1393,9 @@ while consuming the supplied state rather than creating a second store.
 
 **Whole-system role:** This is the visible client half of the prompt to
 committed-board flow. The browser owns neither task state nor message-history
-authority: assistant-ui manages local thread, composer, streaming, and scroll
-mechanics; D-61's same-origin facade forwards `/api/agui` and `/api/tasks` to
+authority: the generated assistant-ui `Thread` manages local thread, composer,
+streaming, and scroll mechanics; D-61's same-origin facade forwards `/api/agui`
+and `/api/tasks` to
 FastAPI; PostgreSQL remains authoritative; and the run-completion event causes
 a fresh read of committed state rather than an optimistic task mutation. The
 same refetch occurs after non-mutating and failed runs, which is safe because it
@@ -1401,12 +1404,16 @@ presentation.
 
 **Inputs and dependencies:** Consumes T12A/T12B's `POST /api/agui` transport,
 D-51 through D-53 and D-58's server-owned trust boundary, D-61's relative API
-rewrite, and T13's `BoardState.refetch: () => Promise<void>` interface. D-62
+rewrite, and T13's `BoardState.refetch: () => Promise<void>` interface. The
+shadcn setup adds Tailwind's PostCSS integration, the `@/*` path alias, `cn()`,
+theme variables, and the generated component dependency graph. The root layout
+provides the tooltip context required by the generated Thread. D-62
 resolves Q-21 by aligning the direct `@ag-ui/client` pin to 0.0.57, the exact
 version consumed by `@assistant-ui/react-ag-ui@0.0.54`. The regenerated npm
 lock graph deduplicates both consumers to one `HttpAgent` class. No type cast,
 adapter upgrade, backend change, CORS policy, Next.js API route, polling, local
-persistence, or new frontend state library is introduced.
+persistence, or Trellis-owned frontend state store is introduced. The generated
+attachment helper uses its pinned Zustand dependency internally.
 
 **Outputs and consumers:** Exports `Chat`, whose `onRunComplete` callback is the
 only Trellis-specific addition to assistant-ui's runtime. The T14 composition
@@ -1425,7 +1432,8 @@ assistant-ui composer
 
 The cumulative CI job is named `T14 chat integration`. It installs the locked
 frontend graph on Node 22.23.2, checks the one-store, relative transport,
-assistant-ui primitive, and run-end wiring, then runs the production build.
+official generated Thread, absence of hand-composed primitives, and run-end
+wiring, then runs the production build.
 T15 consumes this unstyled surface for the deployed smoke and manual checkpoint.
 
 **Verification:** Q-21 was proved red and green against clean installs. With the
@@ -1440,6 +1448,36 @@ three static pages, and exited 0. The exact inline T14 wiring probe printed:
 ```text
 PASS T14: one board store, assistant-ui chat, relative AG-UI transport, and run-end refetch are wired
 ```
+
+The user's 2026-08-16 conformance correction was first proved red against the
+hand-composed `Chat.tsx`: the revised source contract failed because the
+official generated Thread import was absent. After generating only
+`@assistant-ui/thread` and replacing that composition, the focused contract
+printed:
+
+```text
+PASS T14 Thread conformance source contract
+```
+
+The generator created ten assistant-ui files and five shadcn primitives. A file
+inventory confirmed that it created no thread-list, sidebar, mobile hook, or
+GitHub icon. The first production build isolated a TypeScript 7 setup mismatch:
+the generator prerequisite's `baseUrl` option has been removed. Removing only
+that option while retaining the relative `@/*` paths mapping made the production
+build compile, type-check, generate three static pages, and exit 0.
+The required clean verification then ran `npm ci --no-audit --no-fund`, which
+installed 261 packages, followed by another production build with the same
+successful compile, type-check, and three-page result. The revised cumulative
+T14 contract printed:
+
+```text
+PASS T14: one board store, official assistant-ui Thread, relative AG-UI transport, and run-end refetch are wired
+```
+
+Backend regression verification remained green: Ruff reported `All checks
+passed!`, and the deterministic pytest selection passed 40 tests with 13
+network tests deselected. The pytest cache warning is unchanged and does not
+affect collection or execution.
 
 Against Compose PostgreSQL 16, `cd backend && ruff check .` passed and
 `cd backend && pytest -m "not network"` passed 40 tests with 13 network tests
@@ -1459,7 +1497,11 @@ one committed create, and automatic display of that committed task are not
 claimed. The backend was not weakened or substituted to manufacture live
 evidence. Vercel Preview build, deployment, URL, deployed SHA, and hosted
 frontend-to-backend verification are deliberately deferred by the user's
-2026-08-15 instruction. The GitHub job has not yet reported, branch protection
+2026-08-15 instruction. The 2026-08-16 correction deliberately stops before the
+T15 smoke checkpoint and does not add thread-list or conversation-management UI.
+The Cloudflare Quick Tunnel to ngrok handoff changes only Ubuntu and Vercel
+deployment configuration: D-61, `/api/agui`, SSE framing, and application code
+remain unchanged. The GitHub job has not yet reported, branch protection
 has not yet been inspected for the new name, and no push or draft PR has been
 performed. No T16 approval UI or T15 work was implemented. T14 has no dedicated
 blind review; visible review remains assigned to T15.
@@ -1520,3 +1562,63 @@ prompt to committed-board live smoke remains T15's gate. Because T14N changes
 include the T14N boundary-adjacent diff under its existing carry-forward rule.
 No KERNEL file, `main.py`, tool wrapper, approval behavior, deployment
 configuration, or production secret changed.
+
+## T14I: Free-ngrok demo ingress compatibility
+
+**Local role:** Adds the explicitly vendor-scoped `NGROK_BYPASS_HEADERS` shim
+required by ngrok's free-plan interstitial. `fetchTasks` merges the header while
+preserving caller headers, and the existing `HttpAgent` receives the same header
+through its supported configuration. The helper owns no hostname, credential,
+routing decision, retry, or response behavior.
+
+**Whole-system role:** Unblocks the hosted T15 path without replacing D-61. The
+browser still calls relative `/api/tasks` and `/api/agui`; Next.js still rewrites
+both to server-only `TRELLIS_API_ORIGIN`; FastAPI still owns the wire contract;
+PostgreSQL remains authoritative; and `thread.runEnd` still triggers a committed
+board refetch. The shim prevents ngrok's free-plan warning body from being
+mistaken for task JSON or an AG-UI stream.
+
+**Inputs and dependencies:** Consumes D-61's same-origin rewrite, D-62's exact
+`@ag-ui/client@0.0.57` pin, D-63's NVIDIA runtime, ngrok's documented
+`ngrok-skip-browser-warning` header, and `HttpAgentConfig.headers`. The T14I
+diagnosis handoff records the production deployment, repeated request samples,
+and read-only SSE proof. Q-22 separately preserves the one observed but not
+reproduced `DNS_HOSTNAME_NOT_FOUND` event.
+
+**Outputs and consumers:** Produces `NGROK_BYPASS_HEADERS` and
+`withNgrokBypassHeaders` in `frontend/lib/ngrokDemoIngress.ts`. `Chat.tsx` and
+`frontend/lib/api.ts` are the only production consumers. The stable cumulative
+CI job is named `T14I ngrok ingress compatibility`; it runs the offline Node
+tests and production frontend build without an external request. T15 consumes
+the corrected hosted transport.
+
+**Verification:** TDD first failed because the ngrok demo ingress module did not
+exist. After the constant was added, the first test passed. A second test then
+failed because the merge helper did not exist; after its minimal implementation,
+both tests passed. Mutation targets are a missing or wrong bypass value, loss of
+an existing caller header, and allowing a caller to blank the required bypass.
+
+Diagnosis against production proved:
+
+```text
+without header, Vercel /api/tasks     200 text/plain, 233-byte ngrok interstitial
+with header, Vercel /api/tasks        200 application/json, 11 tasks
+with header, Vercel /api/agui         200 text/event-stream
+SSE terminal events                   RUN_STARTED, RUN_FINISHED, no RUN_ERROR
+```
+
+Local verification after implementation:
+
+```text
+cd frontend && npm run test:ingress   2 passed
+cd frontend && npm run build          compiled, type-checked, 3 static pages
+```
+
+**Limitations and review status:** The correction is specific to a free ngrok
+development ingress and can be removed when the deployment no longer injects
+the interstitial. It does not address or explain the separately observed DNS
+event. Hosted Preview, a real browser turn, exactly one committed safe mutation,
+the automatic board refetch, cumulative GitHub CI, and branch-protection update
+remain required before the pull request is ready. T14I changes no backend,
+provider, approval, policy, idempotency, tool, database, CORS, route-handler, or
+SSE-framing behavior.

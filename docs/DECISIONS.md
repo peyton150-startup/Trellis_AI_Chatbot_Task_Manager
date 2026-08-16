@@ -2479,3 +2479,34 @@ runtime software behavior only. T15 remains the next gate after T14N.
 T14N changes `agent.py` after the immutable R2 checkpoint. R2 is not claimed to
 have reviewed this code. The provider-construction diff is carried into R3,
 which already owns every kernel or boundary diff since R2.
+
+---
+
+## Demo ingress decision recorded at T14I
+
+### D-64: free-ngrok compatibility is an explicit browser header shim
+
+The hosted T15 diagnosis reproduced a deterministic blocker on ngrok's free
+plan. Requests without `ngrok-skip-browser-warning` reached the configured ngrok
+domain but received its 233-byte interstitial as HTTP 200 `text/plain`. The
+board then attempted to parse that body as JSON. The same request with
+`ngrok-skip-browser-warning: 1` returned HTTP 200 `application/json` with all 11
+tasks through the unchanged D-61 rewrite. A real AG-UI POST carrying the header
+returned `text/event-stream` with `RUN_STARTED` and `RUN_FINISHED` and no
+`RUN_ERROR`.
+
+T14I therefore adds one explicitly vendor-scoped `NGROK_BYPASS_HEADERS`
+constant. `fetchTasks` merges it into its same-origin request headers, and
+`HttpAgent` receives it through its supported `headers` configuration. Next.js
+forwards both requests through D-61 exactly as before.
+
+This does not supersede or narrow D-61. Browser URLs remain relative, the ngrok
+hostname and `TRELLIS_API_ORIGIN` remain server-only, no CORS policy or Next.js
+route handler is added, and SSE framing is unchanged. The header carries no
+credential or authority. It is a free-ngrok demo compatibility shim, not a
+generic ingress abstraction. A paid ingress that removes the interstitial can
+retire T14I without changing the application topology.
+
+Normal CI never contacts ngrok. Its deterministic gate constructs real Web API
+`Headers` and `Request` objects to prove the bypass header is present and that
+caller headers survive the merge, then runs the production build.
