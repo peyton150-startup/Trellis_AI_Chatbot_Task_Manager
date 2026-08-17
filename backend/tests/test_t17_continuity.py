@@ -38,14 +38,18 @@ _SEEN: list[list] = []
 
 @pytest.fixture
 def db():
-    """Real PostgreSQL, state-free before and after each T17 proof."""
+    """Real PostgreSQL, state-free before and after each T17 proof.
+
+    TRUNCATE_ALL_TEST_STATE since T00L. See the note in test_invariants.py and
+    D-68: production reset stays Linear-unaware, deterministic tests do not.
+    """
     with pool.connection() as conn:
-        conn.execute(sql.TRUNCATE_ALL_STATE)
+        conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
         conn.commit()
         try:
             yield conn
         finally:
-            conn.execute(sql.TRUNCATE_ALL_STATE)
+            conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
             conn.commit()
 
 

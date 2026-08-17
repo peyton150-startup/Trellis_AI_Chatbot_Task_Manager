@@ -91,13 +91,46 @@ approvals                        -- server-stored pending decisions
   expires_at, decided_at
 ```
 
+**Linear integration state, added at T00L.** Business state and integration
+state are structurally separate, and the separation is enforced by the schema
+rather than by a filter in application code.
+
+```sql
+linear_task_state                -- tombstone, NO foreign key to tasks
+  task_id primary key,           -- outlives the task on purpose
+  external_id,                   -- the Linear issue, kept after deletion
+  external_updated_at,           -- Linear's updatedAt as last observed
+  diverged boolean not null default false,
+  last_reconciled_at
+
+linear_projections               -- outbox, written by a trigger
+  event_id primary key           -- references task_events(id)
+  task_id, operation,            -- create | update | archive | unarchive
+  status,                        -- pending | completed | failed
+  attempt_count, remote_id, last_error,
+  created_at, completed_at
+```
+
+No Linear column is on `tasks`. Domain reads are `SELECT *` validated into
+`Task`, which forbids extra keys, so such a column would fail immediately and
+would then reach every event snapshot, where undo restoring a `before` would
+reset the very `diverged` flag the refusal depends on. The missing foreign key
+is equally deliberate: a cascade would destroy `external_id` in the same
+transaction that queues the `archive` projection.
+
+An `AFTER INSERT ON task_events` trigger writes the projection row, so a
+committed audit event and its outbox row are inserted by the database in one
+transaction and no call site can forget to enqueue. Integration bookkeeping
+never increments a task version, never produces a business event, and is never
+restored by undo. See D-25 and D-26.
+
 **Lease semantics.** Insert `pending` before executing, update to `completed` with the result on success.
 
 - Same key, same hash, `completed` → return stored result, do not re-execute.
 - Same key, same hash, `pending` → duplicate in flight. Bounded poll, then fail. Never return null.
 - Same key, different hash → 409, invariant violation, logged loudly.
 
-**Undo.** Read the run's `task_events`, build the inverse, apply as a new forward mutation with `operation = restored`. Guard every row with `WHERE version = :observed_version`. If any row moved, refuse the whole undo and say why. History preserved, never rewound.
+**Undo.** Read the run's `task_events`, build the inverse, apply as a new forward mutation with `operation = restored`. Guard every row with `WHERE version = :observed_version`. If any row moved, refuse the whole undo and say why. History preserved, never rewound. Since T00L the precheck also refuses `EXTERNALLY_MODIFIED` if any affected task carries diverged integration state, including a task this run deleted, which is the case the absent foreign key keeps detectable. Undo reads that flag and never writes it, never calls Linear, and never depends on Linear being reachable.
 
 ---
 
@@ -147,11 +180,26 @@ Every mutation passes one path:
 ```
 proposed tool call
   → Pydantic schema validation
-  → policy layer: actor scope, provenance, blast radius, approval requirement
+  → policy layer: actor scope, external divergence, provenance,
+                  blast radius, approval requirement
   → idempotency lease
   → domain service
-  → transaction (mutation + task_events written together)
+  → transaction (mutation + task_events + local Linear projection
+                 written together)
 ```
+
+The divergence step sits after scope and before classification, and both edges
+matter. Refusing before ownership had resolved would disclose that a row exists,
+which is the same leak the scope check exists to close, so local integration
+state never becomes an oracle for which task ids are real. Classifying first
+would build an approval card, and on the AG-UI path prompt a human, for a
+mutation already decided to be refused.
+
+The projection row inside the transaction is local bookkeeping only. No Linear
+call happens inside any transaction, and no tool function calls Linear. The
+resulting claim is deliberately narrow: local mutations are transactionally
+exactly-once, and external delivery is at-least-once with locally owned
+deduplication. Not exactly-once end to end.
 
 **Layered defenses, each against a different failure:**
 
@@ -159,6 +207,7 @@ proposed tool call
 |---|---|
 | Authentication | the wrong user |
 | Authorization / actor scope | the wrong access |
+| External divergence refusal | silently overwriting a human's edit made outside the system |
 | Provenance | task content becoming instructions |
 | Approval | acting without human intent |
 | Blast radius cap | the model simply being wrong |
@@ -225,7 +274,14 @@ Call the policy layer directly with adversarial payloads. No model, no tokens, n
 ✓ reused key with different arguments             → 409
 ✓ stale undo (row version moved)                  → rejected
 ✓ client-supplied history in request body         → discarded
+✓ mutation on an externally diverged task         → 409, nothing written
+✓ undo touching an externally diverged task       → refused, applied 0
 ```
+
+The last two were added at T00L, and they stay offline like the rest: divergence
+is a local boolean, so proving the refusal needs no Linear and no network. The
+undo case includes a task that was deleted, where only the tombstoned
+integration row survives.
 
 **CI gates on this suite only.**
 
@@ -323,8 +379,10 @@ M4 — Proof and polish (Days 5 to 6)
   TAD-24  Behavioral eval suite, on demand, threshold
   TAD-25  Visual polish, README + "what I did not build", backup recording
 
-M5 - Optional Linear expansion (after T25 only)
+M5 - Optional Linear expansion
   T00L    Linear boundary retrofit, including merged undo.py
+          PULLED FORWARD under D-68, ahead of its post-T25 slot.
+          The local boundary only. No remote Linear behavior.
   T26     Linear client and name-to-id resolution
   T27     Projector worker
   T28     Reconciler
@@ -335,6 +393,13 @@ T00B remains complete in its original position after T06 and is not repeated in
 M5. R2 must pass against one immutable SHA before T13 starts. For R2, failure to
 provision or execute the fresh Vercel Sandbox is a BLOCK rather than a reason to
 substitute a host or clone result.
+
+T00L was pulled out of M5 on 2026-08-17 under D-68 and is the final pre-demo
+implementation patch. That is a scheduling exception and not a renumbering of the
+task history: T00L did not become part of the core sequence, and no other M5 item
+moved with it. T26 through T29 remain deferred in that order, and T00L
+deliberately ships none of their behavior. After T00L and its immutable-SHA
+review are green, planned implementation is frozen for the demo.
 
 Label every ticket `CORE` or `STRETCH`. Anything proposed after Day 2 that is not on this list is filed `STRETCH` and stays there.
 

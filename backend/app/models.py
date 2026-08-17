@@ -88,6 +88,12 @@ class UndoReason(str, Enum):
     ROW_DISAPPEARED = "ROW_DISAPPEARED"
     VERSION_CONFLICT = "VERSION_CONFLICT"
     ROW_RECREATED = "ROW_RECREATED"
+    # T00L, under D-27. An affected task carries diverged local integration
+    # state, so someone changed the corresponding Linear issue outside this
+    # system and undoing would overwrite a change this run never made. Read from
+    # linear_task_state, never from the task row, which is why it survives the
+    # task being deleted. Undo refuses and never clears the flag.
+    EXTERNALLY_MODIFIED = "EXTERNALLY_MODIFIED"
 
 
 TaskTitle = Annotated[str, Field(min_length=1, max_length=500)]

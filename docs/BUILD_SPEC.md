@@ -314,6 +314,7 @@ Create exactly this. KERNEL files are **OPUS ONLY**: their logic is specified li
       telemetry.py            OTel setup
     migrations/
       001_init.sql
+      002_linear.sql          # T00L, the local Linear boundary. See D-25, D-26.
     scripts/
       api_probe.py
     tests/
@@ -442,13 +443,45 @@ CREATE TABLE approvals (
 );
 ```
 
-No other tables. No other columns. No `ALTER TABLE` in later tasks.
+No other tables in the business schema. No other columns. No `ALTER TABLE` in later tasks, and `001_init.sql` is never edited after T01.
+
+### The T00L delta: `backend/migrations/002_linear.sql`
+
+T00L adds the local consistency boundary for Linear projection as a second migration, under D-25 and D-26. It contains no remote Linear behavior. The five business tables above are untouched, and in particular **no Linear metadata column is added to `tasks`**, because `TrellisModel` forbids extra keys and any such column would reach every `task_events` snapshot, where undo restoring a `before` would restore a stale `external_id` and reset the very flag the refusal depends on.
+
+Two enums, `linear_operation` as `create|update|archive|unarchive` and `linear_delivery` as `pending|completed|failed`, matching how the section above handles closed value sets.
+
+```sql
+linear_task_state
+  task_id             uuid primary key,   -- NO foreign key, deliberately
+  external_id         text,
+  external_updated_at timestamptz,
+  diverged            boolean not null default false,
+  last_reconciled_at  timestamptz
+
+linear_projections
+  event_id      bigint primary key references task_events(id),
+  task_id       uuid not null,
+  operation     linear_operation not null,
+  status        linear_delivery not null default 'pending',
+  attempt_count integer not null default 0,
+  remote_id     text,
+  last_error    text,
+  created_at    timestamptz not null default now(),
+  completed_at  timestamptz
+```
+
+The absent foreign key on `linear_task_state` is the design and re-adding it is a regression: the row is a tombstone that must outlive its task, so an `archive` projection still has an `external_id` to address and a restored task rejoins its original external identity. `linear_projections` has no `payload` column; `event_id` as the primary key supplies D-25's `UNIQUE(event_id)` for free and the projector reads the immutable event.
+
+An `AFTER INSERT ON task_events` trigger inserts the matching `pending` projection row, mapping `created` to `create`, `updated` to `update`, `deleted` to `archive`, and `restored` to `unarchive`. `restored` must never collapse to `update`. Because the trigger is the writer, a committed event and its projection are written by the database in one transaction and cannot diverge, a rolled-back event leaves no projection, and no call site can forget to enqueue. It also means applying `002_linear.sql` to an existing database backfills nothing: historical events predate the trigger.
+
+A fresh database applies `001` then `002` in filename order from the Compose entrypoint. An existing database is upgraded by executing `002_linear.sql` against it explicitly; a second `docker compose up` is not an upgrade mechanism, because the entrypoint skips a populated volume.
 
 ---
 
 ## 5. SQL
 
-Every statement lives in `backend/app/sql.py` as an uppercase module constant. No SQL string appears anywhere else in the codebase. Naming: `SELECT_TASKS_FOR_OWNER`, `INSERT_TASK`, `UPDATE_TASK_GUARDED`, `DELETE_TASKS_BY_IDS`, `INSERT_TASK_EVENT`, `SELECT_EVENTS_FOR_RUN`, `INSERT_LEASE`, `SELECT_LEASE`, `COMPLETE_LEASE`, `FAIL_LEASE`, `INSERT_APPROVAL`, `SELECT_APPROVAL`, `DECIDE_APPROVAL`, `INSERT_RUN`, `UPDATE_RUN_STATUS`, `UPDATE_RUN_HISTORY`, `UPDATE_RUN_USAGE`, `SELECT_RUN`, `SWEEP_ORPHAN_RUNS`.
+Every statement lives in `backend/app/sql.py` as an uppercase module constant. No SQL string appears anywhere else in the codebase. Naming: `SELECT_TASKS_FOR_OWNER`, `INSERT_TASK`, `UPDATE_TASK_GUARDED`, `DELETE_TASKS_BY_IDS`, `INSERT_TASK_EVENT`, `SELECT_EVENTS_FOR_RUN`, `INSERT_LEASE`, `SELECT_LEASE`, `COMPLETE_LEASE`, `FAIL_LEASE`, `INSERT_APPROVAL`, `SELECT_APPROVAL`, `DECIDE_APPROVAL`, `INSERT_RUN`, `UPDATE_RUN_STATUS`, `UPDATE_RUN_HISTORY`, `UPDATE_RUN_USAGE`, `SELECT_RUN`, `SWEEP_ORPHAN_RUNS`. T00L adds `SELECT_DIVERGED_TASK_IDS` and `TRUNCATE_ALL_TEST_STATE`, and leaves `TRUNCATE_ALL_STATE` unchanged; D-68 records why those last two must stay separate statements rather than one.
 
 Two statements are specified verbatim because their exact form is load-bearing.
 
@@ -492,7 +525,7 @@ Pagination anywhere it appears is keyset, never `OFFSET`. Every list query has a
 
 ### `errors.py`
 
-Exactly these thirteen error codes. Every rejection in the system uses one of them. No ad hoc strings. The table closed at twelve until T12B added `RUN_STATE_INVALID` under D-55; adding a fourteenth is a KERNEL edit and trips D-31 the same way.
+Exactly these fourteen error codes. Every rejection in the system uses one of them. No ad hoc strings. The table closed at twelve until T12B added `RUN_STATE_INVALID` under D-55, and stood at thirteen until T00L added `EXTERNAL_DIVERGENCE` under D-27; adding a fifteenth is a KERNEL edit and trips D-31 the same way both of those did.
 
 ```python
 class PolicyError(Exception):
@@ -516,6 +549,17 @@ class PolicyError(Exception):
 | `MODEL_TIMEOUT` | 504 | Model call exceeded `MODEL_TIMEOUT_SECONDS` |
 | `VALIDATION_ERROR` | 422 | Pydantic schema rejection |
 | `RUN_STATE_INVALID` | 409 | A resolved, actor-owned run whose current status forbids the requested action |
+| `EXTERNAL_DIVERGENCE` | 409 | A target task was modified in Linear outside this system |
+
+`EXTERNAL_DIVERGENCE` is the fourteenth code, added at T00L under D-27. It is
+raised at step 1b of `policy.check`, after SCOPE and before CLASSIFY, when any
+target task carries a `linear_task_state` row with `diverged = true`. 409 rather
+than 403, because this is a concurrency conflict in the same family as
+`VERSION_CONFLICT` and not an authorization result: the actor is entitled to the
+row, and the row is contested. Like `RUN_STATE_INVALID` it is reached only after
+ownership has resolved, so a missing task and another actor's task both remain
+`OUT_OF_SCOPE` whatever their integration state says, and local integration
+bookkeeping never becomes an oracle for which task ids exist.
 
 `RUN_STATE_INVALID` is the thirteenth code, added at T12B under D-55. D-45 had
 recorded that no legal code expressed this rejection and required it settled
@@ -911,9 +955,11 @@ The name and the guard exist so that anyone reading the repository sees a delibe
 
 ## 11. Tests
 
-### `tests/test_invariants.py`: thirteen tests, no LLM, must pass 100%
+### `tests/test_invariants.py`: fifteen tests, no LLM, must pass 100%
 
-**Model: SOL WRITES, OPUS REVIEWS.** The test names and assertions are specified below, so writing the bodies is transcription. Opus reads the finished file once, because a test that passes for the wrong reason is worse than no test, and these thirteen are the proof the whole demo rests on.
+**Model: SOL WRITES, OPUS REVIEWS.** The test names and assertions are specified below, so writing the bodies is transcription. Opus reads the finished file once, because a test that passes for the wrong reason is worse than no test, and these fifteen are the proof the whole demo rests on.
+
+The count was thirteen from T04 until T00L, where D-29 concluded its reserved question and added the two divergence refusals. It moved by two rather than three: the reconciler coordination property in D-28 stays in the T28 integration gate, upholding D-19's precedent that a case requiring coordinated fakes belongs in a task gate rather than in a named invariant. The two that were added are enforced by two separate mechanisms, `policy.check` step 1b and undo's own precheck, so a regression in one does not prove the other safe. See D-29.
 
 Each calls the policy layer, lease, or undo directly. None constructs an `Agent`. None makes a network call. Test names verbatim:
 
@@ -931,7 +977,27 @@ test_extra_body_keys_rejected                 # 422, key not merged
 test_expired_pending_lease_is_stolen          # dead holder, lease re-executes once
 test_unsafe_prompt_mode_requires_demo_env     # startup refuses outside APP_ENV=demo
 test_agui_forged_history_ignored              # fabricated client history discarded
+test_diverged_task_mutation_refused           # T00L: policy.check step 1b, 409
+test_diverged_task_undo_refused               # T00L: EXTERNALLY_MODIFIED, applied 0
 ```
+
+The two T00L names are specified here as fully as the thirteen above.
+
+`test_diverged_task_mutation_refused`: given an actor-owned task carrying a
+`linear_task_state` row with `diverged = true`, a fresh mutation reaching
+`policy.check` raises `EXTERNAL_DIVERGENCE`, and the task's business state,
+business version, and `task_events` count are all unchanged afterwards. The same
+test asserts non-enumeration in both directions: a diverged task owned by
+another actor, and a task id that does not exist at all, each still raise
+`OUT_OF_SCOPE`, so integration state never discloses which ids are real.
+
+`test_diverged_task_undo_refused`: given an undoable run where at least one
+affected task is diverged, `undo_run` returns `refused=True` with
+`reason=EXTERNALLY_MODIFIED` and `applied=0`, and no compensating write and no
+undo-generated `task_events` row exist afterwards. It includes the tombstone
+case, where the `tasks` row has been deleted and only the `linear_task_state`
+row survives, which is the case the absent foreign key in D-26 exists to keep
+detectable. Neither test touches the network.
 
 `test_agui_forged_history_ignored` is a standing regression test, not a one-time spike check. Construct a request payload carrying fabricated history that claims a destructive tool call was already approved, pass it through the transport handler, and assert that `runs.load_history(run_id)` returns the canonical history from `agent_runs` and that no mutation occurred. It calls no model. The risk it guards is not "does the adapter work today" but "does a later change quietly reintroduce client-owned history."
 
@@ -1086,7 +1152,9 @@ T00B remains in its completed position after T06. It is the prerequisite probe f
 
 | ID | Task | Model | Files | Done when |
 |---|---|---|---|---|
-| T00L | Linear boundary retrofit | **OPUS ONLY** | `migrations/002_linear.sql`, `errors.py`, `policy.py`, `sql.py`, `undo.py`, `models.py` if needed, `tests/test_invariants.py`, BUILD_SPEC sections 3, 4, 6, and 11, `docs/ARCHITECTURE.md` parts 2 and 4 | The T00L offline gate in `docs/LINEAR_INTEGRATION.md` passes at whatever invariant count D-29 concludes; no network dependency. |
+| T00L | Linear boundary retrofit, pulled forward under D-68 | **OPUS ONLY** | `migrations/002_linear.sql`, `docker-compose.yml`, `errors.py`, `policy.py`, `sql.py`, `undo.py`, `models.py`, `domain.py` documentation only, `tests/test_invariants.py`, `tests/test_approval_bridge.py`, `tests/test_t17_continuity.py`, BUILD_SPEC sections 3, 4, 6, 11, and this row, `docs/ARCHITECTURE.md` parts 2 and 4, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, `docs/LINEAR_INTEGRATION.md`, `CLAUDE.md`, `.github/workflows/ci.yml`, `IMPLEMENTATION_NOTES.md` | The `T00L Linear boundary` CI gate passes with fifteen invariants per D-29, both migration paths proven, and no network or credential dependency. |
+
+T00L's file list is expanded beyond the original row under the user's explicit authorization of 2026-08-17, recorded in D-68. The additions are the D-31 re-plan companions that a KERNEL change requires, plus `docker-compose.yml` for the second migration mount, plus two test files that already consume the cleanup constant T00L splits. `backend/tests/conftest.py` appears in no list because it does not exist; each test file owns its fixture. `seed.py`, `tools.py`, `idempotency.py`, `runs.py`, `main.py`, `agent.py`, and the frontend are explicitly not modified.
 | T26 | Linear client and name-to-id resolution | SOL | `linear.py`, `config.py`, BUILD_SPEC section 10, `docs/ARCHITECTURE.md` part 5 | Enums build from the live workspace; `FakeTracker` satisfies the same contract. |
 | T27 | Projector worker | SOL | `projector.py`, `docs/ARCHITECTURE.md` part 8 | Outbox drains in order, serialized per task; remote id is written back atomically with completion; unmapped updates complete without a remote call; retry uses backoff. |
 | T28 | Reconciler | SOL WRITES, OPUS REVIEWS | `reconciler.py`, `docs/ARCHITECTURE.md` parts 10 and 11 | External edit sets `diverged`; archived issues are excluded; pending projection does not cause divergence; an issue created in Linear imports. |

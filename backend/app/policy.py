@@ -12,6 +12,10 @@ in section 6 and the call site printed in section 10 pass neither value, so step
 
 D-17 covers the scope load: SELECT_TASK_OWNERS, the explicit skip on an empty
 target list, and the lazy pool import.
+
+D-27 adds step 1b, DIVERGENCE, between SCOPE and CLASSIFY. It reads local
+integration state only. No step of this module calls Linear or depends on Linear
+being reachable.
 """
 
 import hashlib
@@ -27,6 +31,7 @@ from .errors import (
     ApprovalMismatchError,
     ApprovalNotFoundError,
     ApprovalRequiredError,
+    ExternalDivergenceError,
     OutOfScopeError,
 )
 from .models import Approval, ApprovalReason, ApprovalRequirement, ApprovalState, PolicyDecision
@@ -109,6 +114,26 @@ def check(
     # 1. SCOPE
     resolve_scope(actor_id, target_task_ids)
 
+    # 1b. DIVERGENCE. T00L, under D-27. The position is specified, not
+    # incidental, and moving it in either direction breaks something.
+    #
+    # After SCOPE, because refusing on a row the actor does not own would
+    # disclose that the row exists. That is the same leak the check-order note
+    # at the top of this module warns about, and local integration bookkeeping
+    # must never become an oracle for which task ids are real. A foreign
+    # diverged task and a missing one both raise OutOfScopeError above and never
+    # reach this line.
+    #
+    # Before CLASSIFY, because divergence refuses whether or not the operation
+    # would have required approval. Running it later would build an approval
+    # card, and on the AG-UI path prompt a human, for a mutation already decided
+    # to be refused.
+    #
+    # This is the point at which fresh work is denied mutation authority: check
+    # is called inside the tool body immediately before any mutation, on every
+    # path, so a raise here means no business write and no task_events row.
+    _refuse_if_diverged(target_task_ids)
+
     # 2. CLASSIFY
     destructive = tool_name in DESTRUCTIVE_TOOLS
     # len, not a distinct count. Four references to one id count as four and
@@ -163,6 +188,30 @@ def check(
 
     # 6.
     return PolicyDecision(allow=True, approval_required=True, reason=reason)
+
+
+def _refuse_if_diverged(task_ids: list[UUID]) -> None:
+    """Step 1b of `check`. Call only after scope has resolved.
+
+    Not exposed the way `resolve_scope` is. D-50 published the scope check
+    because D-12 requires a tool body to run it before the conditional
+    ApprovalRequired raise; nothing needs divergence that early, and a second
+    public entry point would invite a call site that ran it before proving
+    ownership, which is the one ordering this step must not have.
+    """
+    if not task_ids:
+        return
+
+    # Lazy, for the reason given in _load_task_owners.
+    from .db import pool
+
+    with pool.connection() as conn:
+        rows = conn.execute(
+            sql.SELECT_DIVERGED_TASK_IDS, {"task_ids": list(task_ids)}
+        ).fetchall()
+
+    if rows:
+        raise ExternalDivergenceError()
 
 
 def _load_task_owners(task_ids: list[UUID]) -> dict[UUID, UUID]:

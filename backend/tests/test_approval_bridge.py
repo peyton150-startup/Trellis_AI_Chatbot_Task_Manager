@@ -76,7 +76,9 @@ def db():
 
 
 def _truncate(conn):
-    conn.execute(sql.TRUNCATE_ALL_STATE)
+    # TRUNCATE_ALL_TEST_STATE since T00L. See the note in test_invariants.py and
+    # D-68: production reset stays Linear-unaware, deterministic tests do not.
+    conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
     conn.commit()
 
 
