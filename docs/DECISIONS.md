@@ -2943,3 +2943,101 @@ After T00L and its required review are green, planned implementation freezes for
 the demo. Any subsequent repository change requires an explicit user-authorized
 demo-blocking exception, and that exception exists for a genuine demo-blocking
 defect, not for resuming deferred roadmap work.
+
+### D-69: T00W is the one authorized exception to the D-68 freeze, and it opens a single remote provider boundary
+
+D-68 froze planned implementation after T00L and required an explicit
+user-authorized exception for any later change. The user granted exactly one on
+2026-08-17: T00W, a native Linear conversation bridge that lets a human operate
+Trellis from inside Linear through OAuth, AgentSession webhooks, and Agent
+Activities. The demo now requires native Linear interaction, which is a
+demo-blocking gap rather than resumed roadmap work.
+
+This exception is narrow by construction. It does not reopen deferred work, and
+it decides nothing about T26 through T29, which remain deferred with their
+`T26 -> T27 -> T28 -> T29` continuation unchanged. T00W creates and mutates no
+Linear issue. The schedule cost is paid from the remaining pre-demo
+implementation timebox, as with D-68.
+
+**T00W is the conversation plane. T00L plus T26 through T29 remain the task
+projection plane.** T00W does not redesign `linear_task_state`,
+`linear_projections`, `task_events`, the T00L trigger, or T00L divergence
+semantics, and it drains no projection. The two planes meet only at the shared
+OAuth installation that T26 will later consume.
+
+**Scope expansion found before implementation: `backend/app/linear_agent_api.py`.**
+The authorized file list for T00W named three modules, none of which existed to
+hold remote provider knowledge. Splitting Linear's endpoints across
+`linear_install.py`, `linear_agent_worker.py`, and `linear_agent.py` would give
+three files independent knowledge of the provider and three places for a second
+HTTP client to appear. A fourth module is authorized instead, and it is the sole
+file in shipped application code permitted to contain a Linear provider endpoint
+literal. `linear_install.py` and `linear_agent_worker.py` reach Linear only
+through it.
+
+Authorized inside that boundary, and nothing else:
+
+- OAuth authorization URL construction, which is on `linear.app` rather than
+  `api.linear.app` and would otherwise have forced `linear_install.py` to know a
+  provider endpoint.
+- OAuth token exchange, refresh, and revoke.
+- The read-only installation identity GraphQL that T00W requires, `viewer { id }`,
+  which Linear recommends storing per workspace for an `actor=app` installation.
+- AgentActivity GraphQL operations.
+
+Still prohibited, unchanged: `issueCreate`, `issueUpdate`, `issueArchive`,
+`issueUnarchive`, workspace and name to id resolution, projection delivery,
+reconciliation, Linear-aware reset, and `LINEAR_API_KEY`. Provider credentials
+and tokens remain server-owned configuration and database state. They are never
+hard-coded into the provider module.
+
+**The T00L gate is amended, not renamed.** `T00L Linear boundary` is a required
+status check and its name stays stable. Its assertion changes in three ways.
+First, it protects the four actual provider endpoints rather than any string
+containing `linear.app`:
+
+```text
+https://linear.app/oauth/authorize
+https://api.linear.app/oauth/token
+https://api.linear.app/oauth/revoke
+https://api.linear.app/graphql
+```
+
+The old pattern, `api\.linear\.app|linear\.app/graphql`, had a hole: it did not
+match `https://linear.app/oauth/authorize`, so a file could have carried Linear's
+authorization endpoint past a gate advertised as exclusive. A blanket ban on
+`linear.app` would be the opposite error, because Agent Activity content
+legitimately carries ordinary Linear links in Markdown, and the property being
+defended is remote provider egress rather than any mention of Linear.
+
+Second, `backend/app/linear_agent_api.py` is the only exemption, paired with a
+positive assertion that it is the only file holding such a literal. Third, the
+grep stays scoped to `backend/app/` and `backend/migrations/` and must never
+become repository-wide: `backend/tests/fixtures/linear_contract.json` contains
+`api.linear.app/graphql` and all four issue mutations as legitimate T00B
+evidence, and a well-meant widening would break that proof.
+
+T00L remains the cumulative negative gate answering one question, whether remote
+Linear behavior has escaped the authorized boundary or a later-roadmap capability
+has appeared early. The positive behavioral proof belongs to the new
+`T00W Linear webhook bridge` context.
+
+**T00W ships in more than one commit, and that is a deliberate narrow deviation
+from the one task, one commit rule.** D-68 took the opposite route and shipped
+its re-plan inside the single T00L commit. T00W cannot, because its re-plan
+amends a required CI gate while stating that the provider module does not yet
+exist. A positive gate asserting that module's behavior would make the re-plan
+commit red on purpose. The first commit therefore carries the re-plan, the
+reconciled contracts, the amended T00L negative gate, and only CI scaffolding
+that passes without unimplemented behavior. It must be green on its own. The
+positive `T00W Linear webhook bridge` proof becomes required alongside the
+implementation it proves.
+
+**T00W is not complete when its code is written.** Its Definition of Done
+includes a live deployed proof that no deterministic gate can supply: a real
+OAuth installation through the deployed callback, a real signed AgentSessionEvent
+reaching the deployed webhook, a visible Agent Activity in Linear, stable ngrok
+URLs, and survival of an Ubuntu reboot without editing the Linear or Vercel
+configuration. Until those pass, the honest status is
+`T00W IMPLEMENTATION COMPLETE / LIVE DEPLOYMENT GATE OPEN`. The Definition of
+Done is not narrowed to what deterministic CI can reach.

@@ -5027,30 +5027,76 @@ jobs:
         run: npm ci
 
       # Runs before any database starts, because it needs none and fails fast.
-      # T00L must contain zero remote Linear behavior; the projector, the
-      # reconciler, the GraphQL client, and Linear-aware reset are T26 to T29.
       # A grep gate is crude, but the property it defends is exactly the kind a
       # green test suite cannot see: code that works offline today because the
       # network path is simply never exercised in CI.
-      - name: Verify T00L ships no remote Linear behavior
+      #
+      # Amended at T00W under D-69. The job name is a required status check and
+      # does not change. What changed is the shape of the assertion, in three
+      # ways, and each is deliberate.
+      #
+      # 1. It now names the four actual provider endpoints instead of matching
+      #    any string containing `linear.app`. The old pattern
+      #    `api\.linear\.app|linear\.app/graphql` had a hole, because Linear's
+      #    authorization endpoint is on `linear.app`, so a file could carry
+      #    `https://linear.app/oauth/authorize` straight through a gate that
+      #    advertised itself as exclusive. Banning the bare host instead would
+      #    be the opposite error: Agent Activity content legitimately contains
+      #    ordinary Linear links in Markdown, and what is being defended is
+      #    remote provider egress, not any mention of Linear.
+      #
+      # 2. Exactly one file may hold such a literal,
+      #    `backend/app/linear_agent_api.py`. Every other file failing this
+      #    check is the finding. The assertion does not require that file to
+      #    exist, which is what lets the D-69 re-plan commit stay green before
+      #    the provider module is written.
+      #
+      # 3. The issue mutations and `LINEAR_API_KEY` stay banned everywhere in
+      #    scope, including inside the provider boundary itself. The exemption
+      #    covers endpoint literals only. T00W talks to Linear; it does not
+      #    touch a Linear issue, and T26 through T29 still own that.
+      #
+      # The search stays scoped to backend/app/ and backend/migrations/ and must
+      # never be widened to the repository. `backend/tests/fixtures/linear_contract.json`
+      # contains `api.linear.app/graphql` and all four issue mutations as
+      # legitimate T00B evidence, and a well-meant widening would break that
+      # proof rather than strengthen this one.
+      - name: Verify no remote Linear behavior outside the authorized boundary
         shell: bash
         run: |
           set -euo pipefail
 
-          if grep -rniE 'api\.linear\.app|linear\.app/graphql|LINEAR_API_KEY|issueCreate|issueUpdate|issueArchive|issueUnarchive' \
+          PROVIDER_ENDPOINTS='https://linear\.app/oauth/authorize|https://api\.linear\.app/oauth/(token|revoke)|https://api\.linear\.app/graphql'
+          ALLOWED_BOUNDARY='backend/app/linear_agent_api.py'
+
+          # `|| true` because grep exits 1 on no matches, which is the expected
+          # state before T00W implementation lands and would otherwise trip
+          # `set -e` into reporting success as a failure.
+          offenders="$(grep -rlE "$PROVIDER_ENDPOINTS" backend/app/ backend/migrations/ 2>/dev/null | grep -vFx "$ALLOWED_BOUNDARY" || true)"
+          if [ -n "$offenders" ]; then
+            echo "FAIL: Linear provider endpoint found outside $ALLOWED_BOUNDARY"
+            echo "$offenders"
+            echo "Reaching Linear from any other module is a D-69 violation."
+            echo "Do not split, encode, or move the literal into configuration to evade this check."
+            exit 1
+          fi
+
+          if grep -rniE 'LINEAR_API_KEY|issueCreate|issueUpdate|issueArchive|issueUnarchive' \
                backend/app/ backend/migrations/ ; then
-            echo "FAIL T00L: remote Linear behavior found in shipped application code"
+            echo "FAIL: Linear issue mutation or personal API key found in shipped application code"
+            echo "Issue projection is T26 through T29 and remains deferred."
             exit 1
           fi
 
           for forbidden in backend/app/linear.py backend/app/projector.py backend/app/reconciler.py; do
             if [ -f "$forbidden" ]; then
-              echo "FAIL T00L: $forbidden belongs to T26 through T29 and must not exist yet"
+              echo "FAIL: $forbidden belongs to T26 through T29 and must not exist yet"
               exit 1
             fi
           done
 
-          echo "PASS T00L: no Linear client, projector, reconciler, credential, or GraphQL mutation"
+          echo "PASS: no projector, reconciler, personal API key, or issue mutation,"
+          echo "PASS: and no provider endpoint outside $ALLOWED_BOUNDARY"
 
       # The production/test truncate split is load bearing and the two constants
       # differ by one table name, so a later edit could reconnect them without

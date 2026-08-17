@@ -111,6 +111,40 @@ linear_projections               -- outbox, written by a trigger
   created_at, completed_at
 ```
 
+**Linear transport state, added at T00W under D-69.** A third category, separate
+again from both business and projection state. These tables hold the OAuth
+installation and AgentSession conversation transport. They are not part of any
+`Task` snapshot, are never restored by undo, and are cleared only by deterministic
+test cleanup, never by production `POST /api/demo/reset`, because resetting the
+demo board must not revoke a workspace installation.
+
+```sql
+linear_installations             -- at most one ACTIVE at a time
+  organization_id, oauth_client_id, app_user_id,
+  allowed_linear_user_id,        -- the one human bound to the demo actor
+  access_token, refresh_token,   -- secret material, rotated under a lock
+  access_token_expires_at, granted_scopes,
+  status                         -- active | revoked
+
+linear_oauth_states              -- single-use, expiring, server-owned
+  state_hash, created_at, expires_at, consumed_at
+
+linear_agent_inbox               -- durable ingress, committed before HTTP 200
+  delivery_id unique,            -- Linear-Delivery, provider retry identity
+  body_sha256,                   -- defense in depth against a forged delivery id
+  claimed_until,                 -- a lease, so a dead worker releases its work
+  attempt_count, disposition
+
+linear_agent_sessions            -- a continuity cursor, not an identity
+  organization_id, agent_session_id,
+  last_completed_run_id          -- unique(organization_id, agent_session_id)
+```
+
+One Linear AgentSession is not one `agent_runs.id`. D-67 stays intact: a prompt
+creates a new server-issued application run that inherits history from the
+completed predecessor the cursor names, and a failed turn leaves the cursor where
+it was.
+
 No Linear column is on `tasks`. Domain reads are `SELECT *` validated into
 `Task`, which forbids extra keys, so such a column would fail immediately and
 would then reach every event snapshot, where undo restoring a `before` would
@@ -221,6 +255,37 @@ APP_ENV=demo                    # required for the above; app refuses to start o
 ```
 
 That flag exists so the guard can be shown failing. Documented in the README as a demo affordance.
+
+**The Linear webhook is a second untrusted ingress, added at T00W under D-69.**
+The browser is not the only thing that can now reach the server, so the same
+question has to be answered for a provider request: what does this payload prove,
+and what does it merely assert. A valid Linear signature proves Linear sent the
+request. It does not prove that this workspace installed us, and it does not
+prove that the human behind the event may operate Trellis. Those are three
+separate facts and the code checks them separately, in this order:
+
+```text
+raw bytes            ->  HMAC-SHA256 over the body exactly as received
+signed body          ->  webhookTimestamp freshness, roughly 60 seconds
+Linear-Delivery      ->  unique, ordinary provider retry idempotency
+sha256(raw body)     ->  a forged delivery id cannot buy a second unit of work
+installation binding ->  organizationId, oauthClientId, appUserId all match
+                         an ACTIVE installation
+human authorization  ->  agentSession.creatorId or agentActivity.userId equals
+                         the one bound Linear user
+```
+
+The freshness authority is the `webhookTimestamp` inside the signed body, never
+the `Linear-Timestamp` header, because the header is not covered by the HMAC and
+a value an attacker can edit cannot be the thing that decides whether a replay is
+fresh. `agentSession.creatorId` is nullable in Linear's schema, so a `created`
+event carrying no responsible human is refused rather than defaulted.
+
+Authorization never reads `promptContext`, `guidance`, issue text, comments,
+names, or emails. Those are model-facing content and sit on the untrusted side of
+the same boundary task titles do. Only provider-owned structured identity decides
+whether a request may act, and `settings.actor_id` remains the server-owned
+application authority exactly as it is for the browser.
 
 ---
 

@@ -1973,3 +1973,56 @@ arrive by accretion.
 T00L modifies correctness-kernel files, so it requires a focused neutral,
 blind, read-only review at an immutable SHA, with the execution phase in a
 Vercel Sandbox. That review has not yet run.
+
+## T00W re-plan: authorizing the native Linear bridge
+
+**Local role:** This commit writes no provider code. It records D-69, reconciles
+the permanent contracts that forbade what T00W is now authorized to build, and
+amends the `T00L Linear boundary` CI gate so a single provider module can exist
+without the gate either failing or being weakened.
+
+**Whole-system role:** The demo requires operating Trellis from inside Linear,
+which the frozen post-T00L build cannot do at all. D-68 froze planned
+implementation and required an explicit exception for any later change; D-69 is
+that exception, granted once. It opens a conversation plane over OAuth and
+AgentSession webhooks and deliberately decides nothing about the projection
+plane. T26 through T29 remain deferred and undesigned.
+
+**Inputs and dependencies:** Post-T00L `master` at `b314017`, which includes the
+PostgreSQL readiness fix from PR #51. T00W's CI job starts PostgreSQL the same
+way every other database job does, so it inherits that fix and could not have
+been branched from `3120f8a`. The live Linear Developer Preview preflight ran
+before any edit and confirmed every provider assumption, including that
+`agentSession.creatorId` is nullable while `agentActivity.userId` is not, and
+that `AgentActivityCreateInput` accepts a caller-supplied UUID v4.
+
+**Outputs and consumers:** D-69; the amended T00L gate; `backend/app/linear_agent_api.py`
+authorized as the sole remote provider boundary; reconciled `CLAUDE.md`,
+`BUILD_SPEC.md`, `LINEAR_INTEGRATION.md`, `ARCHITECTURE.md`, and
+`PROJECT_PLAN.md`. The T00W implementation commits consume all of it, and T26 is
+directed to consume the OAuth installation rather than introduce a second
+credential.
+
+**Verification:** The amended gate was executed locally against this tree, in
+three states rather than one, because a gate that has only been seen passing has
+not been shown to work:
+
+```text
+current tree, no provider module        -> PASS
+planted offender outside the boundary   -> correctly FAILED, named the file
+same literal inside the boundary file   -> correctly exempted
+```
+
+The old pattern was also run against `https://linear.app/oauth/authorize` and
+confirmed not to match it, which is the hole D-69 describes rather than a claim
+taken on trust. The probe files were removed and `git status` confirmed clean
+before commit.
+
+**Limitations and review status:** This commit is documentation and CI contract
+only. No provider module, migration, route, worker, test, or agent profile
+exists yet, and the positive `T00W Linear webhook bridge` gate is deliberately
+absent so this commit stays green on its own; it lands with the implementation it
+proves. T00W ships in more than one commit, a narrow deviation from one task, one
+commit that D-69 records and that applies to T00W alone. The live deployment gate
+is untouched and open. Neither this commit nor the implementation that follows
+may be reported as `T00W COMPLETE`.
