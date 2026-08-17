@@ -4389,6 +4389,7 @@ jobs:
           const page = load("app/page.tsx");
           const board = load("components/Board.tsx");
           const chat = load("components/Chat.tsx");
+          const trellisAgent = load("lib/TrellisHttpAgent.ts");
 
           if ((page.match(/useBoard\s*\(/g) ?? []).length !== 1) {
             throw new Error("page.tsx must own one useBoard instance");
@@ -4405,8 +4406,13 @@ jobs:
 
           requireMatch(
             chat,
-            /new HttpAgent\s*\(\s*\{[\s\S]*?url:\s*["']\/api\/agui["']/,
-            "Chat.tsx must create one HttpAgent for the relative /api/agui endpoint",
+            /new TrellisHttpAgent\s*\(\s*\{[\s\S]*?url:\s*["']\/api\/agui["']/,
+            "Chat.tsx must create one TrellisHttpAgent for the relative /api/agui endpoint",
+          );
+          requireMatch(
+            trellisAgent,
+            /class\s+TrellisHttpAgent\s+extends\s+HttpAgent/,
+            "TrellisHttpAgent must preserve the HttpAgent transport contract",
           );
           requireMatch(
             chat,
@@ -4424,7 +4430,7 @@ jobs:
             "Chat.tsx must import the official generated assistant-ui Thread",
           );
           requireMatch(chat, /<AssistantRuntimeProvider\s+runtime=\{runtime\}>/, "Chat.tsx must provide the runtime");
-          requireMatch(chat, /<Thread\s*\/>/, "Chat.tsx must render the official generated assistant-ui Thread");
+          requireMatch(chat, /<Thread\b/, "Chat.tsx must render the official generated assistant-ui Thread");
           if (/\b(?:Thread|Composer|Message)Primitive\b/.test(chat)) {
             throw new Error("Chat.tsx must not hand-compose thread, composer, or message primitives");
           }
