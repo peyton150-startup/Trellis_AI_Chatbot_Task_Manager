@@ -23,7 +23,7 @@ services:
       - ./backend/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
       - ./backend/migrations/002_linear.sql:/docker-entrypoint-initdb.d/002_linear.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trellis -d trellis"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U trellis -d trellis"]
       interval: 2s
       timeout: 5s
       retries: 15
