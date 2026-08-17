@@ -4899,3 +4899,88 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  t17-cross-turn-continuity:
+    name: T17 cross-turn continuity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      - name: Prove T17 clarification and server-owned cross-turn continuity
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check app/prompts.py app/agent.py app/runs.py app/sql.py tests/test_t17_continuity.py
+          pytest tests/test_t17_continuity.py -v
+
+      - name: Prove the frontend D-67 continuity boundary
+        working-directory: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq 'const CONTINUITY_KEY = "trellisContinuityRunId"' lib/TrellisHttpAgent.ts \
+            || { echo "FAIL missing frozen D-67 continuity key"; exit 1; }
+
+          grep -Fq 'override run(input: RunAgentInput)' lib/TrellisHttpAgent.ts \
+            || { echo "FAIL TrellisHttpAgent does not intercept final AG-UI input"; exit 1; }
+
+          grep -Fq 'forwardedProps[CONTINUITY_KEY] = this.continuityRunId' lib/TrellisHttpAgent.ts \
+            || { echo "FAIL continuity locator is not top-level forwardedProps"; exit 1; }
+
+          grep -Fq 'new TrellisHttpAgent({' components/Chat.tsx \
+            || { echo "FAIL Chat bypasses TrellisHttpAgent"; exit 1; }
+
+          grep -Fq 'detail.status === "completed"' components/Chat.tsx \
+            || { echo "FAIL continuity is not gated by completed server status"; exit 1; }
+
+          grep -Fq 'agent.setContinuityRunId(runId)' components/Chat.tsx \
+            || { echo "FAIL completed run id is not promoted"; exit 1; }
+
+          if grep -Fq 'new HttpAgent({' components/Chat.tsx; then
+            echo "FAIL Chat directly constructs HttpAgent"
+            exit 1
+          fi
+
+          echo "PASS D-67 frontend continuity boundary"
+
+      - name: Run cumulative non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v

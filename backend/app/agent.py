@@ -11,9 +11,10 @@ client sends its entire transcript on every request, and `UIAdapter` appends
 whatever `self.messages` yields to the `message_history` a caller supplies. So
 filtering after the adapter is built would be filtering downstream of the thing
 that reads the payload. Instead the incoming `RunAgentInput` is discarded and a
-new one is constructed from scratch, carrying exactly one field taken from the
-client: the newest user message. Every other field on the rebuilt input is
-server-chosen or empty.
+new one is constructed from scratch. An ordinary turn accepts the newest user
+message plus one optional D-67 continuity locator used only to resolve
+server-owned prior history. The locator itself never becomes model context.
+Every field on the rebuilt adapter input remains server-chosen or empty.
 
 That is a property a reader can check by grep rather than by reasoning about a
 resolver's branches, which matters because reintroducing client-owned history is
@@ -23,7 +24,7 @@ the single most likely way a later change quietly breaks this build:
 - `tools`            empty, so no client-declared frontend toolset is registered
 - `state`            null, so no client state reaches `deps`
 - `context`          empty
-- `forwarded_props`  empty
+- `forwarded_props`  empty after D-67 locator extraction
 - `resume`           absent, so `AGUIAdapter.deferred_tool_results` is None and
                      a client-asserted approval cannot continue a deferred call.
                      The approval bridge in BUILD_SPEC section 10 requires the
@@ -95,7 +96,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import domain, policy, prompts, runs, tools
 from .config import settings
-from .errors import ValidationFailedError
+from .errors import OutOfScopeError, ValidationFailedError
 from .models import (
     Approval,
     ApprovalPreview,
@@ -295,9 +296,8 @@ async def handle_agui_request(request: Request) -> Response:
     The order below is the contract, and each step is doing one job:
 
     1. Parse the AG-UI payload into `RunAgentInput`.
-    2. Take the newest user message. This is the only value accepted from the
-       client anywhere on this route.
-    3. Open a server-owned application run from that exact value.
+    2. Take the newest user message and optional D-67 continuity locator.
+    3. Resolve server-owned continuity and open a fresh application run.
     4. Rebuild the run input from scratch so the adapter can read nothing else.
     5. Load canonical history through the single function section 9 names.
     6. Stream, recording failure, completion, history, and usage server-side.
@@ -312,27 +312,29 @@ async def handle_agui_request(request: Request) -> Response:
     if interrupt_id is not None:
         return await _handle_continuation(request, interrupt_id)
 
+    continuity_run_id = _accepted_continuity_run_id(run_input)
     user_message = _accepted_user_message(run_input)
 
-    # Step 3. `runs.create` is the existing run-creation primitive that
-    # `POST /api/runs` already uses, so there is one INSERT and one place that
-    # issues an application run id. The AG-UI path does not require the REST
-    # endpoint as a preflight, and does not change its contract.
+    # D-67. The optional client continuity value is only a lookup key.
+    # `create_turn` resolves server-owned state and creates a fresh
+    # application run whose starting canonical history is already durable.
     run = await run_in_threadpool(
-        runs.create, settings.actor_id, user_message, settings.model_id
+        runs.create_turn,
+        settings.actor_id,
+        user_message,
+        settings.model_id,
+        continuity_run_id,
     )
-
     adapter: AGUIAdapter[TrellisDeps, str | DeferredToolRequests] = AGUIAdapter(
         get_agent(),
         _accepted_run_input(run.id, user_message),
         accept=request.headers.get("accept"),
     )
 
-    # Step 5. Empty for a new run, by construction, and read from the database
-    # anyway. The read is not ceremony: it is the same call a T12B continuation
-    # makes against a run whose history is not empty, and asserting that it
-    # returns canonical state rather than the submitted transcript is exactly
-    # what `test_agui_forged_history_ignored` proves.
+    # Step 5. A root run starts empty; a D-67 successor is born with its
+    # inherited canonical snapshot already persisted. Either way the model gets
+    # history only through this database read, never from the submitted
+    # transcript. `test_agui_forged_history_ignored` protects that boundary.
     history = await run_in_threadpool(runs.load_history, run.id, settings.actor_id)
     message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(history))
 
@@ -459,6 +461,35 @@ def _continuation_run_input(run_id: UUID) -> RunAgentInput:
         context=[],
         forwarded_props={},
     )
+
+
+def _accepted_continuity_run_id(
+    run_input: RunAgentInput,
+) -> UUID | None:
+    """Extract D-67's optional continuity lookup key.
+
+    `forwardedProps` remains untrusted transport. Exactly one field may
+    nominate a previously server-issued application run. Ownership,
+    existence, eligibility, and history remain server-side decisions.
+
+    The forwarded properties themselves never reach the adapter/model:
+    `_accepted_run_input` reconstructs `forwarded_props={}`.
+    """
+    forwarded = run_input.forwarded_props or {}
+    key = "trellisContinuityRunId"
+
+    if key not in forwarded:
+        return None
+
+    value = forwarded[key]
+
+    if not isinstance(value, str):
+        raise OutOfScopeError()
+
+    try:
+        return UUID(value)
+    except ValueError:
+        raise OutOfScopeError() from None
 
 
 def _accepted_user_message(run_input: RunAgentInput) -> str:

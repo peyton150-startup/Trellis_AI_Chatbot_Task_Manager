@@ -3,6 +3,16 @@
 
 @custom-variant dark (&:is(.dark *));
 
+@keyframes reasoning-active-drift {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(2px);
+  }
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -186,6 +196,18 @@ main {
   margin: 0;
 }
 
+.board__toolbar-actions {
+  align-items: center;
+  display: flex;
+  gap: 0.65rem;
+}
+
+.board__refresh-status {
+  color: var(--muted);
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+
 .board__stale,
 .board-state {
   background: var(--surface);
@@ -334,3 +356,90 @@ main {
 @custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
 
 @custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+
+/* Board filtering */
+
+.board__summary {
+  align-items: center;
+  display: flex;
+  gap: 0.65rem;
+}
+
+.board__filter-toggle {
+  padding: 0.35rem 0.6rem !important;
+}
+
+.board__filters {
+  align-items: end;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: -0.25rem 0 1rem;
+  padding: 0.85rem;
+}
+
+.board__filters label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.board__filters label > span {
+  color: var(--muted);
+  font-family: "Courier New", Courier, monospace;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.board__filters select {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.82rem;
+  min-width: 0;
+  padding: 0.55rem 0.6rem;
+  width: 100%;
+}
+
+.board__filters select:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.board__filter-footer {
+  align-items: center;
+  display: flex;
+  font-size: 0.78rem;
+  gap: 0.65rem;
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+}
+
+.board__filter-empty {
+  background: var(--surface);
+  border: 1px dashed var(--line);
+  color: var(--muted);
+  margin: 1rem 0 0;
+  padding: 1rem;
+  text-align: center;
+}
+
+@media (max-width: 700px) {
+  .board__summary {
+    flex-wrap: wrap;
+  }
+
+  .board__filters {
+    grid-template-columns: 1fr;
+  }
+
+  .board__filter-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

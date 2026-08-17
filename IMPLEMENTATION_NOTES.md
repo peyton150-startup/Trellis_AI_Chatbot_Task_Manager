@@ -1753,3 +1753,54 @@ the browser. Chat memory spans one `agent_runs.id`, so it holds across the
 approval boundary and not across separate user turns; D-66 records this as a run
 identity question rather than a T16 defect. T16 carries no blind-review
 requirement under BUILD_SPEC section 1A.
+
+## T17: Clarifying question + cross-turn continuity
+
+**Local role:** Makes the named `"Clear my tasks"` ambiguity explicit in the
+system prompt. The agent must clarify before calling `list_tasks` or any
+mutating tool. A follow-up such as `"the completed ones"` can be interpreted
+using preceding canonical conversation context. Every ordinary user message
+still receives a fresh server-issued `agent_runs.id`.
+
+**Whole-system role:** D-67 adds server-owned ordinary-turn continuity while
+preserving the AG-UI trust boundary. The browser may nominate one previously
+server-issued application run through
+`forwardedProps.trellisContinuityRunId`, but that value is only a lookup key.
+The backend accepts it only when it resolves to an actor-owned `completed` run.
+Only that run's canonical `message_history` is inherited. Client transcript,
+client `threadId`, client `runId`, state, tools, context, and other forwarded
+properties remain non-authoritative.
+
+**Inputs and dependencies:** Consumes T12A's AG-UI trust boundary, canonical
+`agent_runs.message_history`, T16's same-run approval continuation, and D-67.
+T16 remains unchanged: approval continuation stays inside the same application
+run. Ordinary cross-turn continuation creates a fresh successor run.
+
+**Outputs and consumers:** `runs.create_turn` creates root or continuity
+successor turns. `INSERT_RUN_WITH_HISTORY` persists inherited history before
+model execution. `_accepted_continuity_run_id` extracts the one allowed lookup
+field. `TrellisHttpAgent` injects that field at the final AG-UI transport
+boundary. `RunCompletionListener` promotes a run only after
+`GET /api/runs/{id}` reports `completed`. The stable CI job is
+`T17 cross-turn continuity`.
+
+**Verification:**
+
+    focused T17 backend tests                 7 passed
+    backend ruff                             PASS
+    backend pytest -m "not network"          58 passed, 13 deselected
+    frontend production build               PASS
+
+The focused suite proves canonical predecessor-history inheritance, fresh
+successor run identity, preservation of the newest user message as `prompt`,
+indistinguishable refusal of invalid continuity claims, deliberate branching
+without sibling-history leakage, stripping of browser context before model
+execution, and ordinary two-turn AG-UI history propagation. It also pins the
+T17 requirement that ambiguous `"clear"` requests clarify before consequence.
+
+**Limitations and review status:** D-67 is a continuity chain, not a persistent
+conversation entity. T17 adds no conversation table, migration, unique head,
+branch serialization, cross-session memory, or browser-owned history.
+Manual browser/provider integration testing is deferred to the final Opus
+review. D-67 requires Opus R3 boundary review of the final immutable T17 diff
+before merge.

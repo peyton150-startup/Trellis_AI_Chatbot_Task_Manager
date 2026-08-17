@@ -424,6 +424,19 @@ VALUES (%(actor_id)s, %(prompt)s, %(model)s)
 RETURNING *;
 """
 
+# D-67. A successor ordinary turn is born with the predecessor's
+# server-owned canonical history already persisted.
+INSERT_RUN_WITH_HISTORY = """
+INSERT INTO agent_runs (actor_id, prompt, model, message_history)
+VALUES (
+    %(actor_id)s,
+    %(prompt)s,
+    %(model)s,
+    %(message_history)s
+)
+RETURNING *;
+"""
+
 UPDATE_RUN_STATUS = """
 UPDATE agent_runs
    SET status = %(status)s,

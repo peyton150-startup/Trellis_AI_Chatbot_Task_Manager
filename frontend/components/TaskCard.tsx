@@ -23,9 +23,10 @@ function formatDueDate(value: string | null): string {
 
 export interface TaskCardProps {
   task: Task;
+  blockedByTitle: string | null;
 }
 
-export function TaskCard({ task }: TaskCardProps) {
+export function TaskCard({ task, blockedByTitle }: TaskCardProps) {
   return (
     <article className="task-card" data-priority={task.priority}>
       <header className="task-card__header">
@@ -55,9 +56,9 @@ export function TaskCard({ task }: TaskCardProps) {
         </div>
       </dl>
 
-      {task.blocked_by !== null ? (
+      {blockedByTitle !== null ? (
         <p className="task-card__blocked">
-          Blocked by <code>{task.blocked_by}</code>
+          Blocked by <strong>{blockedByTitle}</strong>
         </p>
       ) : null}
 
