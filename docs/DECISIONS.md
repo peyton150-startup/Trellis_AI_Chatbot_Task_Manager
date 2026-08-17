@@ -2611,3 +2611,61 @@ holds across the approval boundary, which is what T16 needed, and does not hold
 across separate user turns. That is a property of `runs.create` and
 `_accepted_run_input`, not a T16 defect, and changing it is a spec-level decision
 about run identity rather than an approval-UI change.
+
+### D-67: T17 uses a completed-run continuity locator, not a persistent conversation identity
+
+On 2026-08-17, the user resolved Q-18 after the post-T16 evidence showed that
+history is preserved inside one approval continuation but lost between ordinary
+user turns.
+
+**Ruling 1: preserve application-run meaning.** One `agent_runs.id` remains one
+ordinary user turn/unit of work. Every normal user message still receives a new
+server-issued application run id. Approval continuation remains inside the
+existing application run exactly as T16 requires.
+
+**Ruling 2: no conversation schema.** T17 adds no table, column, migration,
+persistent conversation entity, or current-head row. Continuity is represented
+by an optional server-issued predecessor run id.
+
+**Ruling 3: use a dedicated lookup field.** Ordinary AG-UI `threadId` and
+`runId` remain non-authoritative and are not repurposed. The browser may send
+exactly one additional Trellis locator,
+`forwardedProps.trellisContinuityRunId`. It is a lookup key only. The server
+extracts it, resolves authoritative server state, and then discards all
+`forwardedProps` before constructing the accepted adapter input.
+
+**Ruling 4: completed predecessors only.** A continuity locator is eligible only
+when it names a `completed` run owned by the current actor. Malformed,
+nonexistent, foreign, running, awaiting-approval, failed, and interrupted
+locators refuse without exposing whether another actor's row exists.
+
+**Ruling 5: successor runs are born with inherited history.** Predecessor
+resolution, canonical-history selection, and successor INSERT occur in one
+database transaction. A continuation successor is committed with the inherited
+`message_history` already present. There is no committed intermediate successor
+whose intended inherited history is `[]`. Model execution starts afterward and
+still obtains history only through `runs.load_history(new_run.id, actor_id)`.
+
+**Ruling 6: prompt and history remain separate.** The successor `prompt` remains
+the newest accepted user message. Inherited canonical history is prior
+server-owned context and never replaces or modifies that audit field.
+
+**Ruling 7: branching is permitted in v1.** Any previously server-issued,
+actor-owned, completed run may be nominated as a predecessor. Doing so can create
+branches. T17 does not build branch-head enforcement, conversation
+serialization, failed-turn reconstruction, or cross-session memory.
+
+**Ruling 8: T16 is unchanged.** `RUN_STARTED.threadId` continues to expose the
+current server-issued application run id needed by the authoritative approval
+bridge. Approval persistence still precedes AG-UI continuation, and the
+continuation still uses the same application-level run.
+
+**Ruling 9: authoring re-plan.** The original prompt-only T17 allocation no
+longer describes the approved work. T17 expands into the AG-UI/history boundary.
+No KERNEL file is added. Sol may author the implementation, but R3 must include
+an Opus boundary review of the final immutable T17 diff before later work
+proceeds. This is an explicit re-plan for T17 and is not precedent for changing
+the historical T12A/T12B authoring allocation.
+
+No PROJECT_PLAN cut is required because this ruling avoids a schema migration,
+new service, new endpoint, and new numbered task.

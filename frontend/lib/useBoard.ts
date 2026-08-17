@@ -9,6 +9,7 @@ export interface BoardState {
   tasks: Task[];
   isLoading: boolean;
   error: string | null;
+  lastRefreshedAt: number | null;
   refetch: () => Promise<void>;
 }
 
@@ -16,6 +17,7 @@ export function useBoard(): BoardState {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
 
   const refetch = useCallback(async () => {
@@ -29,6 +31,7 @@ export function useBoard(): BoardState {
       const response = await fetchTasks({ signal: controller.signal });
       if (activeRequest.current === controller) {
         setTasks(response.tasks);
+        setLastRefreshedAt(Date.now());
       }
     } catch (requestError) {
       if (requestError instanceof DOMException && requestError.name === "AbortError") {
@@ -54,5 +57,5 @@ export function useBoard(): BoardState {
     return () => activeRequest.current?.abort();
   }, [refetch]);
 
-  return { tasks, isLoading, error, refetch };
+  return { tasks, isLoading, error, lastRefreshedAt, refetch };
 }

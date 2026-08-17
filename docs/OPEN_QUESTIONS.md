@@ -662,39 +662,70 @@ Options:   A. Provide `MODEL_ID` and the matching key in a local `.env`, start t
               observed evidence.
 
 ## Q-18  History does not carry across turns, and T17 needs it
-Task:      T12A, deadline T17
-Blocking:  no
-Status:    OPEN, recorded on 2026-08-15
-Context:   D-51 fixes one `agent_runs` record as one user turn, and section 9
-           loads history from `agent_runs.message_history` by run id. Those two
-           together mean turn two of a conversation starts with empty history.
+Task:      T17
+Blocking:  yes
+Status:    RESOLVED by D-67 on 2026-08-17
+Context:   T16 proved that canonical history survives approval continuation
+           inside one application-level `agent_runs.id`, but an ordinary second
+           user turn creates a fresh run whose history starts empty.
 
-           The schema has no thread column and cannot gain one without a D-31
-           re-plan, and the alternative, letting a browser-chosen thread
-           identifier select the application run, is what D-51 rejects. So the
-           gap is a property of the frozen data model rather than of the
-           transport decision.
+Ruling:    T17 does not introduce a persistent conversation table, conversation
+           column, or stable first-class conversation identity.
 
-           It does not block T12A, whose six proofs are all single turn, and it
-           does not block T12B, whose continuation stays inside one application
-           run by definition. It blocks the demo beat at ARCHITECTURE part 11,
-           2:00: "Clear my tasks" produces a clarifying question, and the user's
-           answer is a second turn that needs the first turn's context to mean
-           anything.
-Options:   A. Load history for a new run from the actor's most recent runs, so a
-              turn inherits conversation context without any client identifier
-              deciding which conversation it belongs to. Server-owned, no new
-              column, and wrong the moment two conversations exist at once.
-           B. Add a thread column and a thread-scoped history read. Correct, and
-              a schema change that trips D-31 and needs a named cut to pay for
-              it.
-           C. Accept the limitation and let T17's clarification live inside one
-              application run, by treating the clarifying question and its answer
-              as one turn that the framework interrupts. Closest to how the
-              approval interrupt already works, and it is the option that costs
-              nothing if it turns out to be sufficient.
-           D. Cut the clarification beat. It is a named demo moment, so this is a
-              PROJECT_PLAN decision rather than an implementation one.
+           Cross-turn continuity uses a server-owned continuity locator.
+
+           The locator is an optional previously server-issued `agent_runs.id`.
+           It is carried separately from AG-UI `threadId` and `runId` through the
+           one Trellis-owned `forwardedProps.trellisContinuityRunId` field.
+
+           Ordinary client `threadId`, client `runId`, transcript, state, tools,
+           context, and every other forwarded property remain non-authoritative.
+
+           Locator semantics:
+
+           - absent locator means a new root continuity chain;
+           - a present locator must resolve to an application run owned by the
+             current actor;
+           - only a `completed` run is eligible as an ordinary-turn predecessor;
+           - malformed, nonexistent, foreign, running, awaiting-approval, failed,
+             and interrupted locators refuse through the same externally visible
+             out-of-scope result;
+           - a valid predecessor contributes only its server-owned canonical
+             `message_history`;
+           - a successor receives a fresh server-issued `agent_runs.id`;
+           - the successor's `prompt` is still only the newest accepted user
+             message;
+           - the successor is inserted with inherited canonical history already
+             present before model execution begins;
+           - the model still receives history only through
+             `runs.load_history(new_run.id, actor_id)`.
+
+           After extracting the optional locator, Trellis rebuilds the accepted
+           `RunAgentInput` with `forwarded_props={}`. The locator is never model
+           context and client-supplied history remains discarded.
+
+           T16 approval continuation is unchanged. It continues the same
+           application-level run and does not create an ordinary successor.
+
+           Any previously issued, actor-owned, completed run may be nominated as
+           a predecessor. This can create branches. T17/Q-18 does not add a
+           unique conversation head, branch serialization, conversation locking,
+           failed-turn reconstruction, or cross-session memory.
+
+           This is therefore a server-owned continuity chain, not a persistent
+           conversation entity.
+
+Verification:
+           - `test_agui_forged_history_ignored` passes unchanged;
+           - root turns still ignore forged client history and identity;
+           - valid completed continuity inherits canonical server history;
+           - the successor has a different application run id;
+           - invalid, foreign, and nonterminal continuity refuses;
+           - two successors from the same completed predecessor may branch
+             without learning each other's turns;
+           - T16 approve/reject continuation remains green;
+           - `"Clear my tasks"` asks rather than mutates and its next-turn answer
+             can be interpreted from the inherited canonical context.
 
 ## Q-19  `render_task_block` has no caller and T23 cannot add one
 Task:      T11, discovered at T12A, deadline T23

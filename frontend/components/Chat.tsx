@@ -1,60 +1,95 @@
 "use client";
 
-import { useMemo } from "react";
-import { HttpAgent } from "@ag-ui/client";
+import { useEffect, useMemo, useRef } from "react";
 import { AssistantRuntimeProvider, useAuiEvent } from "@assistant-ui/react";
 import { useAgUiRuntime } from "@assistant-ui/react-ag-ui";
 import { Thread } from "@/components/thread";
 import { ApprovalCard } from "@/components/ApprovalCard";
 import { NGROK_BYPASS_HEADERS } from "@/lib/ngrokDemoIngress";
+import { fetchRun } from "@/lib/api";
+import { TrellisHttpAgent } from "@/lib/TrellisHttpAgent";
 import { useRun } from "@/lib/useRun";
 
 interface ChatProps {
   onRunComplete: () => void | Promise<void>;
 }
 
-function RunCompletionListener({ onRunComplete }: ChatProps) {
+function RunCompletionListener({
+  agent,
+  onRunComplete,
+}: ChatProps & { agent: TrellisHttpAgent }) {
+  const currentRunId = useRef<string | null>(null);
+
+  // D-67 keeps this separate from useRun(): T16 owns approval state, while
+  // continuity only needs the server-issued application run id.
+  useEffect(() => {
+    const subscription = agent.subscribe({
+      onRunStartedEvent: ({ event }) => {
+        if (event.threadId) {
+          currentRunId.current = event.threadId;
+        }
+      },
+    });
+
+    return () => subscription.unsubscribe();
+  }, [agent]);
+
   useAuiEvent("thread.runEnd", () => {
     void onRunComplete();
+
+    const runId = currentRunId.current;
+    if (runId === null) return;
+
+    // Promote only server-confirmed completed runs. awaiting_approval, failed,
+    // interrupted, or still-running runs leave the previous continuity cursor
+    // unchanged.
+    void fetchRun(runId)
+      .then((detail) => {
+        if (detail.status === "completed") {
+          agent.setContinuityRunId(runId);
+        }
+      })
+      .catch(() => {
+        // A failed status lookup must never guess that the run completed.
+        // Keep the previous authoritative continuity cursor.
+      });
   });
+
   return null;
 }
 
 /**
- * T16. The approval surface, mounted inside the runtime provider.
+ * T16. The authoritative approval surface, mounted inside the runtime provider.
  *
- * Separate from `Chat` because `useRun` reads the runtime's interrupts, and
- * separate from `Thread` because the card is not a tool-call rendering. It sits
- * directly under the transcript and above the composer, so a pending approval is
- * the last thing in the conversation and needs no scrolling, no expanding, and
- * no clicking to be understood.
+ * `Chat` continues to own approval state and behavior because `useRun` reads the
+ * runtime's interrupts. `Thread` receives only a presentation slot to place that
+ * surface immediately above its existing composer; it does not become approval-
+ * aware and the card remains separate from tool-call rendering.
  *
- * It renders nothing at all when the server reports no pending approval. The
- * card's presence is a statement that an approval exists, and only the server
- * gets to make that statement.
+ * It renders nothing when the server reports no pending approval. The card's
+ * presence is a statement that an approval exists, and only the server gets to
+ * make that statement.
  */
-function ApprovalSurface({ agent }: { agent: HttpAgent }) {
+function ApprovalSurface({ agent }: { agent: TrellisHttpAgent }) {
   const { card, deciding, pendingDecision, error, decide } = useRun(agent);
 
   if (card === null) return null;
 
   return (
-    <div className="border-t p-3">
-      <ApprovalCard
-        card={card}
-        deciding={deciding}
-        pendingDecision={pendingDecision}
-        error={error}
-        onDecide={(decision) => void decide(decision)}
-      />
-    </div>
+    <ApprovalCard
+      card={card}
+      deciding={deciding}
+      pendingDecision={pendingDecision}
+      error={error}
+      onDecide={(decision) => void decide(decision)}
+    />
   );
 }
 
 export function Chat({ onRunComplete }: ChatProps) {
   const agent = useMemo(
     () =>
-      new HttpAgent({
+      new TrellisHttpAgent({
         url: "/api/agui",
         headers: NGROK_BYPASS_HEADERS,
       }),
@@ -69,15 +104,14 @@ export function Chat({ onRunComplete }: ChatProps) {
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <RunCompletionListener onRunComplete={onRunComplete} />
+      <RunCompletionListener agent={agent} onRunComplete={onRunComplete} />
       <section
         aria-label="Assistant chat"
         className="mb-6 flex h-[42rem] min-h-[32rem] flex-col overflow-hidden border bg-background"
       >
         <div className="min-h-0 flex-1 overflow-hidden">
-          <Thread />
+          <Thread composerTop={<ApprovalSurface agent={agent} />} />
         </div>
-        <ApprovalSurface agent={agent} />
       </section>
     </AssistantRuntimeProvider>
   );

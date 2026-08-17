@@ -60,8 +60,34 @@ UNDOABLE_STATUSES = frozenset(
 )
 
 
+def _load_owned_run(conn, run_id: UUID, actor_id: UUID) -> AgentRun:
+    """Resolve one actor-owned run through an existing connection.
+
+    Missing and foreign identifiers deliberately have the same result.
+    """
+    row = conn.execute(
+        sql.SELECT_RUN,
+        {"run_id": run_id, "actor_id": actor_id},
+    ).fetchone()
+    if row is None:
+        raise OutOfScopeError()
+    return AgentRun.model_validate(row)
+
+
+def _load_completed_owned_run(
+    conn,
+    run_id: UUID,
+    actor_id: UUID,
+) -> AgentRun:
+    """Resolve one D-67 continuity predecessor or refuse."""
+    run = _load_owned_run(conn, run_id, actor_id)
+    if run.status is not RunStatus.COMPLETED:
+        raise OutOfScopeError()
+    return run
+
+
 def create(actor_id: UUID, prompt: str, model: str) -> AgentRun:
-    """Open a run. The server issues the id; no caller may supply one."""
+    """Open a root run. The server issues the id; no caller may supply one."""
     with pool.connection() as conn:
         row = conn.execute(
             sql.INSERT_RUN,
@@ -71,22 +97,64 @@ def create(actor_id: UUID, prompt: str, model: str) -> AgentRun:
     return AgentRun.model_validate(row)
 
 
+def create_turn(
+    actor_id: UUID,
+    prompt: str,
+    model: str,
+    continuity_run_id: UUID | None,
+) -> AgentRun:
+    """Create one ordinary AG-UI turn under D-67.
+
+    Without a continuity locator this creates a root run.
+
+    With a locator, predecessor ownership, completed-state eligibility,
+    canonical-history selection, and successor creation share one database
+    transaction. The successor is committed with inherited history already
+    present before model execution can begin.
+    """
+    with pool.connection() as conn:
+        if continuity_run_id is None:
+            row = conn.execute(
+                sql.INSERT_RUN,
+                {
+                    "actor_id": actor_id,
+                    "prompt": prompt,
+                    "model": model,
+                },
+            ).fetchone()
+        else:
+            predecessor = _load_completed_owned_run(
+                conn,
+                continuity_run_id,
+                actor_id,
+            )
+            row = conn.execute(
+                sql.INSERT_RUN_WITH_HISTORY,
+                {
+                    "actor_id": actor_id,
+                    "prompt": prompt,
+                    "model": model,
+                    "message_history": Json(
+                        list(predecessor.message_history)
+                    ),
+                },
+            ).fetchone()
+
+        conn.commit()
+
+    return AgentRun.model_validate(row)
+
+
 def load(run_id: UUID, actor_id: UUID) -> AgentRun:
     """Resolve a run id to a run this actor owns, or refuse.
 
-    This is the function that makes a browser-supplied identifier a lookup key
-    rather than a grant. A run that does not exist and a run belonging to
-    another actor both raise OutOfScopeError, so the response cannot be used to
-    enumerate which run ids are real.
+    A nonexistent run and another actor's run remain externally
+    indistinguishable.
     """
     with pool.connection() as conn:
-        row = conn.execute(
-            sql.SELECT_RUN, {"run_id": run_id, "actor_id": actor_id}
-        ).fetchone()
+        run = _load_owned_run(conn, run_id, actor_id)
         conn.commit()
-    if row is None:
-        raise OutOfScopeError()
-    return AgentRun.model_validate(row)
+    return run
 
 
 def load_history(run_id: UUID, actor_id: UUID) -> list:
