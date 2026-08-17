@@ -63,7 +63,7 @@ def _token_body(**overrides) -> dict:
         "refresh_token": "rt-live",
         "expires_in": 86399,
         "token_type": "Bearer",
-        "scope": "read,write,app:mentionable,app:assignable",
+        "scope": "read write app:mentionable app:assignable",
     }
     body.update(overrides)
     return body
@@ -121,17 +121,20 @@ def test_refresh_returns_the_rotated_pair_expiry_and_scope():
     assert b"grant_type=refresh_token" in seen[0].content
     assert tokens.access_token == "at-2"
     assert tokens.refresh_token == "rt-2"
-    assert tokens.scope == "read,write,app:mentionable,app:assignable"
+    assert api.granted_scope_set(tokens) == set(api.LINEAR_SCOPES)
+    assert api.has_bearer_token_type(tokens)
 
 
-def test_viewer_query_is_sent_with_bearer_auth():
+def test_identity_query_is_sent_with_bearer_auth():
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer at-live"
-        return httpx.Response(200, json={"data": {"viewer": {"id": "app-user-1"}}})
+        return httpx.Response(200, json={"data": {"viewer": {"id": "app-user-1", "organization": {"id": "org-1"}}}})
 
     handler, seen = _counting(respond)
     with _client(handler) as client:
-        assert api.fetch_app_user_id("at-live", client=client) == "app-user-1"
+        identity = api.fetch_installation_identity("at-live", client=client)
+        assert identity.app_user_id == "app-user-1"
+        assert identity.organization_id == "org-1"
     assert str(seen[0].url) == api.LINEAR_GRAPHQL_URL
 
 
@@ -197,10 +200,12 @@ def test_malformed_token_responses_are_refused(overrides):
         api.exchange_code("code", client=client)
 
 
-def test_viewer_without_an_id_is_refused():
-    handler, _ = _counting(lambda _r: httpx.Response(200, json={"data": {"viewer": {}}}))
+def test_identity_without_an_organization_is_refused():
+    handler, _ = _counting(
+        lambda _r: httpx.Response(200, json={"data": {"viewer": {"id": "app-user-1"}}})
+    )
     with _client(handler) as client, pytest.raises(LinearApiError):
-        api.fetch_app_user_id("at-live", client=client)
+        api.fetch_installation_identity("at-live", client=client)
 
 
 def test_graphql_partial_success_is_a_failure():
@@ -214,13 +219,13 @@ def test_graphql_partial_success_is_a_failure():
         lambda _r: httpx.Response(
             200,
             json={
-                "data": {"viewer": {"id": "usable-looking"}},
+                "data": {"viewer": {"id": "usable-looking", "organization": {"id": "o"}}},
                 "errors": [{"message": "partial failure"}],
             },
         )
     )
     with _client(handler) as client, pytest.raises(LinearApiError) as caught:
-        api.fetch_app_user_id("at-live", client=client)
+        api.fetch_installation_identity("at-live", client=client)
 
     assert caught.value.detail == "partial failure"
 
@@ -281,7 +286,7 @@ def test_no_bearer_token_appears_in_a_graphql_failure():
         )
     )
     with _client(handler) as client, pytest.raises(LinearApiError) as caught:
-        api.fetch_app_user_id("at-live", client=client)
+        api.fetch_installation_identity("at-live", client=client)
 
     assert "at-live" not in str(caught.value)
 
@@ -350,3 +355,131 @@ def test_the_module_declares_no_retry_policy():
         text = handle.read()
     assert "retries=0" in text
     assert "retries=1" not in text
+
+
+# ------------------------------------------------- D-70 contract corrections
+
+
+def test_revoke_sends_the_modern_form_and_no_bearer_header():
+    """`token` plus an optional hint, and nothing else. See D-70.
+
+    An earlier version also sent the token as a bearer header. The danger of that
+    is not a loud failure but a quiet one: the endpoint accepts the call and the
+    caller believes a credential was revoked when it was not.
+    """
+    handler, seen = _counting(lambda _r: httpx.Response(200, json={}))
+    with _client(handler) as client:
+        api.revoke_token("rt-1", token_type_hint="refresh_token", client=client)
+
+    request = seen[0]
+    assert str(request.url) == api.LINEAR_REVOKE_URL
+    assert b"token=rt-1" in request.content
+    assert b"token_type_hint=refresh_token" in request.content
+    assert "Authorization" not in request.headers
+    # The legacy field names must not appear.
+    assert b"access_token=" not in request.content
+    assert b"refresh_token=" not in request.content
+
+
+def test_revoke_without_a_hint_omits_the_field():
+    handler, seen = _counting(lambda _r: httpx.Response(200, json={}))
+    with _client(handler) as client:
+        api.revoke_token("at-1", client=client)
+
+    assert b"token_type_hint" not in seen[0].content
+
+
+def test_revoke_failure_raises_so_the_caller_can_decide():
+    handler, seen = _counting(lambda _r: httpx.Response(400, json={}))
+    with _client(handler) as client, pytest.raises(LinearApiError):
+        api.revoke_token("at-1", client=client)
+    assert len(seen) == 1
+
+
+def test_authorization_url_scope_is_comma_separated(monkeypatch):
+    """The request format. The response format is different, deliberately.
+
+    Scope goes out comma-separated and comes back space-delimited. Code that
+    assumes one round-trips is wrong in a way only the live provider reveals,
+    which is why both directions are pinned by tests rather than by memory.
+    """
+    _with_settings(
+        monkeypatch, linear_client_id="cid", trellis_public_origin="https://x.example"
+    )
+    url = api.authorization_url("s")
+    assert "scope=read%2Cwrite%2Capp%3Amentionable%2Capp%3Aassignable" in url
+
+
+def test_granted_scope_set_ignores_order_and_format():
+    """Set comparison, never the raw string and never ordering."""
+    handler, _ = _counting(
+        lambda _r: httpx.Response(
+            200,
+            json=_token_body(scope="app:assignable read app:mentionable write"),
+        )
+    )
+    with _client(handler) as client:
+        tokens = api.exchange_code("code", client=client)
+
+    assert api.granted_scope_set(tokens) == set(api.LINEAR_SCOPES)
+
+
+def test_missing_scope_is_detected_as_a_set_difference():
+    handler, _ = _counting(
+        lambda _r: httpx.Response(200, json=_token_body(scope="read write"))
+    )
+    with _client(handler) as client:
+        tokens = api.exchange_code("code", client=client)
+
+    granted = api.granted_scope_set(tokens)
+    assert granted != set(api.LINEAR_SCOPES)
+    assert set(api.LINEAR_SCOPES) - granted == {"app:mentionable", "app:assignable"}
+
+
+@pytest.mark.parametrize("token_type", ["Bearer", "bearer", "BEARER"])
+def test_bearer_token_type_is_compared_case_insensitively(token_type):
+    """The provider documents `Bearer`; the capitalization is not the contract."""
+    handler, _ = _counting(
+        lambda _r: httpx.Response(200, json=_token_body(token_type=token_type))
+    )
+    with _client(handler) as client:
+        assert api.has_bearer_token_type(api.exchange_code("code", client=client))
+
+
+def test_non_bearer_token_type_is_rejected_by_the_caller_check():
+    handler, _ = _counting(
+        lambda _r: httpx.Response(200, json=_token_body(token_type="mac"))
+    )
+    with _client(handler) as client:
+        assert not api.has_bearer_token_type(api.exchange_code("code", client=client))
+
+
+def test_identity_query_asks_for_the_organization():
+    """D-70's whole point: organization_id cannot be sourced anywhere else."""
+    captured: dict = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured["query"] = json.loads(request.content)["query"]
+        return httpx.Response(
+            200,
+            json={"data": {"viewer": {"id": "u", "organization": {"id": "o"}}}},
+        )
+
+    handler, _ = _counting(respond)
+    with _client(handler) as client:
+        api.fetch_installation_identity("at-live", client=client)
+
+    assert "organization" in captured["query"]
+    # Still installation identity, not workspace resolution.
+    for forbidden in ("organizations(", "teams(", "issues(", "search"):
+        assert forbidden not in captured["query"]
+
+
+def test_identity_with_an_empty_organization_id_is_refused():
+    handler, _ = _counting(
+        lambda _r: httpx.Response(
+            200, json={"data": {"viewer": {"id": "u", "organization": {"id": ""}}}}
+        )
+    )
+    with _client(handler) as client, pytest.raises(LinearApiError):
+        api.fetch_installation_identity("at-live", client=client)

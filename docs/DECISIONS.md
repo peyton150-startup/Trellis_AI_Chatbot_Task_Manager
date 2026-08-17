@@ -3041,3 +3041,88 @@ URLs, and survival of an Ubuntu reboot without editing the Linear or Vercel
 configuration. Until those pass, the honest status is
 `T00W IMPLEMENTATION COMPLETE / LIVE DEPLOYMENT GATE OPEN`. The Definition of
 Done is not narrowed to what deterministic CI can reach.
+
+### D-70: installation identity includes the organization, and the provider contract is corrected against the live schema
+
+D-69 authorized the read-only installation identity query as `viewer { id }`.
+That is insufficient, and the gap was found before the OAuth callback was
+written rather than during it.
+
+`linear_installations.organization_id` is required, and it is load bearing: every
+`AgentSessionEvent` is bound to an installation by matching `organizationId`,
+`oauthClientId`, and `appUserId` together, so an installation missing its
+organization cannot authorize a single webhook. There is no legitimate way to
+obtain it other than asking the provider. It is not in the OAuth redirect, not in
+the token response, and taking it from configuration would let a mistyped
+environment variable silently bind the installation to a workspace that did not
+install us. Waiting for the first webhook to learn it would mean accepting a
+webhook before knowing which workspace the installation belongs to, which is the
+authorization question itself.
+
+Exactly one read-only operation is therefore authorized, replacing the narrower
+one:
+
+```graphql
+query InstallationIdentity {
+  viewer {
+    id
+    organization {
+      id
+    }
+  }
+}
+```
+
+`User.organization` is non-null in Linear's published schema, verified against
+it rather than assumed. Both identifiers are required non-empty strings.
+
+**This remains installation identity and is not T26.** It performs no workspace
+search, accepts no workspace name, resolves no arbitrary organization, and reads
+nothing about issues, teams, or projects. It answers only "which workspace am I
+installed into, and who am I in it", about the very token that was just issued.
+T26's name to id resolution stays deferred and unauthorized, and no second Linear
+HTTP client is authorized.
+
+**Four provider contract corrections, found by reading Linear's current
+documentation and schema rather than by a test failing.**
+
+First, scope is comma-separated in the authorization URL and space-delimited in
+the token response. These are different formats in different directions, and code
+that assumes one round-trips is wrong in a way that only shows up against the
+live provider. The lifecycle layer therefore compares sets, never the raw string
+and never ordering:
+
+```python
+granted = set(tokens.scope.split())
+required = set(LINEAR_SCOPES)
+```
+
+Second, `token_type` is compared case-insensitively. The provider documents
+`Bearer`; treating the capitalization as part of the contract would be inventing
+a requirement.
+
+Third, an authorization-code exchange and a refresh both require a
+`refresh_token`, `expires_in > 0`, a bearer token type, and the exact required
+scope set. The generic response model stays broader, because it also describes
+responses these two flows do not produce.
+
+Fourth, revocation uses the modern form: `POST /oauth/revoke` with a `token`
+field and an optional `token_type_hint`. The earlier implementation additionally
+sent the token as a bearer header, which is not the documented request and could
+mask a failure to actually revoke.
+
+**The callback's transaction boundaries are fixed here because they are a
+correctness property, not an implementation detail.** OAuth state is consumed and
+committed in its own transaction before any network call, and the installation is
+written in a second transaction afterwards. No database transaction is held open
+across a call to Linear. A crash after the exchange therefore cannot leave a
+state value that a second attempt could reuse.
+
+That ordering leaves one window that this schema cannot close: the provider can
+issue credentials and the process can die before they are persisted. Cleanup on a
+caught failure is best effort, attempting to revoke the refresh and access tokens
+independently with the appropriate hint. **It does not eliminate orphaned
+credentials, and must not be described as though it does.** It handles caught
+failures, not process death. Closing the remaining window would require token
+staging state, which is a fourth table for a demo-scale risk, and D-70 declines
+to add one.

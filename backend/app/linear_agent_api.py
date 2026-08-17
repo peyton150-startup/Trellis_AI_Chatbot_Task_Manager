@@ -73,7 +73,10 @@ LINEAR_ACTOR = "app"
 # `write` is requested, and nothing here uses it for issues.
 LINEAR_SCOPES = ("read", "write", "app:mentionable", "app:assignable")
 
-_GRAPHQL_VIEWER = "query { viewer { id } }"
+# D-70. Both identifiers, in one round trip. `User.organization` is non-null in
+# Linear's published schema. This is installation identity, not workspace
+# resolution: it asks who the just-issued token belongs to and nothing else.
+_GRAPHQL_IDENTITY = "query InstallationIdentity { viewer { id organization { id } } }"
 _GRAPHQL_CREATE_ACTIVITY = """
 mutation CreateAgentActivity($input: AgentActivityCreateInput!) {
   agentActivityCreate(input: $input) {
@@ -82,6 +85,28 @@ mutation CreateAgentActivity($input: AgentActivityCreateInput!) {
   }
 }
 """
+
+
+class _Organization(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: str = Field(min_length=1)
+
+
+class _Viewer(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: str = Field(min_length=1)
+    organization: _Organization
+
+
+class InstallationIdentity(BaseModel):
+    """The validated answer to "who am I, and where". See D-70."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    app_user_id: str = Field(min_length=1)
+    organization_id: str = Field(min_length=1)
 
 
 class _AgentActivityIdentity(BaseModel):
@@ -246,42 +271,92 @@ def refresh_tokens(
     )
 
 
-def revoke_token(access_token: str, *, client: httpx.Client | None = None) -> None:
-    """Revoke a token at the provider.
+def revoke_token(
+    token: str,
+    *,
+    token_type_hint: str | None = None,
+    client: httpx.Client | None = None,
+) -> None:
+    """Revoke one token at the provider, in the documented modern form. D-70.
 
-    Returns cleanly on success. A provider-side failure raises, and the caller
-    decides whether local revocation should proceed anyway. It usually should:
-    an installation we can no longer use is revoked locally whether or not the
-    remote call succeeded, and leaving it `active` because a network call failed
-    would be the less safe direction.
+    The request carries `token` and an optional `token_type_hint`, and nothing
+    else. An earlier version of this function also sent the token as a bearer
+    header, which is not the documented request; the risk of that is not a noisy
+    failure but a quiet one, where the endpoint accepts the call and the caller
+    believes a credential was revoked when it was not.
+
+    One token per call, so a caller cleaning up a failed installation can attempt
+    the refresh token and the access token independently and have the second
+    attempt survive the first failing.
+
+    A provider-side failure raises, and the caller decides whether local
+    revocation proceeds anyway. It usually should: an installation we can no
+    longer use is revoked locally whether or not the remote call succeeded, and
+    leaving it `active` because a network call failed is the less safe direction.
     """
+    form = {"token": token}
+    if token_type_hint is not None:
+        form["token_type_hint"] = token_type_hint
     response = _request(
-        "oauth_revoke",
-        "POST",
-        LINEAR_REVOKE_URL,
-        client=client,
-        data={"token": access_token},
-        headers={"Authorization": f"Bearer {access_token}"},
+        "oauth_revoke", "POST", LINEAR_REVOKE_URL, client=client, data=form
     )
     if response.status_code != 200:
         raise LinearApiError("oauth_revoke", response.status_code, "revocation refused")
 
 
-def fetch_app_user_id(access_token: str, *, client: httpx.Client | None = None) -> str:
-    """The installed application's workspace-specific identity, `viewer.id`.
+def granted_scope_set(tokens: LinearTokens) -> set[str]:
+    """The granted scopes as a set. D-70.
 
-    Linear recommends storing this per workspace so the app can identify itself,
-    and T00W needs it as an authorization input: an `AgentSessionEvent` carries
-    `appUserId`, and a webhook whose value does not match the stored one is not
-    for this installation. Read only, and the only non-activity GraphQL query
-    D-69 authorizes.
+    Scope is comma-separated in the authorization URL and space-delimited in the
+    token response. Those are different formats in different directions, and code
+    assuming the request format round-trips is wrong in a way that surfaces only
+    against the live provider. Splitting on whitespace and comparing sets removes
+    both the format and the ordering from the comparison.
     """
-    data = _post_graphql("viewer", access_token, _GRAPHQL_VIEWER, {}, client=client)
-    viewer = data.get("viewer") or {}
-    app_user_id = viewer.get("id")
-    if not isinstance(app_user_id, str) or not app_user_id:
-        raise LinearApiError("viewer", None, "response carried no viewer id")
-    return app_user_id
+    return set(tokens.scope.split())
+
+
+def has_bearer_token_type(tokens: LinearTokens) -> bool:
+    """Bearer, compared case-insensitively.
+
+    The provider documents `Bearer`. Treating that capitalization as part of the
+    contract would be inventing a requirement the provider never stated.
+    """
+    return tokens.token_type.casefold() == "bearer"
+
+
+def fetch_installation_identity(
+    access_token: str, *, client: httpx.Client | None = None
+) -> InstallationIdentity:
+    """Who this token is, and which workspace it belongs to. See D-70.
+
+    Both values are authorization inputs rather than bookkeeping. An
+    `AgentSessionEvent` is bound to an installation by matching `organizationId`,
+    `oauthClientId`, and `appUserId` together, so an installation missing either
+    identifier cannot authorize a webhook at all.
+
+    Neither can be obtained anywhere else honestly. The organization is not in the
+    redirect or the token response; taking it from configuration would let a
+    mistyped variable bind the installation to a workspace that never installed
+    us, and learning it from the first webhook would mean trusting a webhook
+    before knowing which workspace it should have come from.
+
+    Read only, and the only non-activity GraphQL operation authorized. It performs
+    no workspace search and accepts no workspace name, which is what keeps it
+    distinct from the T26 resolution that remains deferred.
+    """
+    data = _post_graphql(
+        "installation_identity", access_token, _GRAPHQL_IDENTITY, {}, client=client
+    )
+    try:
+        viewer = _Viewer.model_validate(data.get("viewer"))
+    except ValidationError:
+        raise LinearApiError(
+            "installation_identity", None, "response carried no viewer identity"
+        ) from None
+    return InstallationIdentity(
+        app_user_id=viewer.id, organization_id=viewer.organization.id
+    )
 
 
 def create_agent_activity(

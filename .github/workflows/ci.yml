@@ -5078,7 +5078,14 @@ jobs:
           # `|| true` because grep exits 1 on no matches, which is the expected
           # state before T00W implementation lands and would otherwise trip
           # `set -e` into reporting success as a failure.
-          offenders="$(grep -rlE "$PROVIDER_ENDPOINTS" backend/app/ backend/migrations/ 2>/dev/null | grep -vFx "$ALLOWED_BOUNDARY" || true)"
+          # --exclude-dir and -I keep this on source rather than build output. A
+          # compiled .pyc embeds the string constants of the module it came from,
+          # so a __pycache__ left by any earlier step would report the boundary's
+          # own literals as an offender in a second file. The gate is ordered
+          # before anything imports the application today, but relying on step
+          # order for correctness is exactly the kind of accident this file is
+          # supposed to catch rather than depend on.
+          offenders="$(grep -rlIE --exclude-dir=__pycache__ "$PROVIDER_ENDPOINTS" backend/app/ backend/migrations/ 2>/dev/null | grep -vFx "$ALLOWED_BOUNDARY" || true)"
           if [ -n "$offenders" ]; then
             echo "FAIL: Linear provider endpoint found outside $ALLOWED_BOUNDARY"
             echo "$offenders"
@@ -5087,7 +5094,7 @@ jobs:
             exit 1
           fi
 
-          if grep -rniE 'LINEAR_API_KEY|issueCreate|issueUpdate|issueArchive|issueUnarchive' \
+          if grep -rniIE --exclude-dir=__pycache__ 'LINEAR_API_KEY|issueCreate|issueUpdate|issueArchive|issueUnarchive' \
                backend/app/ backend/migrations/ ; then
             echo "FAIL: Linear issue mutation or personal API key found in shipped application code"
             echo "Issue projection is T26 through T29 and remains deferred."
