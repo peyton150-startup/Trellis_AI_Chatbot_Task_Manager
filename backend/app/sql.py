@@ -508,9 +508,14 @@ RESTART IDENTITY CASCADE;
 # The split is proven rather than trusted to naming: the T00L gate asserts that
 # seed.reset uses TRUNCATE_ALL_STATE and that this statement is the one the
 # deterministic fixtures call.
+# T00W adds the four transport tables here and deliberately not above. Under
+# D-69 production reset must never revoke an OAuth installation or discard
+# accepted webhook work: resetting the demo board is a business operation, and
+# an operator who resets the board does not expect to reinstall the app.
 TRUNCATE_ALL_TEST_STATE = """
 TRUNCATE TABLE tasks, task_events, agent_runs, tool_invocations, approvals,
-               linear_task_state
+               linear_task_state, linear_installations, linear_oauth_states,
+               linear_agent_inbox, linear_agent_sessions
 RESTART IDENTITY CASCADE;
 """
 
@@ -536,4 +541,118 @@ UPDATE agent_runs
        ended_at = now()
  WHERE status = 'running'
 RETURNING *;
+"""
+
+
+# ---------------------------------------------------------------------------
+# T00W. OAuth installation and AgentSession transport. See D-69 and D-70.
+# ---------------------------------------------------------------------------
+
+INSERT_LINEAR_OAUTH_STATE = """
+INSERT INTO linear_oauth_states (state_hash, expires_at)
+VALUES (%(state_hash)s, now() + make_interval(secs => %(ttl_seconds)s))
+RETURNING *;
+"""
+
+# The whole single-use guarantee, in one statement.
+#
+# Matching, unexpired, and unconsumed are all predicates on the UPDATE rather
+# than checks a caller performs first. A SELECT that observed an unconsumed row
+# followed by an unguarded UPDATE is the check-then-act race that lets two
+# callbacks both consume one state, and the OAuth state exists precisely to make
+# a replayed callback fail. Zero rows back means refuse, and the caller cannot
+# learn which of the three reasons applied.
+CONSUME_LINEAR_OAUTH_STATE = """
+UPDATE linear_oauth_states
+   SET consumed_at = now()
+ WHERE state_hash = %(state_hash)s
+   AND expires_at > now()
+   AND consumed_at IS NULL
+RETURNING *;
+"""
+
+INSERT_LINEAR_INSTALLATION = """
+INSERT INTO linear_installations (
+  organization_id, oauth_client_id, app_user_id, allowed_linear_user_id,
+  access_token, refresh_token, access_token_expires_at, granted_scopes
+) VALUES (
+  %(organization_id)s, %(oauth_client_id)s, %(app_user_id)s,
+  %(allowed_linear_user_id)s, %(access_token)s, %(refresh_token)s,
+  now() + make_interval(secs => %(expires_in)s), %(granted_scopes)s
+)
+RETURNING *;
+"""
+
+SELECT_ACTIVE_LINEAR_INSTALLATION = """
+SELECT *
+  FROM linear_installations
+ WHERE status = 'active';
+"""
+
+# The installation binding an AgentSessionEvent must match. All three provider
+# identifiers together, because any one alone is insufficient: an organization
+# can install several apps, one OAuth client serves many organizations, and an
+# app user is only meaningful within its workspace.
+SELECT_LINEAR_INSTALLATION_FOR_EVENT = """
+SELECT *
+  FROM linear_installations
+ WHERE organization_id = %(organization_id)s
+   AND oauth_client_id = %(oauth_client_id)s
+   AND app_user_id = %(app_user_id)s
+   AND status = 'active';
+"""
+
+# Revocation, guarded by when the revocation actually happened.
+#
+# `created_at <= %(revocation_created_at)s` is the reinstall guard and it is the
+# reason this statement takes the provider's event time at all. Linear retries a
+# failed delivery for up to six hours, so a revocation of an installation that
+# has since been replaced can arrive after the replacement exists. Without the
+# predicate that replay would revoke the new installation and take the demo down
+# with a stale message.
+#
+# The event's own `createdAt` is used rather than `webhookTimestamp`, because
+# the first is when the revocation happened and the second is when this delivery
+# attempt was sent. A six hour old revocation redelivered now carries a fresh
+# delivery timestamp and would defeat the guard entirely.
+REVOKE_LINEAR_INSTALLATION = """
+UPDATE linear_installations
+   SET status = 'revoked',
+       updated_at = now()
+ WHERE organization_id = %(organization_id)s
+   AND oauth_client_id = %(oauth_client_id)s
+   AND status = 'active'
+   AND created_at <= %(revocation_created_at)s
+RETURNING *;
+"""
+
+# Durable ingress. `ON CONFLICT DO NOTHING` rather than catching a unique
+# violation, because a duplicate delivery is ordinary expected traffic and not
+# an exceptional condition. Catching `UniqueViolation` would also catch a
+# constraint the caller never reasoned about and report it as a duplicate.
+#
+# Zero rows back means one of the two dedupe identities already exists, and the
+# caller classifies which by reading them back. It never means the insert
+# failed for an unrelated reason: those still raise.
+INSERT_LINEAR_INBOX = """
+INSERT INTO linear_agent_inbox (
+  delivery_id, body_sha256, organization_id, agent_session_id, action,
+  payload, status, refusal_reason
+) VALUES (
+  %(delivery_id)s, %(body_sha256)s, %(organization_id)s, %(agent_session_id)s,
+  %(action)s, %(payload)s, %(status)s, %(refusal_reason)s
+)
+ON CONFLICT DO NOTHING
+RETURNING *;
+"""
+
+# Conflict classification. Read both identities separately so the caller can
+# tell an ordinary duplicate from the case where one identity matches one row
+# and the other matches a different row.
+SELECT_LINEAR_INBOX_BY_DELIVERY = """
+SELECT * FROM linear_agent_inbox WHERE delivery_id = %(delivery_id)s;
+"""
+
+SELECT_LINEAR_INBOX_BY_BODY = """
+SELECT * FROM linear_agent_inbox WHERE body_sha256 = %(body_sha256)s;
 """

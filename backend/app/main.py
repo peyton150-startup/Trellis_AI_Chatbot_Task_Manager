@@ -48,14 +48,17 @@ still flows through the actor rather than around it, so introducing real
 identity later is a change of where `actor_id` comes from and nothing else.
 """
 
+import json
 from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
-from app import agent, domain, runs, seed
+from app import agent, domain, linear_agent, linear_install, runs, seed
 from app.config import settings
 from app.db import pool
 from app.errors import (
@@ -241,6 +244,133 @@ async def post_agui(request: Request) -> Response:
     gate can substitute a model without a seam in this route.
     """
     return await agent.handle_agui_request(request)
+
+
+@app.get("/api/linear/oauth/callback", response_class=PlainTextResponse)
+def get_linear_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> Response:
+    """The registered Linear OAuth redirect. T00W, under D-69 and D-70.
+
+    The browser sees generic text and nothing else. No authorization code, state
+    value, token, client secret, or provider response reaches the response body,
+    and `no-store` keeps the page out of caches and out of history restoration. A
+    browser landing here already holds an authorization code in its URL bar;
+    there is no reason to put it in the page as well.
+
+    `error`, or a missing `code` or `state`, is answered without contacting
+    Linear. A user who declined consent has nothing to exchange, and calling the
+    provider anyway would turn an ordinary cancellation into a failed token
+    request.
+
+    The work is delegated because the transaction phases are the correctness
+    property here, and they belong beside the reasoning for them.
+    """
+    if error is not None or not code or not state:
+        return _callback_response("Installation was not completed.", 400)
+
+    try:
+        linear_install.complete_installation(code, state)
+    except linear_install.InstallationError as exc:
+        return _callback_response(f"Installation failed. {exc}", 400)
+
+    return _callback_response(
+        "Trellis is installed. You can close this window and return to Linear.", 200
+    )
+
+
+def _callback_response(message: str, status: int) -> Response:
+    return PlainTextResponse(
+        message, status_code=status, headers={"Cache-Control": "no-store"}
+    )
+
+
+@app.post("/api/linear/webhook")
+async def post_linear_webhook(request: Request) -> Response:
+    """The registered Linear webhook. T00W, under D-69.
+
+    Async because the raw body must be awaited, and because Linear allows five
+    seconds. The trust decisions live in `linear_agent.py`; this route reads the
+    exact bytes once, runs the CPU-only verification, and hands the durable
+    decision to a thread so synchronous psycopg never blocks the event loop. That
+    threadpool pattern is the one `agent.py` already uses for `runs.create_turn`.
+
+    **The body is read exactly once, before anything else, and never
+    re-serialized.** Declaring a Pydantic body parameter here would let FastAPI
+    parse the payload before the signature is checked, and the bytes the
+    signature covers would then be reconstructed rather than observed.
+
+    **No outbound Linear call happens on this path.** Not to acknowledge, not to
+    post an activity, not to revoke. A provider round trip inside a five second
+    budget buys nothing the worker cannot do afterwards.
+
+    The status codes are chosen for what they tell Linear to do next. A 401 or
+    400 says this delivery will never be acceptable, so a retry would spend six
+    hours reaching the same answer. A 200 says it is handled, including when the
+    answer was a permanent refusal that is now durably recorded. A 5xx is
+    reserved for our own failure before a durable decision exists, which is the
+    one case where retrying can genuinely succeed.
+    """
+    raw_body = await request.body()
+
+    try:
+        linear_agent.verify_signature(raw_body, request.headers.get("Linear-Signature"))
+
+        try:
+            payload = json.loads(raw_body)
+        except ValueError:
+            raise linear_agent.WebhookRejected(400, "invalid_json") from None
+        if not isinstance(payload, dict):
+            raise linear_agent.WebhookRejected(400, "invalid_json")
+
+        linear_agent.verify_freshness(payload)
+        delivery_id = linear_agent.canonical_delivery_id(
+            request.headers.get("Linear-Delivery")
+        )
+        body_sha256 = linear_agent.body_digest(raw_body)
+
+        # Routing reads the signed body. `Linear-Event` carries the same idea in
+        # a header the HMAC does not cover, so it stays diagnostic only.
+        event_type = payload.get("type")
+        action = payload.get("action")
+
+        if event_type == linear_agent.TYPE_AGENT_SESSION:
+            event = linear_agent.parse_agent_session_event(payload)
+            result = await run_in_threadpool(
+                linear_agent.accept_agent_session_event,
+                delivery_id=delivery_id,
+                body_sha256=body_sha256,
+                payload=payload,
+                event=event,
+            )
+            return JSONResponse(status_code=200, content=result)
+
+        if (
+            event_type == linear_agent.TYPE_OAUTH_APP
+            and action == linear_agent.ACTION_REVOKED
+        ):
+            try:
+                revocation = linear_agent.OAuthRevocationEvent.model_validate(payload)
+            except ValidationError:
+                raise linear_agent.WebhookRejected(
+                    400, "unusable_revocation_payload"
+                ) from None
+            result = await run_in_threadpool(
+                linear_agent.apply_oauth_revocation, revocation
+            )
+            return JSONResponse(status_code=200, content=result)
+
+        # A signed event family T00W does not consume. Not stored, because an
+        # event we do not handle is not work, and 200 rather than an error,
+        # because Linear retrying it would change nothing.
+        return JSONResponse(status_code=200, content={"disposition": "ignored"})
+
+    except linear_agent.WebhookRejected as rejected:
+        return JSONResponse(
+            status_code=rejected.status, content={"error": {"code": rejected.reason}}
+        )
 
 
 @app.post(
