@@ -46,10 +46,10 @@ credential, a network, or a live workspace.
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
 from urllib.parse import urlencode
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .config import settings
 
@@ -84,6 +84,33 @@ mutation CreateAgentActivity($input: AgentActivityCreateInput!) {
 """
 
 
+class _AgentActivityIdentity(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: str = Field(min_length=1)
+
+
+class AgentActivityResult(BaseModel):
+    """The validated `agentActivityCreate` payload.
+
+    Both fields are required. `success` alone is not enough: a payload claiming
+    success while carrying no activity is a provider contract violation, and
+    accepting it would let the worker record a delivery that may not exist.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    success: bool
+    agentActivity: _AgentActivityIdentity  # noqa: N815 - provider field name
+
+    @field_validator("success")
+    @classmethod
+    def _must_be_true(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("provider reported success=false")
+        return value
+
+
 class LinearApiError(RuntimeError):
     """A remote Linear call failed.
 
@@ -100,18 +127,44 @@ class LinearApiError(RuntimeError):
         super().__init__(f"linear {operation} failed (status={status}): {detail}")
 
 
-@dataclass(frozen=True, slots=True)
-class LinearTokens:
-    """One token response. The shape is identical for exchange and refresh.
+class LinearTokens(BaseModel):
+    """One validated token response. Identical shape for exchange and refresh.
 
-    `refresh_token` is optional because Linear's client-credentials style
-    responses omit it. The caller persists whatever came back and must not
-    assume the previous refresh token survives, since Linear rotates it.
+    A Pydantic model rather than a dataclass, and that is not decoration. These
+    values are written to `linear_installations`, so the boundary is the last
+    place a wrong type can be stopped before it reaches a column. A dataclass
+    annotated `scope: str` would happily carry a list, because annotations are
+    not checked at runtime, and the failure would surface as bad data rather
+    than as a rejected response.
+
+    `extra="ignore"` rather than `forbid`, which is the opposite of the rule
+    every request model in `models.py` follows, and deliberately so. Those models
+    guard an inbound trust boundary where an unexpected key is an attack surface.
+    This is a provider response: Linear may add a field at any time, and refusing
+    to install because a response grew a key we do not read would be brittleness
+    rather than strictness. Unknown keys are ignored; known keys are type-checked.
+
+    `refresh_token` is optional because Linear omits it on client-credentials
+    style responses. When present it replaces the token used to obtain it, since
+    Linear rotates refresh tokens, so the caller must persist what came back
+    rather than assume the old value survives.
     """
 
-    access_token: str
-    refresh_token: str | None
-    expires_in: int
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    access_token: str = Field(min_length=1)
+    refresh_token: str | None = None
+    expires_in: int = Field(gt=0)
+    token_type: str = Field(min_length=1)
+
+    # Linear documents `scope` as a string today, and as an array only for
+    # applications created before 1 December 2023. The Trellis application is
+    # created now, so the legacy shape cannot occur for it, and this fails closed
+    # on anything that is not the documented string rather than guessing.
+    #
+    # Failing closed is the right direction here because the alternative is
+    # silently coercing a list into a text column, where the damage is discovered
+    # later and by something else. A refused install reports its own cause.
     scope: str
 
 
@@ -268,11 +321,14 @@ def create_agent_activity(
         variables,
         client=client,
     )
-    result = data.get("agentActivityCreate") or {}
-    if not result.get("success"):
+    try:
+        AgentActivityResult.model_validate(data.get("agentActivityCreate"))
+    except ValidationError:
         raise LinearApiError(
-            "agent_activity_create", None, "provider reported success=false"
-        )
+            "agent_activity_create",
+            None,
+            "provider did not confirm the activity was created",
+        ) from None
 
 
 def _post_token(
@@ -293,17 +349,20 @@ def _post_token(
     except ValueError:
         raise LinearApiError(operation, response.status_code, "response was not JSON") from None
 
-    access_token = body.get("access_token")
-    expires_in = body.get("expires_in")
-    if not isinstance(access_token, str) or not isinstance(expires_in, int):
-        raise LinearApiError(operation, response.status_code, "response was malformed")
-
-    return LinearTokens(
-        access_token=access_token,
-        refresh_token=body.get("refresh_token"),
-        expires_in=expires_in,
-        scope=body.get("scope") or "",
-    )
+    try:
+        return LinearTokens.model_validate(body)
+    except ValidationError as exc:
+        # Only the field names and error types, never the values. A validation
+        # error rendered in full repeats the input, and the input here is a token
+        # response. `error_count` and the located field names are enough to
+        # diagnose a shape change without printing a credential.
+        fields = sorted(
+            {".".join(str(part) for part in error.get("loc", ())) for error in exc.errors()}
+        )
+        detail = f"response failed validation at: {', '.join(fields)}" if fields else (
+            "response failed validation"
+        )
+        raise LinearApiError(operation, response.status_code, detail) from None
 
 
 def _post_graphql(
@@ -373,14 +432,35 @@ def _request(
     network, which is what keeps the T00W gate offline.
 
     A transport failure is reported with `status=None` so callers can distinguish
-    "Linear said no" from "Linear was unreachable". The worker retries the second
-    and generally should not retry the first.
+    "Linear said no" from "Linear was unreachable". Those are different problems
+    and only the caller knows whether either is safe to repeat.
+
+    **Exactly one outbound attempt per call, and no retry lives here.** The
+    transport is constructed with `retries=0` explicitly rather than relying on
+    that being httpx's default, because a default is a thing a dependency upgrade
+    can change and this one is load bearing.
+
+    The reason is `agentActivityCreate`, which is a remote side effect. A
+    connection that dies after the request was transmitted leaves two states this
+    code cannot tell apart: Linear never received it, or Linear committed the
+    activity and the response was lost. Retrying resolves that ambiguity by
+    guessing, and the guess is only safe if replaying the same activity UUID is
+    proven idempotent at the provider. That probe needs a live workspace and has
+    not run. Until it does, one call issues one mutation attempt.
+
+    Linear does document a 30 minute window in which a failed OAuth refresh may
+    be replayed, and that allowance is real. It is also specific to refresh, and
+    generalizing it into "retry all Linear POSTs" would quietly extend a
+    guarantee about a credential operation to a mutation the provider never made
+    that promise about. Any refresh replay therefore belongs to the caller that
+    knows it is refreshing, not to this shared path.
     """
     timeout = settings.linear_http_timeout_seconds
     try:
         if client is not None:
             return client.request(method, url, timeout=timeout, **kwargs)
-        with httpx.Client(timeout=timeout) as owned:
+        transport = httpx.HTTPTransport(retries=0)
+        with httpx.Client(timeout=timeout, transport=transport) as owned:
             return owned.request(method, url, **kwargs)
     except httpx.HTTPError as exc:
         raise LinearApiError(operation, None, type(exc).__name__) from exc
