@@ -587,6 +587,76 @@ Then confirm all four transport tables exist: `linear_installations`,
 > **Never run `docker compose down -v` against the live database.** The `-v`
 > removes the volume. That is not an upgrade path, it is deleting the demo.
 
+### Who owns what at runtime
+
+Four processes, four responsibilities, and no overlap:
+
+```text
+Docker         PostgreSQL lifecycle, via restart: unless-stopped
+deployment     reconciling tracked Compose configuration
+systemd        FastAPI lifecycle and readiness
+ngrok service  the public tunnel
+```
+
+**The backend must not control the Postgres container.** A `trellis-backend`
+unit whose `ExecStartPre` ran `docker compose up` would need access to the
+Docker control socket merely to answer "is the database reachable", which is a
+large privilege for a small question, and it lets a backend restart mutate
+container configuration as a side effect. `restart: unless-stopped` already
+brings PostgreSQL back after a reboot on its own.
+
+The backend's start precondition is a bounded, non-mutating readiness probe run
+through the same interpreter systemd already uses for Trellis. Something of this
+shape, with the real venv path substituted after inspecting the unit:
+
+```ini
+[Unit]
+Requires=docker.service
+After=docker.service
+
+[Service]
+ExecStartPre=/path/to/venv/bin/python -c "import os,time,psycopg,sys
+d=os.environ['DATABASE_URL']
+for _ in range(60):
+    try:
+        psycopg.connect(d, connect_timeout=2).execute('SELECT 1'); sys.exit(0)
+    except Exception: time.sleep(1)
+sys.exit(1)"
+ExecStart=/path/to/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+It fails service startup if the database never becomes ready, and it can change
+nothing. Do not create a `trellis-postgres.service`; Docker already owns that.
+
+**Bind PostgreSQL to loopback on the deployment host.** The tracked
+`docker-compose.yml` publishes `55432` on all interfaces, which is correct for
+CI and local development but would expose the database with demo credentials on
+a public host. Do not change the tracked file: every DSN in CI says `localhost`,
+which resolves to `::1` first on some platforms, and an IPv4-only publish makes
+those connections fall back slowly. Add a host-only override instead:
+
+```yaml
+# docker-compose.override.yml, on the Ubuntu host only, not committed
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:55432:5432"
+```
+
+and set `DATABASE_URL` on that host to use `127.0.0.1` rather than `localhost`.
+A firewall rule on the published port is an equally good alternative.
+
+Deployment is the one place Compose may reconcile:
+
+```bash
+docker compose up -d --wait postgres
+```
+
+That is deliberate, and it is why the backup below comes first. `compose up`
+recreates a service whose configuration changed, which is exactly what applies
+the loopback port binding and the restart policy. `compose restart` would not
+apply them, because it restarts containers without re-reading the file.
+
 ### Deploy an exact commit, not a branch head
 
 T00W is not merged, so the usual `git pull --ff-only origin master` does not
@@ -636,6 +706,43 @@ workspace admin; the exact callback and webhook URLs are registered; agent
 session events are enabled; the app is mentionable and assignable; the demo team
 is accessible to the agent; the client name does not contain the word `Linear`;
 and the installation is not pending workspace approval.
+
+### The retry-identity probe
+
+Linear documents the retry schedule but not which identifiers survive a retry.
+The unknown is whether one logical retry regenerates `webhookTimestamp`, the
+body, the signature, and the delivery id, or reuses them. Both dedupe identities
+depend on the answer.
+
+There is a trap in the timing. Linear's first retry is roughly a minute after
+failure, and the recommended freshness window is also roughly a minute. If
+Linear preserves the original signed timestamp, the retry will correctly fail
+the normal freshness check, and a probe that records metadata after that check
+would observe nothing at all.
+
+So the temporary instrumentation records **after HMAC verification and before
+the freshness check**:
+
+```text
+exact raw body -> verify HMAC
+  if valid: record probe metadata
+-> unchanged production freshness check
+-> unchanged production behavior
+```
+
+Record only `Linear-Delivery`, `webhookTimestamp`, `body_sha256`, a short
+signature fingerprint, `webhookId`, and the receive time. Never the raw body,
+the full signature, `promptContext`, or any credential.
+
+**Do not widen or bypass the production freshness rule for the probe**, and do
+not leave a second webhook path behind. The instrumentation and the deliberate
+pre-durable failure are temporary, uncommitted, and removed immediately
+afterwards, with `git status --short` clean before continuing.
+
+If one logical retry changes both the delivery id and the signed body hash, stop
+before the worker: the two committed dedupe identities would not be able to
+recognize a provider retry, and a semantic event identity is a design decision
+rather than something to improvise during a live test.
 
 ### What the live gate proves, and what it does not
 

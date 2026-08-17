@@ -3,6 +3,13 @@ name: trellis-ai-agent
 services:
   postgres:
     image: postgres:16
+    # T00W. The database survives a host reboot on its own, so nothing else has
+    # to own its lifecycle. In particular the backend service does not: a
+    # FastAPI unit that ran `docker compose up` as a start precondition would
+    # need access to the Docker control socket merely to check that a database
+    # is reachable, which is a large privilege for a small question. Deployment
+    # reconciles this container; the backend only probes readiness. See README.
+    restart: unless-stopped
     environment:
       POSTGRES_DB: trellis
       POSTGRES_USER: trellis
@@ -10,6 +17,22 @@ services:
       # D-60. Pins what was previously inherited from the image default. A
       # SQL_ASCII cluster fails five deterministic tests on bytes versus str.
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.utf8"
+    # T00W considered binding this to 127.0.0.1 here and deliberately did not.
+    #
+    # The short form publishes on every interface, which on a public Ubuntu host
+    # would expose PostgreSQL with the demo credentials above, so the loopback
+    # binding is right for that host. It is wrong for this file. `localhost`
+    # resolves to ::1 first on Windows, and an explicit IPv4 publish answers only
+    # on 127.0.0.1, so every DSN in CI and in developer environments that says
+    # `localhost` would attempt IPv6 first and fall back slowly. Measured: the
+    # approval bridge suite went from 11 seconds to 137 seconds and four pool
+    # timeouts.
+    #
+    # Fixing that properly means rewriting the DSN in 27 CI job definitions plus
+    # the application default, which is a cross-cutting change to gates that have
+    # nothing to do with Linear, made immediately before a live deployment. The
+    # loopback binding belongs on the deployment host instead, as a compose
+    # override or a firewall rule. See the README.
     ports:
       - "55432:5432"
     volumes:
