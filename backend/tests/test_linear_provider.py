@@ -53,8 +53,16 @@ def _with_settings(monkeypatch, **overrides) -> None:
     `Settings` is frozen, so `setattr` on it raises. Replacing the module
     attribute is also the more honest substitution: it proves the code reads
     `settings` at call time rather than having captured a value at import.
+
+    Constructed through the class rather than `model_copy(update=...)`, and that
+    difference is not cosmetic. `model_copy` skips validators, so a helper built
+    on it hands the code under test an origin the real startup path would have
+    canonicalized or rejected. That is a harness quietly disabling the thing
+    under test, and it produced a double slash in the redirect URI before this
+    was corrected.
     """
-    monkeypatch.setattr(api, "settings", api.settings.model_copy(update=overrides))
+    values = {**api.settings.model_dump(), **overrides}
+    monkeypatch.setattr(api, "settings", api.settings.__class__(**values))
 
 
 def _token_body(**overrides) -> dict:
@@ -483,3 +491,81 @@ def test_identity_with_an_empty_organization_id_is_refused():
     )
     with _client(handler) as client, pytest.raises(LinearApiError):
         api.fetch_installation_identity("at-live", client=client)
+
+
+# ------------------------------------------------- public origin validation
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://foo.ngrok.app",
+        "ftp://foo.ngrok.app",
+        "https://foo.ngrok.app/x",
+        "https://foo.ngrok.app/api/linear",
+        "https://foo.ngrok.app?x=y",
+        "https://foo.ngrok.app#frag",
+        "https://user:pw@foo.ngrok.app",
+        "https://",
+        "notaurl",
+    ],
+    ids=[
+        "http", "ftp", "path", "deep-path", "query", "fragment",
+        "credentials", "no-host", "garbage",
+    ],
+)
+def test_malformed_public_origins_are_rejected(origin):
+    """A bad origin must fail at startup, not at install time in a browser.
+
+    Linear requires the redirect_uri at code exchange to match the one used at
+    authorization exactly. A wrong origin therefore surfaces against a value
+    Linear stored earlier, which is the worst possible place to find a trailing
+    slash or a stray path.
+    """
+    from pydantic import ValidationError as PydanticValidationError
+
+    with pytest.raises(PydanticValidationError):
+        api.settings.model_copy().__class__(
+            **{**api.settings.model_dump(), "trellis_public_origin": origin}
+        )
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("https://foo.ngrok.app", "https://foo.ngrok.app"),
+        ("https://foo.ngrok.app/", "https://foo.ngrok.app"),
+        ("https://FOO.ngrok.app", "https://foo.ngrok.app"),
+        ("https://foo.ngrok.app:8443", "https://foo.ngrok.app:8443"),
+    ],
+    ids=["bare", "trailing-slash", "uppercase-host", "explicit-port"],
+)
+def test_public_origins_canonicalize_identically(origin, expected):
+    """Both spellings must produce one redirect URI, or only one would match."""
+    settings = api.settings.__class__(
+        **{**api.settings.model_dump(), "trellis_public_origin": origin}
+    )
+    assert settings.trellis_public_origin == expected
+    assert settings.linear_oauth_redirect_url == f"{expected}/api/linear/oauth/callback"
+    assert settings.linear_webhook_url == f"{expected}/api/linear/webhook"
+
+
+def test_empty_origin_is_allowed_so_import_needs_no_credential():
+    settings = api.settings.__class__(
+        **{**api.settings.model_dump(), "trellis_public_origin": ""}
+    )
+    assert settings.trellis_public_origin == ""
+
+
+def test_authorization_url_and_exchange_use_the_same_redirect(monkeypatch):
+    """One property feeds both, so they cannot drift apart."""
+    _with_settings(
+        monkeypatch, linear_client_id="cid", trellis_public_origin="https://x.ngrok.app/"
+    )
+    handler, seen = _counting(lambda _r: httpx.Response(200, json=_token_body()))
+    with _client(handler) as client:
+        api.exchange_code("code", client=client)
+
+    expected = "https://x.ngrok.app/api/linear/oauth/callback"
+    assert expected in api.authorization_url("s").replace("%3A", ":").replace("%2F", "/")
+    assert expected.encode() in seen[0].content.replace(b"%3A", b":").replace(b"%2F", b"/")

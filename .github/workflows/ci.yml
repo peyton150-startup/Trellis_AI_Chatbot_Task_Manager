@@ -2240,6 +2240,11 @@ jobs:
           # widening this comment sanctions: by the owning task, and never to
           # make something green.
           paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
+          # T00W adds the two Linear ingress routes, which it owns under D-69.
+          # The same sanctioned widening: by the owning task, still exact in
+          # both directions. There is deliberately no /api/linear/install route,
+          # because an unauthenticated endpoint that mints OAuth state would let
+          # anyone start an installation flow against this deployment.
           expected = {
               "/api/tasks",
               "/api/runs",
@@ -2247,6 +2252,8 @@ jobs:
               "/api/runs/{run_id}/approvals/{tool_call_id}",
               "/api/demo/reset",
               "/api/agui",
+              "/api/linear/oauth/callback",
+              "/api/linear/webhook",
           }
           check(paths == expected, f"the route surface is {sorted(paths)}, expected {sorted(expected)}")
           check(
@@ -2592,9 +2599,11 @@ jobs:
           # on the same assertion in the T08 gate.
           paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
           # T12B adds the approvals decision route, which it owns under D-44.
+          # T00W adds the two Linear ingress routes, which it owns under D-69.
           expected_paths = {
               "/api/tasks", "/api/runs", "/api/runs/{run_id}", "/api/demo/reset",
-              "/api/agui", "/api/runs/{run_id}/approvals/{tool_call_id}"
+              "/api/agui", "/api/runs/{run_id}/approvals/{tool_call_id}",
+              "/api/linear/oauth/callback", "/api/linear/webhook",
           }
           check(paths == expected_paths, f"route surface is {sorted(paths)}")
 
@@ -4998,6 +5007,119 @@ jobs:
       - name: Build production frontend
         working-directory: frontend
         run: npm run build
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  t00w-linear-webhook-bridge:
+    name: T00W Linear webhook bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      # The positive proof D-69 deferred until the implementation existed. This
+      # gate asserts what T00W DOES; the T00L gate asserts what nothing may do.
+      #
+      # Runs with no Linear credential, no network, and no live workspace. Every
+      # provider call is driven through httpx.MockTransport, and the webhook path
+      # makes no outbound call at all by design, so there is nothing here that a
+      # secret would enable. The empty environment values are the assertion: if
+      # any path silently required a credential, this step would fail rather than
+      # skip.
+      - name: Verify the provider boundary is credential-free and offline
+        working-directory: backend
+        env:
+          LINEAR_CLIENT_ID: ""
+          LINEAR_CLIENT_SECRET: ""
+          LINEAR_WEBHOOK_SECRET: ""
+          LINEAR_ALLOWED_USER_ID: ""
+          TRELLIS_PUBLIC_ORIGIN: ""
+        run: python -m pytest tests/test_linear_provider.py -q
+
+      - name: Start PostgreSQL and apply 001 then 002 then 003
+        run: docker compose up -d --wait
+
+      - name: Verify the T00W transport schema
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tables="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
+            "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'linear_%';"; } | tr -d '\r')"
+          test "$tables" = "linear_agent_inbox,linear_agent_sessions,linear_installations,linear_oauth_states,linear_projections,linear_task_state"
+
+          # The single ACTIVE installation rule is a database guarantee, so it is
+          # proven by making it fail rather than by reading the index definition.
+          docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis -c \
+            "INSERT INTO linear_installations (organization_id, oauth_client_id, app_user_id, allowed_linear_user_id, access_token, access_token_expires_at, granted_scopes) VALUES ('o','c','a','u','t', now() + interval '1 day', 's');"
+
+          if docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis -c \
+            "INSERT INTO linear_installations (organization_id, oauth_client_id, app_user_id, allowed_linear_user_id, access_token, access_token_expires_at, granted_scopes) VALUES ('o2','c2','a2','u2','t2', now() + interval '1 day', 's');" ; then
+            echo "FAIL: a second ACTIVE installation was accepted"
+            exit 1
+          fi
+
+          docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis -c \
+            "TRUNCATE linear_installations;"
+
+          echo "PASS: four transport tables, and one active installation enforced"
+
+      - name: Verify production reset cannot clear Linear transport state
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c "
+          from app import sql
+          transport = ('linear_installations', 'linear_oauth_states', 'linear_agent_inbox', 'linear_agent_sessions')
+          for table in transport:
+              assert table not in sql.TRUNCATE_ALL_STATE, f'production reset would clear {table}'
+              assert table in sql.TRUNCATE_ALL_TEST_STATE, f'deterministic cleanup misses {table}'
+          print('PASS: production reset stays Linear-unaware; deterministic cleanup does not')
+          "
+
+      - name: Verify the deterministic ingress and OAuth callback contract
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: python -m pytest tests/test_linear_ingress.py -q
+
+      # The whole cumulative suite, because T00W touches main.py, sql.py, and
+      # config.py, and a route or statement change can break a gate that never
+      # mentions Linear.
+      - name: Verify the cumulative deterministic suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: python -m pytest -m "not network" -q
+
+      - name: Verify the webhook path cannot reach Linear
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Linear allows five seconds, and nothing on the ingress path needs a
+          # provider round trip. Asserted structurally rather than by timing: the
+          # ingress module must not import the provider boundary at all, so it
+          # cannot call Linear even by accident.
+          if grep -nE '^(from|import).*linear_agent_api' backend/app/linear_agent.py; then
+            echo "FAIL: the webhook boundary imports the provider client"
+            exit 1
+          fi
+          echo "PASS: ingress cannot reach Linear, because it cannot name it"
 
       - name: Remove CI database resources
         if: always()

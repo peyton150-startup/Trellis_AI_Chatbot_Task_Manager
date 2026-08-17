@@ -1,8 +1,9 @@
 import os
+from urllib.parse import urlparse
 from uuid import UUID
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 load_dotenv()
@@ -45,15 +46,58 @@ class Settings(BaseModel):
     linear_inbox_max_attempts: int
     linear_http_timeout_seconds: int
 
+    @field_validator("trellis_public_origin")
+    @classmethod
+    def _canonical_origin(cls, value: str) -> str:
+        """One canonical HTTPS origin, or refuse to start.
+
+        Linear requires the `redirect_uri` sent during code exchange to match the
+        one used during authorization exactly, and requires the webhook URL to be
+        public HTTPS. Both are derived from this value, so a sloppy origin fails
+        at install time in a browser against a value Linear stored earlier, which
+        is the worst place to discover a trailing slash.
+
+        Canonicalizing here rather than at each use is the point.
+        `https://x.ngrok.app` and `https://x.ngrok.app/` would otherwise produce
+        two different redirect URIs depending on which caller concatenated them,
+        and only one would match what is registered.
+
+        Empty is allowed, because every Linear value defaults to empty so that
+        importing this module needs no credential. The install path requires it.
+        """
+        if not value:
+            return value
+
+        parsed = urlparse(value)
+        if parsed.scheme != "https":
+            raise ValueError("TRELLIS_PUBLIC_ORIGIN must use https")
+        if not parsed.hostname:
+            raise ValueError("TRELLIS_PUBLIC_ORIGIN must carry a host")
+        if parsed.username or parsed.password:
+            raise ValueError("TRELLIS_PUBLIC_ORIGIN must not carry credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("TRELLIS_PUBLIC_ORIGIN must not carry a query or fragment")
+        if parsed.path not in ("", "/"):
+            raise ValueError("TRELLIS_PUBLIC_ORIGIN must be an origin, not a path")
+
+        netloc = parsed.hostname
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return f"https://{netloc}"
+
     @property
     def linear_oauth_redirect_url(self) -> str:
-        """The exact value that must be registered in the Linear OAuth app."""
-        return f"{self.trellis_public_origin.rstrip('/')}/api/linear/oauth/callback"
+        """The exact value that must be registered in the Linear OAuth app.
+
+        One property, used by both the authorization URL and the token exchange,
+        so the two cannot disagree.
+        """
+        return f"{self.trellis_public_origin}/api/linear/oauth/callback"
 
     @property
     def linear_webhook_url(self) -> str:
         """The exact value that must be registered as the Linear webhook URL."""
-        return f"{self.trellis_public_origin.rstrip('/')}/api/linear/webhook"
+        return f"{self.trellis_public_origin}/api/linear/webhook"
 
 
 settings = Settings(

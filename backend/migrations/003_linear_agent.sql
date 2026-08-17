@@ -63,12 +63,20 @@ CREATE TABLE linear_oauth_states (
 -- Durable ingress. A row here is committed before the webhook returns 200, so a
 -- backend restart cannot lose accepted work.
 --
--- Two independent identities, and D-69 requires both. delivery_id is Linear's
--- own delivery UUID and is ordinary provider retry idempotency. body_sha256 is
--- defense in depth: the HMAC authenticates the body, not the header, so an
--- attacker replaying an identical valid signed body under a fresh delivery id
--- would otherwise buy a second unit of work. Both are UNIQUE and either one
--- rejecting is a duplicate.
+-- Two independent identities, and D-69 requires both.
+--
+-- delivery_id is Linear's provider delivery identity. Whether it stays stable
+-- across a provider retry is NOT established: Linear documents the retry
+-- schedule but not which identifiers survive it, and this comment previously
+-- overstated the case by calling it retry idempotency. That property is live
+-- evidence to be measured during the ingress preflight, not something the
+-- schema can assert.
+--
+-- body_sha256 is the exact authenticated raw-body replay identity. The HMAC
+-- authenticates the body and not the headers, so an identical signed body
+-- replayed under a fresh delivery id would otherwise buy a second unit of work.
+--
+-- Both are UNIQUE and either one rejecting is a duplicate.
 --
 -- claimed_until is a lease, not a processing boolean. A worker that dies
 -- holding a boolean strands its row forever; a lease expires and the work
@@ -99,9 +107,15 @@ CREATE TABLE linear_agent_inbox (
     CHECK ((status = 'refused') = (refusal_reason IS NOT NULL))
 );
 
--- The dequeue path. Ordered by received_at so one session's events are taken in
--- arrival order, which is what makes the created-before-prompted ordering in
--- D-69 enforceable by the claim query rather than by the worker remembering.
+-- The dequeue path.
+--
+-- received_at is queue PREFERENCE only. It makes the right row cheap to find
+-- and it is not causality: an index and an ORDER BY cannot stop a later prompt
+-- from being claimed while an earlier created event for the same session is
+-- still leased or retrying. Correctness comes from the claim predicate and the
+-- session continuity state, which must make the wrong row unclaimable rather
+-- than merely second in line. An earlier version of this comment credited the
+-- ordering with a guarantee it cannot provide.
 CREATE INDEX linear_agent_inbox_claimable_idx
   ON linear_agent_inbox (status, not_before, received_at);
 

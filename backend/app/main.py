@@ -282,8 +282,26 @@ def get_linear_oauth_callback(
 
 
 def _callback_response(message: str, status: int) -> Response:
+    """Generic text plus the headers that keep an inert page inert.
+
+    `no-store` keeps the page out of caches and out of history restoration, and
+    `no-referrer` matters more than it looks: without it a browser following any
+    link from this page would send the full URL, authorization code and state
+    included, to a third party in the `Referer` header.
+
+    The last two cost nothing here. The page carries no script, style, image, or
+    frame, so a policy denying all of them cannot break it, and it removes this
+    endpoint as a target worth thinking about.
+    """
     return PlainTextResponse(
-        message, status_code=status, headers={"Cache-Control": "no-store"}
+        message,
+        status_code=status,
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+        },
     )
 
 
