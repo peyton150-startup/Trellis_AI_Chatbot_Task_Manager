@@ -475,4 +475,3 @@ def test_system_prompt_requires_clear_request_clarification():
     assert "delete only completed tasks" in SYSTEM_PROMPT
     assert '"the completed ones"' in SYSTEM_PROMPT
     assert "preceding conversation" in SYSTEM_PROMPT
-
