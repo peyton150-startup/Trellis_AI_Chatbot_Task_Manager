@@ -4,6 +4,106 @@ import { useState } from "react";
 
 import { TaskCard } from "./TaskCard";
 import type { BoardState } from "../lib/useBoard";
+import type { Task } from "../lib/types";
+
+type SortMode =
+  | "default"
+  | "priority-highest"
+  | "priority-lowest"
+  | "name-az"
+  | "name-za"
+  | "due-soonest"
+  | "due-latest"
+  | "status-open-first"
+  | "status-done-first";
+
+const PRIORITY_RANK: Record<Task["priority"], number> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  critical: 3,
+};
+
+const dueDateKey = (dueDate: string | null) =>
+  dueDate === null ? null : dueDate.slice(0, 10);
+
+function compareTitleAndId(a: Task, b: Task) {
+  const titleComparison = a.title.localeCompare(b.title, undefined, {
+    sensitivity: "base",
+  });
+
+  if (titleComparison !== 0) {
+    return titleComparison;
+  }
+
+  return a.id.localeCompare(b.id);
+}
+
+function compareTasks(a: Task, b: Task, sortBy: SortMode) {
+  let comparison = 0;
+
+  switch (sortBy) {
+    case "priority-highest":
+      comparison = PRIORITY_RANK[b.priority] - PRIORITY_RANK[a.priority];
+      break;
+
+    case "priority-lowest":
+      comparison = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
+      break;
+
+    case "name-az":
+      return compareTitleAndId(a, b);
+
+    case "name-za": {
+      const titleComparison = b.title.localeCompare(a.title, undefined, {
+        sensitivity: "base",
+      });
+
+      return titleComparison !== 0
+        ? titleComparison
+        : a.id.localeCompare(b.id);
+    }
+
+    case "due-soonest":
+    case "due-latest": {
+      const aDueDate = dueDateKey(a.due_date);
+      const bDueDate = dueDateKey(b.due_date);
+
+      // Tasks without due dates remain last in either direction.
+      if (aDueDate === null && bDueDate !== null) {
+        return 1;
+      }
+
+      if (aDueDate !== null && bDueDate === null) {
+        return -1;
+      }
+
+      if (aDueDate !== null && bDueDate !== null) {
+        comparison =
+          sortBy === "due-soonest"
+            ? aDueDate.localeCompare(bDueDate)
+            : bDueDate.localeCompare(aDueDate);
+      }
+
+      break;
+    }
+
+    case "status-open-first":
+      comparison =
+        Number(a.status === "done") - Number(b.status === "done");
+      break;
+
+    case "status-done-first":
+      comparison =
+        Number(a.status === "open") - Number(b.status === "open");
+      break;
+
+    case "default":
+      return 0;
+  }
+
+  return comparison !== 0 ? comparison : compareTitleAndId(a, b);
+}
 
 interface BoardProps {
   state: BoardState;
@@ -17,6 +117,7 @@ export function Board({ state }: BoardProps) {
   const [dueFilter, setDueFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
   const [blockedFilter, setBlockedFilter] = useState("all");
+  const [sortBy, setSortBy] = useState<SortMode>("default");
 
   if (isLoading && tasks.length === 0) {
     return <p className="board-state">Loading committed tasks...</p>;
@@ -26,6 +127,7 @@ export function Board({ state }: BoardProps) {
     return (
       <section className="board-state board-state--error" role="alert">
         <p>{error}</p>
+
         <button type="button" onClick={() => void refetch()}>
           Try again
         </button>
@@ -37,6 +139,7 @@ export function Board({ state }: BoardProps) {
     return (
       <section className="board-state">
         <p>No committed tasks are on the board.</p>
+
         <button type="button" onClick={() => void refetch()}>
           Refresh board
         </button>
@@ -45,6 +148,7 @@ export function Board({ state }: BoardProps) {
   }
 
   const openCount = tasks.filter((task) => task.status === "open").length;
+
   const taskTitlesById = new Map(
     tasks.map((task) => [task.id, task.title] as const),
   );
@@ -64,6 +168,7 @@ export function Board({ state }: BoardProps) {
     now.getMonth(),
     now.getDate() + 7,
   );
+
   const nextSevenDays = localDateKey(sevenDaysFromNow);
 
   const filteredTasks = tasks.filter((task) => {
@@ -83,8 +188,7 @@ export function Board({ state }: BoardProps) {
       return false;
     }
 
-    const dueDate =
-      task.due_date === null ? null : task.due_date.slice(0, 10);
+    const dueDate = dueDateKey(task.due_date);
 
     if (dueFilter === "overdue") {
       return (
@@ -113,6 +217,11 @@ export function Board({ state }: BoardProps) {
     return true;
   });
 
+  const sortedTasks =
+    sortBy === "default"
+      ? filteredTasks
+      : [...filteredTasks].sort((a, b) => compareTasks(a, b, sortBy));
+
   const activeFilterCount = [
     priorityFilter,
     dueFilter,
@@ -120,11 +229,15 @@ export function Board({ state }: BoardProps) {
     blockedFilter,
   ].filter((value) => value !== "all").length;
 
-  const clearFilters = () => {
+  const hasViewChanges =
+    activeFilterCount > 0 || sortBy !== "default";
+
+  const resetView = () => {
     setPriorityFilter("all");
     setDueFilter("all");
     setStatusFilter("all");
     setBlockedFilter("all");
+    setSortBy("default");
   };
 
   return (
@@ -138,7 +251,9 @@ export function Board({ state }: BoardProps) {
             aria-controls="board-filters"
             onClick={() => setFiltersOpen((open) => !open)}
           >
-            Filter{activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}
+            Filter / Sort
+            {activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}
+            {sortBy !== "default" ? " - Sorted" : ""}
           </button>
 
           <p>
@@ -147,6 +262,7 @@ export function Board({ state }: BoardProps) {
             <span>{openCount} open</span>
           </p>
         </div>
+
         <div className="board__toolbar-actions">
           {lastRefreshedAt !== null ? (
             <span
@@ -162,6 +278,7 @@ export function Board({ state }: BoardProps) {
               })}
             </span>
           ) : null}
+
           <button
             type="button"
             onClick={() => void refetch()}
@@ -176,9 +293,12 @@ export function Board({ state }: BoardProps) {
         <div className="board__filters" id="board-filters">
           <label>
             <span>Priority</span>
+
             <select
               value={priorityFilter}
-              onChange={(event) => setPriorityFilter(event.target.value)}
+              onChange={(event) =>
+                setPriorityFilter(event.target.value)
+              }
             >
               <option value="all">All priorities</option>
               <option value="critical">Critical</option>
@@ -190,6 +310,7 @@ export function Board({ state }: BoardProps) {
 
           <label>
             <span>Due</span>
+
             <select
               value={dueFilter}
               onChange={(event) => setDueFilter(event.target.value)}
@@ -204,9 +325,12 @@ export function Board({ state }: BoardProps) {
 
           <label>
             <span>Status</span>
+
             <select
               value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value)}
+              onChange={(event) =>
+                setStatusFilter(event.target.value)
+              }
             >
               <option value="all">All statuses</option>
               <option value="open">Open</option>
@@ -216,9 +340,12 @@ export function Board({ state }: BoardProps) {
 
           <label>
             <span>Dependency</span>
+
             <select
               value={blockedFilter}
-              onChange={(event) => setBlockedFilter(event.target.value)}
+              onChange={(event) =>
+                setBlockedFilter(event.target.value)
+              }
             >
               <option value="all">Any dependency</option>
               <option value="blocked">Blocked</option>
@@ -226,18 +353,51 @@ export function Board({ state }: BoardProps) {
             </select>
           </label>
 
+          <label>
+            <span>Sort by</span>
+
+            <select
+              value={sortBy}
+              onChange={(event) =>
+                setSortBy(event.target.value as SortMode)
+              }
+            >
+              <option value="default">Default order</option>
+              <option value="priority-highest">
+                Priority - highest first
+              </option>
+              <option value="priority-lowest">
+                Priority - lowest first
+              </option>
+              <option value="name-az">Name - A to Z</option>
+              <option value="name-za">Name - Z to A</option>
+              <option value="due-soonest">
+                Due date - soonest first
+              </option>
+              <option value="due-latest">
+                Due date - latest first
+              </option>
+              <option value="status-open-first">
+                Status - Open first
+              </option>
+              <option value="status-done-first">
+                Status - Done first
+              </option>
+            </select>
+          </label>
+
           <div className="board__filter-footer">
             <span>
-              Showing <strong>{filteredTasks.length}</strong> of{" "}
+              Showing <strong>{sortedTasks.length}</strong> of{" "}
               <strong>{tasks.length}</strong>
             </span>
 
             <button
               type="button"
-              onClick={clearFilters}
-              disabled={activeFilterCount === 0}
+              onClick={resetView}
+              disabled={!hasViewChanges}
             >
-              Clear filters
+              Reset view
             </button>
           </div>
         </div>
@@ -250,20 +410,21 @@ export function Board({ state }: BoardProps) {
       ) : null}
 
       <div className="board__grid">
-        {filteredTasks.map((task) => (
+        {sortedTasks.map((task) => (
           <TaskCard
             key={task.id}
             task={task}
             blockedByTitle={
               task.blocked_by === null
                 ? null
-                : (taskTitlesById.get(task.blocked_by) ?? "Unknown task")
+                : (taskTitlesById.get(task.blocked_by) ??
+                  "Unknown task")
             }
           />
         ))}
       </div>
 
-      {filteredTasks.length === 0 ? (
+      {sortedTasks.length === 0 ? (
         <p className="board__filter-empty">
           No tasks match the current filters.
         </p>
