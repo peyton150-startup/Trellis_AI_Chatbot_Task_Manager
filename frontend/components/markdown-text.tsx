@@ -193,23 +193,31 @@ const defaultComponents = memoizeMarkdownComponents({
       />
     </div>
   ),
-  th: ({ className, ...props }) => (
+  th: ({ className, children, ...props }) => (
     <th
       className={cn(
-        "aui-md-th bg-muted px-3 py-1.5 text-start font-medium first:rounded-ss-lg last:rounded-se-lg [[align=center]]:text-center [[align=right]]:text-right",
+        "aui-md-th bg-muted px-3 py-1.5 text-start align-top font-medium first:rounded-ss-lg last:rounded-se-lg [[align=center]]:text-center [[align=right]]:text-right",
         className,
       )}
       {...props}
-    />
+    >
+      <div className="min-w-0 max-w-64 whitespace-normal [overflow-wrap:anywhere]">
+        {children}
+      </div>
+    </th>
   ),
-  td: ({ className, ...props }) => (
+  td: ({ className, children, ...props }) => (
     <td
       className={cn(
-        "aui-md-td border-muted-foreground/20 border-s border-b px-3 py-1.5 text-start last:border-e [[align=center]]:text-center [[align=right]]:text-right",
+        "aui-md-td border-muted-foreground/20 border-s border-b px-3 py-1.5 text-start align-top last:border-e [[align=center]]:text-center [[align=right]]:text-right",
         className,
       )}
       {...props}
-    />
+    >
+      <div className="min-w-0 max-w-64 whitespace-normal [overflow-wrap:anywhere]">
+        {children}
+      </div>
+    </td>
   ),
   tr: ({ className, ...props }) => (
     <tr

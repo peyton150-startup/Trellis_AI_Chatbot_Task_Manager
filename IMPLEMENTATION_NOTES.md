@@ -1804,3 +1804,48 @@ branch serialization, cross-session memory, or browser-owned history.
 Manual browser/provider integration testing is deferred to the final Opus
 review. D-67 requires Opus R3 boundary review of the final immutable T17 diff
 before merge.
+
+## Out-of-band frontend UX follow-up: board sorting and markdown table wrapping
+
+**Local role:** Extends the existing PR #48 task-board filter surface with
+client-side sorting while preserving the server-returned order as the default.
+The same follow-up bounds Markdown table-cell content so long task names and
+other values wrap inside cells without removing the existing horizontal-scroll
+behavior for genuinely wide tables.
+
+**Whole-system role:** This is an explicitly authorized frontend UX follow-up,
+not a new BUILD_SPEC numbered task. It does not change backend task semantics,
+AG-UI transport, run identity, approval behavior, persistence, Linear
+integration, or the authoritative task ordering returned by the backend.
+Filtering is applied first, optional client-side sorting is applied second, and
+the resulting tasks are rendered without mutating the source `tasks` array.
+
+**Inputs and dependencies:** Consumes PR #48's existing Priority, Due, Status,
+and Dependency filters; the authoritative `Task` wire type; the existing
+server-returned board ordering; and the existing Markdown table wrapper using
+`max-w-full overflow-x-auto` with a `w-max min-w-full` table.
+
+**Outputs and consumers:** `Board.tsx` adds sort modes for priority, name, due
+date, and status. Default sorting preserves server order. Tasks without a due
+date remain last for both due-date directions. `Reset view` clears both filters
+and sorting. `globals.css` makes the Filter / Sort controls responsive with an
+auto-fitting grid. `markdown-text.tsx` constrains header and body cell content
+with wrapping while preserving the table-level horizontal scroll surface.
+
+**Verification:**
+
+    backend ruff                             PASS
+    backend pytest -m "not network"          58 passed, 13 deselected
+    frontend production build               PASS
+    git diff --check                        PASS
+
+The backend checks ran inside `trellis-t19-test` against the existing Trellis
+test environment. The PostgreSQL container
+`trellis-ai-agent-postgres-1` was healthy during verification. The frontend
+production build also completed successfully after each functional change.
+
+**Limitations and review status:** Manual browser acceptance passed. Sort
+directions, filter-plus-sort behavior, Reset view, long Markdown value wrapping,
+and retained horizontal scrolling were verified in the local frontend. The
+existing authoritative approval card and T16 approval continuation path are
+regression-only for this follow-up and are intentionally unchanged.
