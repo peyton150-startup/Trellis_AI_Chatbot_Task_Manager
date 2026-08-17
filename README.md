@@ -550,6 +550,101 @@ PostgreSQL remains authoritative. Linear is an external projection and reconcili
 
 External SaaS state cannot participate in the same PostgreSQL transaction as the local domain, so the integration is designed around an explicit consistency boundary instead of pretending the two systems commit atomically.
 
+## T00W live deployment procedure
+
+T00W adds a native Linear agent over OAuth and AgentSession webhooks. See D-69
+and D-70. This section is the deployment path for the live gate, and it exists
+because the two most expensive failures here are not code defects.
+
+### Applying migration 003 to an existing database
+
+**`003_linear_agent.sql` will not apply itself on an existing deployment.** The
+PostgreSQL image runs `/docker-entrypoint-initdb.d` scripts only when it
+initializes an empty data directory, and skips them entirely when a database is
+already present. Neither of these applies it to a live server:
+
+```bash
+git pull && docker compose restart
+docker compose up -d
+```
+
+The migration is also not idempotent: it is plain `CREATE TYPE` and
+`CREATE TABLE`, so running it twice fails. Check first:
+
+```bash
+docker compose exec -T postgres psql -At -U trellis -d trellis -c "SELECT to_regclass('public.linear_installations');"
+```
+
+An empty result means it has not been applied. Apply it exactly once:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis < backend/migrations/003_linear_agent.sql
+```
+
+Then confirm all four transport tables exist: `linear_installations`,
+`linear_oauth_states`, `linear_agent_inbox`, `linear_agent_sessions`.
+
+> **Never run `docker compose down -v` against the live database.** The `-v`
+> removes the volume. That is not an upgrade path, it is deleting the demo.
+
+### Deploy an exact commit, not a branch head
+
+T00W is not merged, so the usual `git pull --ff-only origin master` does not
+contain it. Deploy the immutable commit whose CI is green, and confirm the
+deployed `git rev-parse HEAD` equals it before restarting. Live-testing a
+moving branch head makes a failure unreproducible.
+
+### Keep the OAuth callback out of logs
+
+Linear returns the authorization `code` and `state` in the callback query
+string, and Uvicorn's access logger writes the path with its query string. For
+this deployment, run Uvicorn with `--no-access-log`, which leaves application
+and error logging intact. Set `inspect: false` on the ngrok tunnel and leave
+ngrok cloud Full Capture off. Do not rely on ngrok replay for the callback.
+
+The callback response is already generic and sends `no-store`, `no-referrer`,
+`nosniff`, and a deny-all CSP, and never echoes the code, state, or any token.
+
+### Configuration order
+
+`allowed_linear_user_id` is captured into the installation row at install time,
+so the authorized human must be known before the OAuth flow runs, not after.
+
+Obtain that UUID out of band. Using a temporary personal Linear credential
+outside this application, query the authenticated viewer, confirm the name and
+email are the intended person, keep only the returned id, and revoke the
+temporary credential. **No personal API key belongs in Trellis**, its
+environment, or CI; `LINEAR_API_KEY` remains prohibited and CI asserts it.
+
+Then set `LINEAR_ALLOWED_USER_ID`, `TRELLIS_PUBLIC_ORIGIN`, `LINEAR_CLIENT_ID`,
+`LINEAR_CLIENT_SECRET`, and `LINEAR_WEBHOOK_SECRET`, restart the backend, and
+only then begin a new installation with:
+
+```bash
+python -m app.linear_install
+```
+
+`TRELLIS_PUBLIC_ORIGIN` is validated at startup and must be a bare HTTPS origin
+with no path, query, fragment, or credentials. Both public URLs derive from it,
+so it is the only place the hostname is configured.
+
+### Linear application settings
+
+When ingress appears dead, check these before reading code: the app is private
+with the `authorization_code` grant and `actor=app`; the installer is a
+workspace admin; the exact callback and webhook URLs are registered; agent
+session events are enabled; the app is mentionable and assignable; the demo team
+is accessible to the agent; the client name does not contain the word `Linear`;
+and the installation is not pending workspace approval.
+
+### What the live gate proves, and what it does not
+
+Ingress alone proves the OAuth install, a real signed webhook, and a committed
+inbox row inside Linear's five-second budget. The AgentSession will appear
+unresponsive after about ten seconds, because the worker that emits Agent
+Activities does not exist yet. That is expected at this stage and must not be
+"fixed" by running the model or emitting an activity inside the webhook request.
+
 ## Deliberately not built
 
 The project is intentionally scoped. It is not trying to look production-grade by accumulating infrastructure that does not strengthen the interview thesis.
