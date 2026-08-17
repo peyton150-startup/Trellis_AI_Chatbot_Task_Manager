@@ -2669,3 +2669,277 @@ the historical T12A/T12B authoring allocation.
 
 No PROJECT_PLAN cut is required because this ruling avoids a schema migration,
 new service, new endpoint, and new numbered task.
+
+---
+
+## Linear integration decisions, materialized at T00L
+
+Recorded on 2026-08-12 in `docs/LINEAR_INTEGRATION.md` section 3 and revised the
+same day after the Opus review of that document. They were reserved rather than
+appended, because T06 had already taken D-23 and the reserved block had to stay
+contiguous. D-30 was written on the explicit understanding that D-24 through
+D-29 were reserved and must not be reused, and every later decision honoured
+that, so appending them here consumes no number another decision claims.
+
+This block is materialization, not new architecture. D-24 through D-28 are
+recorded as they were settled and are not redesigned. Only D-29's open question
+is decided, because it was written to be decided at T00L and by nobody else.
+`docs/LINEAR_INTEGRATION.md` remains the detailed design and carries the
+schemas, the field tables, and the worked failure cases. No decision above is
+amended. D-02, D-04, D-09, D-10, D-18, D-19, and D-22 all constrain what follows
+and none of them changes.
+
+### D-24: Postgres stays authoritative and Linear is a projected surface
+
+The demo runs on Linear. The write path does not.
+
+A tool body commits its domain mutation, its `task_events` rows, and
+`idempotency.complete` in one PostgreSQL transaction. A Linear GraphQL mutation
+cannot join that transaction. Calling Linear from inside the tool body would
+open a window where Linear had mutated while the lease was still `pending`, and
+lease stealing would then re-execute work that had already landed externally,
+falsifying the exactly-once claim in precisely the scenario the demo
+dramatizes.
+
+Linear is therefore written only after the local transaction commits, by a
+background projector draining an outbox. Postgres is authoritative state; Linear
+is an asynchronously projected external representation.
+
+The binding consequences: the failure mode when Linear is unavailable is
+`projection pending`, never `mutation half applied`; agent correctness never
+depends on Linear being reachable; no tool function calls Linear, and no code
+inside a transaction block calls Linear. The honest claim, for the interview, is
+that local mutations are transactionally exactly-once while external projection
+is at-least-once with locally owned deduplication. Do not claim exactly-once end
+to end.
+
+### D-25: the outbox row is written by a database trigger, not by application code
+
+`linear_projections` rows are written by an `AFTER INSERT ON task_events`
+trigger defined in the migration, not by `domain.py`, `undo.py`, `seed.py`, or
+any tool.
+
+The invariant is that every committed change to a task reaches Linear. An
+invariant enforced by every call site remembering to do something is an
+invariant that breaks under time pressure. The trigger makes it structural: the
+audit event and its projection row are inserted by the database in the same
+transaction, so they cannot diverge and no future call site can forget. It also
+fixes the boundary of what projects. A change that wrote no `task_events` row
+does not project, which is correct, because the system has no record it
+happened.
+
+`linear_projections` carries `UNIQUE(event_id)`, satisfied by making `event_id`
+the primary key, so retries and a restarted projector cannot enqueue the same
+change twice. Deduplication is owned locally. Gate B fact 6 established that
+Linear advertises no replay semantics on any of its 361 mutations, so the local
+constraint is not merely the first layer, it is the only one available.
+
+There is no `payload` column. `task_events.before` and `after` are immutable and
+authoritative; a second copy could only drift, and populating it would force
+field mapping into PL/pgSQL inside a migration. The projector reads the event.
+
+The operation mapping is four values, not three:
+
+```
+created   -> create
+updated   -> update
+deleted   -> archive
+restored  -> unarchive
+```
+
+`restored` must not collapse into `update`. Undo of a delete writes a `restored`
+event while the Linear issue is archived, so an update would leave it archived
+while the local board shows the task back. That is a demo beat failing silently.
+
+### D-26: integration state is a tombstoned side table, not columns on `tasks`
+
+`tasks` keeps its eleven domain columns. Linear state lives in
+`linear_task_state`, keyed by `task_id` as a bare primary key with no foreign key
+to `tasks`.
+
+Three columns on `tasks` was the original proposal and it breaks on contact.
+Every domain read is `SELECT *` validated into `Task`, `TrellisModel` sets
+`extra="forbid"`, and the added columns raise `ValidationError` on the first
+call. Once on `Task` they also reach every `task_events` snapshot, where undo
+restoring a `before` would restore a stale `external_id` and reset the very
+`diverged` flag the refusal depends on. Solving that with an exclude list is the
+schedule-pressure answer; the side table makes the whole class structurally
+impossible, which is why the architecture and not a filter is what enforces it.
+
+The missing foreign key is deliberate and re-adding it is a regression. Under
+`ON DELETE CASCADE`, deleting a task would destroy `external_id` in the same
+transaction that queues the `archive` projection, leaving the projector a
+`task_id` and no issue to address. The row is a tombstone and outlives its task
+on purpose. Restore reconnecting to the same external identity works only
+because a deleted task is reinserted under its original id; that coupling is
+load bearing and must not be relaxed.
+
+Integration state never increments a task business version, never produces a
+business `task_event`, never enters a `Task` snapshot, and is never restored by
+undo.
+
+### D-27: external divergence refuses rather than merges
+
+`linear_task_state` carries a `diverged` boolean. The reconciler sets it when
+Linear reports an issue whose `updatedAt` moved with no corresponding local
+projection. The reconciler never writes any `tasks` field for a known task and
+never merges remote values into local state.
+
+Two safeguards are required and neither follows from a Gate B fact. Archived
+issues are excluded from the poll, or a deleted task resurrects through the
+import path and deletion undoes itself. Tasks with an incomplete projection are
+skipped, because the projector's own write moves Linear's `updatedAt`, and
+flagging that would refuse every later mutation on a task nobody outside the
+system touched.
+
+`policy.check` gains a DIVERGENCE step between SCOPE and CLASSIFY, and `undo.py`
+gains an `EXTERNALLY_MODIFIED` precheck reason. Both refuse.
+
+Refusing rather than merging is the decision. Field-level conflict resolution
+between two systems with different concurrency models is a real project, and
+this build has seven days. It is also consistent with what the system already
+does: `update_task` refuses on an `expected_version` conflict, and undo refuses
+if any row moved. Divergence is that same rule applied to an actor outside the
+system, which is why it produces a refusal and not a new subsystem.
+
+The product consequence is the reason this is worth building rather than
+cutting. During the demo a human has Linear open. Without this, their edit is
+silently overwritten by the next projection. With it, the agent notices, says
+which issue changed, and declines to act.
+
+`EXTERNAL_DIVERGENCE` is HTTP 409, in the same concurrency-conflict family as
+`VERSION_CONFLICT`, and not 403. The actor is entitled to the row; the row is
+contested. It is the fourteenth error code, and the addition is priced through
+D-31 as part of the same re-plan that carries D-68.
+
+### D-28: reset fences the projector, and delivery is serialized per task
+
+Two coordination properties. The mechanism belongs to T27 and T29 and is
+deliberately not fixed here; the semantics are.
+
+Reset and projection delivery are mutually exclusive. `POST /api/demo/reset`
+must fence the projection worker before mutating either Linear or local
+integration state, and when reset returns, no projection from the pre-reset
+generation may still be executing. The second clause is the operative one:
+refusing new work is not enough if a delivery is already in flight, and ordering
+reset's own statements does not help, because the projector is an independent
+actor that can wake between any two of them.
+
+A later event for a task may not be delivered while an earlier projection for
+that same task is incomplete. The outbox is ordered by `event_id`, which fixes
+dequeue order and nothing else. If delivery ever runs more than one row at a
+time, `create -> update -> archive -> unarchive` can be reordered, and an update
+then targets an issue that does not exist, or an unarchive races the archive it
+reverses. Cross-task concurrency stays available.
+
+T00L implements neither property and does not pretend to. It ships the local
+tables and the trigger those mechanisms will coordinate over, and it leaves
+`POST /api/demo/reset` Linear-unaware, which is the honest state until T29 owns
+the fence. See D-68 for the consequence that surfaced inside
+`TRUNCATE_ALL_STATE`.
+
+### D-29: Gate B, the contract fixture, and the invariant count, concluded at fifteen
+
+Gate B ran on 2026-08-13, before any Linear code was written, and returned
+`GATE B: PASS`. Its six facts are recorded at the head of this file, the frozen
+contract subset is checked in at `backend/tests/fixtures/linear_contract.json`,
+and the network-marked drift test compares live introspection against it on
+demand rather than in CI, per D-09. No observed rate limit is recorded as an
+architectural constant; the conclusion this build depends on is that the
+observed limits sit comfortably above demo and rehearsal usage.
+
+The open clause is the invariant count, which this decision reserved for T00L to
+settle deliberately rather than by accretion. It is settled at **fifteen**.
+
+D-19 fixed the count at thirteen and set the precedent that a case needing
+coordinated fakes belongs in a task gate rather than in a named invariant. That
+precedent is upheld here, and it is why the count moves by two rather than by
+three. The reconciler coordination property in D-28 does **not** become a named
+invariant. It is a property relating the projector, the reconciler, projection
+state, and an external timestamp; constructing it requires coordinated fakes and
+a reconciler that does not exist at T00L. It stays covered by the T28
+integration gate, asserting both directions so that it proves safety rather than
+blanket suppression.
+
+The two divergence refusals are different, and they earn their names on the
+argument D-29 demanded rather than on a renumber. They are independent
+trust-boundary guarantees enforced by two separate mechanisms.
+
+The normal-mutation refusal is enforced inside the authoritative policy path, at
+step 1b of `policy.check`, on every mutating call.
+
+The undo refusal is enforced by undo's own all-before-any precheck, which
+deliberately does not call `policy.check` at all. Undo compensates state the
+actor already owns, through events the actor already caused, and it answers a
+different question from "may this actor mutate this task now."
+
+Because the mechanisms are separate, a regression in one does not prove the
+other remains safe, and a suite naming only one would report green while half
+the boundary was gone. Two independently reachable guarantees are two
+invariants. That is the test D-29 set, and both refusals meet it where the
+reconciler property does not.
+
+Thirteen plus two is fifteen. `docs/BUILD_SPEC.md` section 11 and D7 of
+`docs/PROJECT_PLAN.md` carry the number and the two new test names. D-19's fixed
+count is superseded for these two deterministic trust-boundary properties and
+for nothing else. CI still requires 100 percent of whatever the suite is.
+
+### D-68: T00L is the final pre-demo implementation patch
+
+The user has explicitly re-planned the current pre-demo workstream so that T00L
+proceeds against the current repository state rather than waiting for the
+post-T25 position D-46 gave it. The workstream is: current `master`, then this
+D-31 re-plan, then T00L, then an immutable-SHA review, then demo freeze.
+
+This supersedes D-46 only as a scheduling constraint on T00L. It rewrites no
+other task's status. Existing repository statuses remain authoritative:
+completed work remains completed, explicitly cut work remains cut, work awaiting
+review remains awaiting review, and remaining work not taken before the demo
+remains deferred. Nothing is marked complete merely because T00L moved. T26
+through T29 remain deferred, and the `T26 -> T27 -> T28 -> T29` continuation is
+unchanged.
+
+The schedule cost is paid by cutting the remaining pre-demo implementation
+timebox after T00L and its required review. That is a schedule-budget cut and
+not a task-status reclassification. No roadmap task is newly marked `CUT` merely
+for falling outside this workstream. T00L works against functionality that
+exists on its starting SHA, `3be719d`, and depends on no deferred work.
+
+**Scope bootstrap.** KERNEL changes require a D-31 re-plan, the re-plan must
+update permanent planning documents, and an implementation model may not touch
+files outside its authorized list. T00L needed more companions than its original
+row listed, so the re-plan is performed first in the working tree and ships
+inside the single T00L commit. There is no separate preliminary re-plan commit,
+and the one task, one commit, one verification boundary rule is preserved.
+
+**The `TRUNCATE_ALL_STATE` split.** Found against `3be719d` before any edit:
+`sql.TRUNCATE_ALL_STATE` has two callers with opposite requirements. Production
+`seed.reset`, behind `POST /api/demo/reset`, and the cleanup fixtures of
+`test_invariants.py`, `test_approval_bridge.py`, and `test_t17_continuity.py`.
+Because `linear_task_state` has no foreign key to `tasks` under D-26,
+`TRUNCATE ... CASCADE` cannot reach it. Adding it to the shared constant would
+give the reset route Linear-aware behavior that D-28 fences and T29 owns.
+Omitting it would leak tombstoned divergence between tests, and a stale
+`diverged = true` row would make both new invariants pass without the code under
+test ever reading the flag, which is the D-21 failure mode of a test that passes
+for the wrong reason.
+
+The user ruled on 2026-08-17: keep `TRUNCATE_ALL_STATE` unchanged, add
+`TRUNCATE_ALL_TEST_STATE` which additionally clears `linear_task_state`, repoint
+the three fixtures at it, and prove the split executably rather than trusting the
+names. `backend/tests/test_approval_bridge.py` and
+`backend/tests/test_t17_continuity.py` are authorized T00L scope on the ground
+that they are existing consumers of a cleanup contract T00L changes, which is not
+feature scope creep. Known leakage is not an acceptable price for avoiding that
+expansion. `seed.py` is not modified, and production reset semantics do not
+change.
+
+**`backend/tests/conftest.py` does not exist** on this SHA and is not created.
+Earlier T00L planning prose assumed a shared fixture module; there is none, and
+each test file defines its own fixture over the shared SQL constant. That
+assumption is removed rather than satisfied.
+
+After T00L and its required review are green, planned implementation freezes for
+the demo. Any subsequent repository change requires an explicit user-authorized
+demo-blocking exception, and that exception exists for a genuine demo-blocking
+defect, not for resuming deferred roadmap work.

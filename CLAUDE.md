@@ -134,7 +134,10 @@ Do not mark a major task complete if its implementation note explains only the c
 ## Be careful with
 
 - `policy.py`, `idempotency.py`, `undo.py`, and the wire contract in `main.py` are correctness-kernel files.
+- Do not implement remote Linear behavior before T26. No GraphQL client, credentials, workspace discovery, projector, reconciler, delivery retry, or Linear-aware reset. T00L ships the local boundary only, and no deterministic test may require `LINEAR_API_KEY`, the network, or a live Linear workspace.
 - Do not add frameworks, tables, columns, endpoints, status values, or speculative features outside `docs/BUILD_SPEC.md`.
+- Linear integration state lives in `linear_task_state` and `linear_projections`, never as columns on `tasks`. `linear_task_state.task_id` has no foreign key to `tasks.id` on purpose, because the row is a tombstone that must outlive its task. Integration bookkeeping never increments a task business version, never produces a business `task_events` row, never enters a `Task` snapshot, and is never restored by undo.
+- `sql.TRUNCATE_ALL_STATE` and `sql.TRUNCATE_ALL_TEST_STATE` are deliberately separate and must not be merged. Production `seed.reset` uses the first and stays Linear-unaware; only deterministic test fixtures use the second, which also clears the tombstone table. See D-68.
 - Do not reuse disposable `spike/` code in the production integration. Delete it before T12A.
 - Do not treat client-supplied AG-UI message history or approval payloads as authoritative.
 - For an interface that intentionally polls, browser verification waits for DOM readiness and explicit visible controls or state. Do not wait for `networkidle`, because recurring requests make network idleness impossible by design.

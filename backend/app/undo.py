@@ -28,6 +28,14 @@ D-41 covers the event boundary. This module builds and relabels compensation
 event payloads; every write to ``tasks`` and ``task_events`` goes through
 ``domain``.
 
+D-27 adds the divergence refusal at T00L, and its boundary is narrower than it
+sounds. This module never calls Linear and never depends on Linear being
+reachable; it reads one local boolean out of `linear_task_state` during the
+precheck and refuses on it. Reading a local conflict marker is not performing an
+integration. It never writes that table, so a refusal leaves the marker set and
+a later successful undo cannot silently clear the evidence that something
+outside the system moved.
+
 Scope, from section 8 and D-38: one run, all or nothing, no partial undo and no
 cross-run undo. Repeated invocation is not redo. Compensation events keep the
 original ``run_id`` for audit correlation, which means a second call would load
@@ -96,9 +104,10 @@ def undo_run(run_id: UUID, actor_id: UUID) -> UndoResult:
                 return UndoResult(applied=0, refused=False)
 
             current = _load_current_state(actor_id, events, conn=conn)
+            diverged = _load_diverged_task_ids(events, conn=conn)
 
             # 3. PRECHECK PASS, no writes.
-            refusal = _precheck(events, current)
+            refusal = _precheck(events, current, diverged)
             if refusal is not None:
                 conn.rollback()
                 return UndoResult(applied=0, refused=True, reason=refusal)
@@ -170,12 +179,37 @@ def _load_current_state(
     return {task.id: task for task in tasks}
 
 
+def _load_diverged_task_ids(events: list[TaskEvent], *, conn) -> set[UUID]:
+    """Every task the run touched whose local integration state is diverged.
+
+    T00L, under D-27. Deliberately NOT owner scoped and deliberately not joined
+    to `tasks`, which is the whole reason `linear_task_state` carries no foreign
+    key: the flag has to remain readable for a task this very run deleted, and a
+    join or an owner scope would silently drop exactly that case and turn the
+    tombstone refusal into a pass.
+
+    Read on the caller's connection so it sits inside the same transaction and
+    the same snapshot as the locked rows above. Undo reads this table and never
+    writes it. No Linear call happens here or anywhere below.
+    """
+    task_ids = sorted({event.task_id for event in events})
+    rows = conn.execute(
+        sql.SELECT_DIVERGED_TASK_IDS, {"task_ids": task_ids}
+    ).fetchall()
+    return {row["task_id"] for row in rows}
+
+
 def _precheck(
-    events: list[TaskEvent], current: dict[UUID, Task]
+    events: list[TaskEvent],
+    current: dict[UUID, Task],
+    diverged: set[UUID],
 ) -> UndoReason | None:
     """3. Every event, before any of them is applied. Returns the refusal reason.
 
-    The condition is operation-specific, because "the row is gone" is a conflict
+    Divergence is checked first and is not operation-specific: it is a statement
+    about who else has touched the task, not about what this event did to it.
+
+    The condition below is operation-specific, because "the row is gone" is a conflict
     for some operations and the expected state for others. A version check alone
     is not sufficient: if an outside actor deleted a task this run had created or
     updated, there is no row and therefore no version to compare, and a
@@ -189,6 +223,28 @@ def _precheck(
     one task, where the newest event still agrees with the database and undoing
     the earlier one would destroy a change this run never made.
     """
+    # T00L divergence, under D-27, as one pass over every affected task before
+    # any operation-specific check runs.
+    #
+    # The Linear design states this per event, alongside the existing three
+    # reasons. One pass ahead of the loop agrees with that wording on every run
+    # where exactly one refusal applies, and differs only where two do: walking
+    # the events would report whichever reason the newest event happens to
+    # produce, so a run whose newest event has a stale version and whose oldest
+    # touches a diverged task would refuse VERSION_CONFLICT and never mention
+    # that an issue was edited in Linear. The refusal reason is displayed to a
+    # human who then has to decide what to do, and "someone else changed this
+    # outside the system" is the reason that changes their next action. Making
+    # it win deterministically is a strengthening, and it refuses in strictly
+    # the same set of cases.
+    #
+    # No write has happened at this point and none can: this is the precheck,
+    # and every path out of it rolls back. Divergence therefore produces
+    # applied = 0 with no compensation, no compensation task_event, no version
+    # change, and no write to linear_task_state.
+    if diverged:
+        return UndoReason.EXTERNALLY_MODIFIED
+
     projected = {
         task_id: _TaskState(exists=True, version=task.version)
         for task_id, task in current.items()

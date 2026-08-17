@@ -14,6 +14,17 @@ Two entry points exist for T07 alone and are not tool paths.
 needs, and they live here rather than in ``undo.py`` so that this module remains
 the only code that writes either table. See D-39 and D-41.
 
+Since T00L one further write is coupled to this module without originating in
+it. An ``AFTER INSERT`` trigger on ``task_events`` enqueues a
+``linear_projections`` row inside the same transaction, under D-25. That is the
+intended shape: the ownership rule is that this module owns task business state
+and business ``task_events``, while Linear projection and reconciliation
+metadata is structurally separate integration state living in its own tables. No
+function here reads or writes those tables, integration bookkeeping never
+increments a task version and never produces a business event, and nothing about
+that state can enter a ``Task``, because ``TrellisModel`` forbids extra keys and
+the integration columns are not on ``tasks``. See D-26.
+
 One mutation in this schema does not originate here. ``tasks.blocked_by`` is a
 self reference declared ``ON DELETE SET NULL``, so deleting a task rewrites
 every surviving row that pointed at it, without passing through any function

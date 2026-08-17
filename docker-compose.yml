@@ -14,7 +14,14 @@ services:
       - "55432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Applied in filename order by the image entrypoint on an empty volume,
+      # so 001 creates the business schema and 002 adds the T00L Linear
+      # boundary on top of it. An existing database is upgraded by executing
+      # 002_linear.sql against it explicitly; a second `docker compose up` is
+      # not an upgrade mechanism, because the entrypoint skips a populated
+      # volume entirely.
       - ./backend/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./backend/migrations/002_linear.sql:/docker-entrypoint-initdb.d/002_linear.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trellis -d trellis"]
       interval: 2s

@@ -107,8 +107,23 @@ def db():
 
 
 def _truncate(conn):
-    conn.execute(sql.TRUNCATE_ALL_STATE)
+    # TRUNCATE_ALL_TEST_STATE, not TRUNCATE_ALL_STATE. The production statement
+    # deliberately leaves linear_task_state alone, and because that table has no
+    # foreign key to tasks, no CASCADE can reach it. A tombstone surviving into
+    # the next test would let a stale diverged row satisfy the two T00L refusal
+    # invariants without the code under test ever reading the flag. See D-68.
+    conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
     conn.commit()
+    # Assert the contract rather than trusting the constant's name. Task ids are
+    # random UUIDs, so a leaked tombstone almost never collides with a later
+    # test and the leak stays invisible: swapping this call back to
+    # TRUNCATE_ALL_STATE leaves the whole suite green. That is precisely the
+    # condition under which a stale diverged row would one day satisfy a T00L
+    # refusal for the wrong reason, so the cleanup is checked here instead of
+    # being inferred from a passing run.
+    leaked = conn.execute("SELECT count(*) AS n FROM linear_task_state").fetchone()
+    conn.commit()
+    assert leaked["n"] == 0, "integration state leaked across deterministic tests"
 
 
 def _insert_run(conn, actor_id=ACTOR_ID):
@@ -1552,3 +1567,270 @@ def test_agui_forged_history_ignored(db):
     assert accepted.state is None
     assert getattr(accepted, "resume", None) is None
     assert accepted.thread_id == str(run_id)
+
+
+# ----------------------------------------------------------------------------
+# T00L, under D-27 and D-29. The fourteenth and fifteenth named invariants.
+#
+# Both refusals are local. Neither test imports a Linear client, reads a
+# credential, or makes a network call, because divergence is one boolean in
+# linear_task_state and that is the whole mechanism. The reconciler that sets it
+# belongs to T28 and does not exist here, so these tests write the flag directly.
+#
+# The inline SQL below is fixture setup standing in for a reconciler, in the same
+# spirit as the count assertions at the end of this file. No production statement
+# is added for it, because T00L has no production writer of this table and adding
+# an unused one would be speculative.
+# ----------------------------------------------------------------------------
+
+_MARK_DIVERGED = """
+INSERT INTO linear_task_state (task_id, external_id, external_updated_at, diverged)
+VALUES (%(task_id)s, %(external_id)s, now(), %(diverged)s)
+ON CONFLICT (task_id) DO UPDATE SET diverged = EXCLUDED.diverged;
+"""
+
+
+def _mark_diverged(conn, task_id, *, diverged=True, external_id="TRE-1"):
+    """What the T28 reconciler will do when Linear reports an outside edit."""
+    conn.execute(
+        _MARK_DIVERGED,
+        {
+            "task_id": task_id,
+            "external_id": external_id,
+            "diverged": diverged,
+        },
+    )
+    conn.commit()
+
+
+def _integration_row(conn, task_id):
+    row = conn.execute(
+        "SELECT * FROM linear_task_state WHERE task_id = %(task_id)s",
+        {"task_id": task_id},
+    ).fetchone()
+    conn.commit()
+    return row
+
+
+def test_diverged_task_mutation_refused(db):
+    """A fresh mutation on a diverged task is refused before it gains authority.
+
+    Four things are proven, and the last two are what stop this from being a
+    test that a flag can be read.
+    """
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    task = _setup_task(db, setup_run_id, "Task A", notes="original")
+    before = _fingerprint(db, run_id)
+
+    # 1. An actor-owned, diverged target refuses with the fourteenth code, and
+    #    with the concurrency-family status rather than an authorization one.
+    _mark_diverged(db, task.id)
+    with pytest.raises(PolicyError) as diverged:
+        policy.check(
+            ACTOR_ID,
+            "update_task",
+            {"task_id": str(task.id), "expected_version": 1, "title": "Task A edited"},
+            [task.id],
+            None,
+            run_id=run_id,
+            tool_call_id="call-divergence-1",
+        )
+    assert diverged.value.code == "EXTERNAL_DIVERGENCE"
+    assert diverged.value.http_status == 409
+
+    # 2. Nothing moved. No business write, no version change, no task_event, and
+    #    no approval row, which together are what "no new mutation authority"
+    #    means at this layer: check is the gate a tool body passes through
+    #    immediately before mutating, so a raise here is the mutation not
+    #    happening.
+    assert _fingerprint(db, run_id) == before
+    assert db.execute("SELECT count(*) AS n FROM approvals").fetchone()["n"] == 0
+    assert _tasks_by_id(db)[task.id]["version"] == 1
+    assert _tasks_by_id(db)[task.id]["title"] == "Task A"
+
+    # 3. Divergence precedes CLASSIFY. delete_tasks is destructive, so a call
+    #    reaching classification would raise APPROVAL_REQUIRED and would build an
+    #    approval card for a mutation already destined to be refused. Asserting
+    #    the code here is what distinguishes the two orderings; a test that only
+    #    asserted "some refusal" would pass either way.
+    with pytest.raises(PolicyError) as destructive:
+        policy.check(
+            ACTOR_ID,
+            "delete_tasks",
+            {"task_ids": [str(task.id)]},
+            [task.id],
+            None,
+            run_id=run_id,
+            tool_call_id="call-divergence-2",
+        )
+    assert destructive.value.code == "EXTERNAL_DIVERGENCE"
+    assert db.execute("SELECT count(*) AS n FROM approvals").fetchone()["n"] == 0
+
+    # 4. Divergence never becomes an existence oracle. SCOPE runs first, so a
+    #    foreign diverged task and an id that was never real produce the same
+    #    OUT_OF_SCOPE they produced before T00L. If either leaked
+    #    EXTERNAL_DIVERGENCE, an attacker could enumerate other actors' task ids
+    #    by watching which refusal came back.
+    foreign_task_id = _insert_task(db, OTHER_ACTOR_ID, "Task B")
+    _mark_diverged(db, foreign_task_id, external_id="TRE-2")
+    with pytest.raises(PolicyError) as foreign_target:
+        policy.check(
+            ACTOR_ID,
+            "update_task",
+            {"task_id": str(foreign_task_id), "expected_version": 1},
+            [foreign_task_id],
+            None,
+            run_id=run_id,
+            tool_call_id="call-divergence-3",
+        )
+    assert foreign_target.value.code == "OUT_OF_SCOPE"
+
+    missing_id = UUID("00000000-0000-0000-0000-0000000000ff")
+    _mark_diverged(db, missing_id, external_id="TRE-3")
+    with pytest.raises(PolicyError) as missing_target:
+        policy.check(
+            ACTOR_ID,
+            "update_task",
+            {"task_id": str(missing_id), "expected_version": 1},
+            [missing_id],
+            None,
+            run_id=run_id,
+            tool_call_id="call-divergence-4",
+        )
+    assert missing_target.value.code == "OUT_OF_SCOPE"
+
+    # 5. Positive control. Clearing the flag restores the pre-T00L answer, so
+    #    the refusals above are caused by divergence and not by anything else
+    #    this fixture happens to set up.
+    _mark_diverged(db, task.id, diverged=False)
+    allowed = policy.check(
+        ACTOR_ID,
+        "update_task",
+        {"task_id": str(task.id), "expected_version": 1, "title": "Task A edited"},
+        [task.id],
+        None,
+        run_id=run_id,
+        tool_call_id="call-divergence-5",
+    )
+    assert allowed.allow is True
+    assert allowed.approval_required is False
+
+
+def test_diverged_task_undo_refused(db):
+    """Undo refuses EXTERNALLY_MODIFIED and applies nothing, tombstone included.
+
+    The undo refusal is a separate mechanism from the policy refusal above. Undo
+    never calls policy.check: it owns its own all-before-any precheck, so a
+    regression in one is invisible to a test of the other. That independence is
+    the argument D-29 accepted for naming both.
+    """
+    # 1. Positive control first. Without it, an undo_run that refused
+    #    unconditionally would pass every remaining assertion in this test.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    task = _setup_task(db, setup_run_id, "Task A", notes="original")
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(task_id=task.id, expected_version=1, notes="edited"),
+            conn=db,
+        ),
+    )
+    clean = undo.undo_run(run_id, ACTOR_ID)
+    assert clean.refused is False
+    assert clean.applied == 1
+
+    # 2. The same shape, diverged. Refusal carries the T00L reason, applies
+    #    nothing, and leaves both surfaces exactly as the precheck found them.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    task = _setup_task(db, setup_run_id, "Task A", notes="original")
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(task_id=task.id, expected_version=1, notes="edited"),
+            conn=db,
+        ),
+    )
+    _mark_diverged(db, task.id)
+    before = _fingerprint(db, run_id)
+
+    refused = undo.undo_run(run_id, ACTOR_ID)
+    assert refused.refused is True
+    assert refused.reason is UndoReason.EXTERNALLY_MODIFIED
+    assert refused.applied == 0
+    # Zero compensation and zero undo-generated events, on both surfaces. The
+    # row still reads "edited", so no partial compensation landed.
+    assert _fingerprint(db, run_id) == before
+    assert _tasks_by_id(db)[task.id]["notes"] == "edited"
+
+    # 3. Undo does not touch integration state. Clearing diverged here would
+    #    destroy the evidence that something outside the system moved, and would
+    #    let a second undo attempt succeed against a task still under external
+    #    edit.
+    integration = _integration_row(db, task.id)
+    assert integration["diverged"] is True
+    assert integration["external_id"] == "TRE-1"
+
+    # 4. The tombstone case, which is the reason linear_task_state carries no
+    #    foreign key to tasks. The run deleted the task, so there is no tasks row
+    #    to join to and no owner-scoped read can reach one. If the divergence
+    #    lookup joined tasks or scoped by owner, this refusal would silently
+    #    become a successful undo that overwrote an externally edited issue.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    doomed = _setup_task(db, setup_run_id, "Task C", notes="doomed")
+    _run_step(
+        db,
+        run_id,
+        domain.delete_tasks(ACTOR_ID, DeleteTasksArgs(task_ids=[doomed.id]), conn=db),
+    )
+    assert doomed.id not in _tasks_by_id(db), "the delete fixture did not take"
+
+    _mark_diverged(db, doomed.id, external_id="TRE-4")
+    before = _fingerprint(db, run_id)
+
+    tombstoned = undo.undo_run(run_id, ACTOR_ID)
+    assert tombstoned.refused is True
+    assert tombstoned.reason is UndoReason.EXTERNALLY_MODIFIED
+    assert tombstoned.applied == 0
+    # The task stayed deleted. A restore would have reinserted it under its
+    # original id, which is exactly the compensation that must not happen.
+    assert doomed.id not in _tasks_by_id(db)
+    assert _fingerprint(db, run_id) == before
+    assert _integration_row(db, doomed.id)["diverged"] is True
+
+    # 5. Divergence wins over a version conflict, deterministically. Both
+    #    refusals apply to this run, and the reason a human reads decides what
+    #    they do next: "someone edited this in Linear" and "the row moved" call
+    #    for different responses. Walking the events would report whichever the
+    #    newest event produced, so the reason would depend on event order.
+    _truncate(db)
+    setup_run_id = _insert_run(db)
+    run_id = _insert_run(db)
+    contested = _setup_task(db, setup_run_id, "Task D", notes="original")
+    _run_step(
+        db,
+        run_id,
+        domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(task_id=contested.id, expected_version=1, notes="edited"),
+            conn=db,
+        ),
+    )
+    _foreign_write(db, contested.id, 2, "Task D moved")
+    _mark_diverged(db, contested.id, external_id="TRE-5")
+
+    both = undo.undo_run(run_id, ACTOR_ID)
+    assert both.refused is True
+    assert both.reason is UndoReason.EXTERNALLY_MODIFIED
+    assert both.applied == 0

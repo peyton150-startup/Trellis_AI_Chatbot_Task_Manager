@@ -1,12 +1,14 @@
 """KERNEL. Error codes and exception classes, from BUILD_SPEC section 6.
 
-Exactly these thirteen codes. Every rejection in the system uses one of them. No
+Exactly these fourteen codes. Every rejection in the system uses one of them. No
 ad hoc strings. The code and HTTP status are fixed per class, so a raise site
 chooses a class rather than composing a code.
 
 The table closed at twelve from T04 until T12B added `RUN_STATE_INVALID` under
-D-55, which is why several older comments in this repository say twelve. Adding
-a fourteenth is a KERNEL edit and trips D-31 the same way this one did.
+D-55, which is why several older comments in this repository say twelve, and
+T00L added `EXTERNAL_DIVERGENCE` under D-27, which is why several say thirteen.
+Adding a fifteenth is a KERNEL edit and trips D-31 the same way both of those
+did.
 """
 
 
@@ -142,11 +144,34 @@ class RunStateInvalidError(PolicyError):
     http_status = 409
 
 
+class ExternalDivergenceError(PolicyError):
+    """A target task was modified in Linear outside this system.
+
+    The fourteenth code, added at T00L under D-27. Raised at section 6 step 1b,
+    after SCOPE and before CLASSIFY, when any target task carries a
+    `linear_task_state` row with `diverged = true`.
+
+    409 rather than 403, because this is a concurrency conflict in the same
+    family as `VERSION_CONFLICT`, and not an authorization result. The actor is
+    entitled to the row; the row is contested.
+
+    The ordering is the same non-enumeration rule `RunStateInvalidError` records
+    for runs. Reached only after ownership has resolved, so a missing task and
+    another actor's task both stay `OutOfScopeError` whatever their integration
+    state says. Raising this before the scope check would turn local integration
+    bookkeeping into an oracle for which task ids exist.
+    """
+
+    code = "EXTERNAL_DIVERGENCE"
+    http_status = 409
+
+
 # The complete section 6 table, in specification order. The T04 CI gate walks
-# this to assert all thirteen code and status pairs, because the six T04
+# this to assert all fourteen code and status pairs, because the six T04
 # invariant tests only ever construct five of them and an unexercised transposed
 # status would otherwise surface at T05, in a file T05 may not edit. T12B added
-# the thirteenth entry and updated that gate in the same commit, under D-55.
+# the thirteenth entry and updated that gate in the same commit, under D-55, and
+# T00L added the fourteenth the same way under D-27.
 ERRORS_BY_CODE = {
     error.code: error
     for error in (
@@ -163,5 +188,6 @@ ERRORS_BY_CODE = {
         ModelTimeoutError,
         ValidationFailedError,
         RunStateInvalidError,
+        ExternalDivergenceError,
     )
 }

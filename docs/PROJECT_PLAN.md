@@ -21,7 +21,7 @@ Construction quality is capped by what came before it, so before scheduling anyt
 | Prerequisite | Status | Evidence |
 |---|---|---|
 | Problem definition | Complete | "Demonstrate that I can take an unreliable probabilistic component and turn it into a trustworthy product." Stated as a problem, not a solution. |
-| Requirements | Complete for this scope | Six tools, five tables, wire contract, thirteen invariants, seven demo beats. Each is testable. |
+| Requirements | Complete for this scope | Six tools, five business tables plus the two T00L integration tables, wire contract, fifteen invariants since D-29 concluded at T00L, seven demo beats. Each is testable. |
 | Architecture | Complete and frozen | Frozen stack, trust boundary, error-handling strategy (single path through validation, policy, lease, domain service), buy-vs-build decisions recorded, cut list recorded. |
 
 **Biggest remaining gap:** the AG-UI approval path is unproven against an experimental API. That is exactly why it is the first activity, timeboxed, with a designed fallback. No other load-bearing unknown remains.
@@ -51,7 +51,7 @@ Construction quality is capped by what came before it, so before scheduling anyt
 | D4 | Idempotency | Repeated tool call with same key and same argument hash returns the stored result and commits exactly one mutation. Domain mutation, audit event, and completed invocation result commit atomically in one transaction. An abandoned `pending` lease has defined behaviour: it expires after `LEASE_TTL_SECONDS` and is stolen once, which is safe because a `pending` row means the transaction never committed. |
 | D5 | Undo | Single-run revert applies compensating mutations, refuses if any row version moved |
 | D6 | Run Inspector | Shows tool calls, attempt status, duration, tokens, cost, and per-attempt deduplication |
-| D7 | Invariant suite | Deterministic tests, no LLM calls, 100% pass, gating CI. Includes a standing regression test that fabricated client-supplied history is discarded in favour of canonical history from `agent_runs`. The count is whatever D-29's reconciliation against D-19 concludes at T00L, not a number edited here. D-19 fixed it at thirteen and set the precedent of covering a coordination case in a task gate instead of naming a new invariant; the two Linear divergence refusals are either genuine trust-boundary invariants, in which case T00L records that D-19's count is superseded and why, or they belong in a gate and thirteen stands. CI requires 100 percent of whatever the suite is. |
+| D7 | Invariant suite | Deterministic tests, no LLM calls, 100% pass, gating CI. Includes a standing regression test that fabricated client-supplied history is discarded in favour of canonical history from `agent_runs`. **The count is fifteen.** D-29 reconciled against D-19 at T00L and concluded it there, as that clause required. D-19 fixed it at thirteen and set the precedent of covering a coordination case in a task gate instead of naming a new invariant; that precedent is upheld, which is why the count moved by two and not three. The reconciler coordination property stays in the T28 integration gate. The two Linear divergence refusals are named, because they are enforced by two separate mechanisms, `policy.check` step 1b and undo's own all-before-any precheck, so a regression in one does not prove the other safe. D-19's count is superseded for those two properties and for nothing else. CI requires 100 percent of whatever the suite is. |
 | D8 | Behavioral evals | 15 or more outcome-asserted cases with a recorded pass rate |
 | D9 | Demo assets | Seed fixture, reset endpoint, rehearsed script, backup recording |
 | D10 | README | Includes "what I deliberately did not build, and why" |
@@ -244,6 +244,44 @@ That is the most important number in this plan and it should not be softened. At
 | 5 | Injection toggle, both test suites | Proof beats demonstrable |
 | 6 | Polish, README, backup recording, change drill | Feature freeze at end of day |
 | 7 | Five rehearsals, buffer | Demo ready |
+
+### Current pre-demo workstream, re-planned 2026-08-17
+
+D-68 records a schedule exception, and it is written here as an exception rather
+than folded into the canonical sequence. The task history did not become
+`T17 -> T00L -> T18`, and pretending it did would misrepresent what was built in
+what order.
+
+```
+current repository state
+        |
+        v
+      T00L
+        |
+        v
+   T00L REVIEW  (immutable SHA, neutral, read-only)
+        |
+        v
+   DEMO FREEZE
+```
+
+T00L was scheduled after T25 by D-46. The user pulled it forward against the
+current `master` because the local Linear consistency boundary is the part of
+the expansion that is worth demonstrating and the part that touches KERNEL
+files, so it is the piece least safe to leave for the end.
+
+Every other roadmap item keeps the status the repository already records:
+completed work stays completed, explicitly cut work stays cut, work awaiting
+review stays awaiting review, and remaining work not taken before the demo stays
+deferred. Nothing is reclassified as complete or as `CUT` merely because T00L
+moved. The Linear continuation `T26 -> T27 -> T28 -> T29` remains deferred in
+that order.
+
+The schedule cost is paid by cutting the remaining pre-demo implementation
+timebox after T00L and its review. That is a budget cut, not a status change.
+After the review is green, planned implementation is frozen; a genuine
+demo-blocking defect can be fixed only through a new explicit user-authorized
+exception, which is not a route back into deferred roadmap work.
 
 ### Runtime decision and surprise-change drill
 
@@ -468,7 +506,7 @@ Not an engineering activity. Run it after the final rehearsal and before the cal
 [ ] seed and reset tested, twice
 [ ] demo model configured in .env
 [ ] API key valid, checked today
-[ ] invariant suite green, 13 of 13
+[ ] invariant suite green, 15 of 15
 [ ] behavioral eval result recorded and quotable
 [ ] backup video opens and plays
 [ ] browser tabs prepared and ordered

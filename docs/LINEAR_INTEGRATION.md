@@ -93,7 +93,8 @@ Reads of external change flow the other way, and only as far as a flag:
 
 ```
 reconciler polls Linear for issues whose updatedAt moved
-  → issue we know about, changed outside the agent → set tasks.diverged = true
+  → issue we know about, changed outside the agent
+        → set linear_task_state.diverged = true
   → issue we do not know about → import as a new task
   → never merges, never overwrites a local field
 ```
@@ -111,8 +112,13 @@ Linear projection:   pending
 
 That is a queue that drains, not a half-applied change. Nothing about the
 agent's correctness depends on Linear being reachable. The invariant suite stays
-offline and CI-gating. `undo.py` never learns what Linear is, because undo
-operates on authoritative local state and its compensating mutations project
+offline and CI-gating.
+
+`undo.py` never calls Linear and never depends on Linear availability. It may
+inspect local Linear integration divergence state during its all-before-any
+precheck, which is what D-27 requires of it. Undo understands a local conflict
+marker; undo does not perform Linear integration. Everything else it does
+operates on authoritative local state, and its compensating mutations project
 outward like any other change.
 
 ---
@@ -565,11 +571,29 @@ The trigger, per D-25, fires `AFTER INSERT ON task_events` and inserts the
 corresponding `pending` row, mapping `created` to `create`, `updated` to
 `update`, `deleted` to `archive`, and `restored` to `unarchive`.
 
-**`TRUNCATE_ALL_STATE` needs a comment update.** Its `CASCADE` now reaches
-`linear_projections` through the foreign key to `task_events`, so the constant
-that documents a five-table reset performs a six-table one. `linear_task_state`
-has no foreign key and is **not** reached by the cascade, which is why D-26
-clears it explicitly.
+**`TRUNCATE_ALL_STATE` needs a comment update, and T00L found that it needs
+more than one.** Its `CASCADE` now reaches `linear_projections` through the
+foreign key to `task_events`, so the constant that documents a five-table reset
+performs a six-table one. `linear_task_state` has no foreign key and is **not**
+reached by the cascade.
+
+The unresolved consequence, found against `master` at `3be719d` before any T00L
+edit, is that this single constant has two callers with opposite requirements:
+production `seed.reset` behind `POST /api/demo/reset`, and the cleanup fixtures
+of three deterministic test files. Adding `linear_task_state` to it would give
+the demo reset route Linear-aware behavior that D-28 fences and T29 owns.
+Omitting it leaks tombstoned divergence between tests, where a stale
+`diverged = true` row would make the two T00L refusal invariants pass without
+the code under test having read the flag at all.
+
+T00L therefore splits the statement, under the user's authorization of
+2026-08-17 and recorded as part of D-68. `TRUNCATE_ALL_STATE` is unchanged and
+stays Linear-unaware. A separate `TRUNCATE_ALL_TEST_STATE` additionally clears
+`linear_task_state` and is called only by the deterministic fixtures. The T00L
+gate proves the split by inspecting which statement each caller uses, because
+two similarly named constants are exactly the kind of thing a later edit
+reconnects by accident. Clearing tombstones in production remains deferred to
+T29, behind the projector fence in D-28.
 
 ### 4.3 Section 6, `policy.py`
 
@@ -781,7 +805,7 @@ remaining Linear expansion begins, so the delta ships as optional post-T25 work.
 | ID | Task | Model | Files | Done when |
 |---|---|---|---|---|
 | T00B | Gate B: Linear API probe, completed after T06 | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, BUILD_SPEC section 12 row, `CLAUDE.md` sources-of-truth line | Six facts recorded, fixture written, GATE B PASS |
-| T00L | Linear boundary retrofit, after T25 | **OPUS ONLY** | `migrations/002_linear.sql`, `errors.py`, `policy.py`, `sql.py`, `undo.py`, `models.py` if needed, `tests/test_invariants.py`, BUILD_SPEC sections 3, 4, 6, 11, `docs/ARCHITECTURE.md` parts 2 and 4 | Invariant suite passes at whatever count D-29 concludes, no network |
+| T00L | Linear boundary retrofit, pulled forward under D-68 | **OPUS ONLY** | `migrations/002_linear.sql`, `docker-compose.yml`, `errors.py`, `policy.py`, `sql.py`, `undo.py`, `models.py`, `domain.py` documentation, `tests/test_invariants.py`, `tests/test_approval_bridge.py`, `tests/test_t17_continuity.py`, BUILD_SPEC sections 3, 4, 6, 11, `docs/ARCHITECTURE.md` parts 2 and 4, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, this file, `CLAUDE.md`, `.github/workflows/ci.yml`, `IMPLEMENTATION_NOTES.md` | Invariant suite passes at the fifteen D-29 concludes, both migration paths proven, no network |
 | T26 | Linear client and name to id resolution | SOL | `linear.py`, `config.py`, BUILD_SPEC section 10, `docs/ARCHITECTURE.md` part 5 | Enums build from the live workspace; `FakeTracker` satisfies the same contract |
 | T27 | Projector worker | SOL | `projector.py`, `docs/ARCHITECTURE.md` part 8 | Outbox drains in order, serialized per task, remote id written back atomically with completion, unmapped updates completed without a remote call, retry with backoff |
 | T28 | Reconciler | SOL WRITES, OPUS REVIEWS | `reconciler.py`, `docs/ARCHITECTURE.md` parts 10 and 11 | External edit sets `diverged`; archived issues excluded; a pending projection does not cause divergence; an issue created in Linear imports |

@@ -476,13 +476,57 @@ SELECT *
 """
 
 # The five-table reset specified for POST /api/demo/reset in BUILD_SPEC section
-# 13, added at T04 under D-17 because the invariant fixtures need it and
-# agent_runs has no delete statement. T09 consumes this rather than duplicating
-# it. RESTART IDENTITY resets the task_events bigserial so event ids stay
-# hand-checkable across a reset.
+# 13, added at T04 under D-17 because agent_runs has no delete statement. T09
+# consumes this rather than duplicating it. RESTART IDENTITY resets the
+# task_events bigserial so event ids stay hand-checkable across a reset.
+#
+# Since T00L this statement names five tables and clears six. CASCADE reaches
+# linear_projections through its foreign key to task_events, which is correct:
+# an outbox row for an event that no longer exists has nothing to deliver.
+#
+# It does NOT reach linear_task_state, which has no foreign key to tasks by
+# design under D-26. That is deliberate and must not be repaired by adding the
+# table here. Production reset stays Linear-unaware: clearing tombstones is a
+# remote-ordering problem that belongs to the reset fence in D-28 and is
+# deferred to T29. Deterministic tests need the opposite and use
+# TRUNCATE_ALL_TEST_STATE below.
 TRUNCATE_ALL_STATE = """
 TRUNCATE TABLE tasks, task_events, agent_runs, tool_invocations, approvals
 RESTART IDENTITY CASCADE;
+"""
+
+# T00L. Test-only cleanup, never reachable from a route.
+#
+# linear_task_state is a tombstone that deliberately survives deletion of its
+# task, so nothing in the business truncate above can clear it. Left alone
+# between deterministic tests it leaks: a stale diverged row keyed to a task id
+# a later test reuses would make the T00L divergence refusals pass without the
+# code under test ever reading the flag correctly. A test that passes for the
+# wrong reason is the failure mode the invariant suite exists to prevent, so the
+# suite clears integration state explicitly and production does not.
+#
+# The split is proven rather than trusted to naming: the T00L gate asserts that
+# seed.reset uses TRUNCATE_ALL_STATE and that this statement is the one the
+# deterministic fixtures call.
+TRUNCATE_ALL_TEST_STATE = """
+TRUNCATE TABLE tasks, task_events, agent_runs, tool_invocations, approvals,
+               linear_task_state
+RESTART IDENTITY CASCADE;
+"""
+
+# T00L, under D-27. Step 1b of policy.check, and the undo precheck's divergence
+# pass.
+#
+# Returns only the diverged ids, so a task with no linear_task_state row has
+# never been projected and cannot have diverged. The caller has already proven
+# ownership of every id it passes, which is why this statement is not owner
+# scoped: scoping it would imply it were safe to call before the scope check,
+# and it is not. See the ordering comment in policy.check.
+SELECT_DIVERGED_TASK_IDS = """
+SELECT task_id
+  FROM linear_task_state
+ WHERE task_id = ANY(%(task_ids)s::uuid[])
+   AND diverged;
 """
 
 SWEEP_ORPHAN_RUNS = """

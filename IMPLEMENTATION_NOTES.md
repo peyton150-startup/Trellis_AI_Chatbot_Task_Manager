@@ -1849,3 +1849,127 @@ directions, filter-plus-sort behavior, Reset view, long Markdown value wrapping,
 and retained horizontal scrolling were verified in the local frontend. The
 existing authoritative approval card and T16 approval continuation path are
 regression-only for this follow-up and are intentionally unchanged.
+## T00L: Linear boundary retrofit
+
+**Local role:** Creates the local PostgreSQL consistency boundary that a future
+Linear projection will sit behind, and nothing else. It adds
+`backend/migrations/002_linear.sql` with two integration tables, two enums, and
+an `AFTER INSERT ON task_events` trigger; the fourteenth error code
+`EXTERNAL_DIVERGENCE`; a DIVERGENCE step at position 1b of `policy.check`; an
+`EXTERNALLY_MODIFIED` refusal in undo's precheck; and the two named invariants
+D-29 concluded on. It contains zero remote Linear behavior: no GraphQL client,
+no credential, no projector, no reconciler, no network call, and no
+Linear-aware reset.
+
+**Whole-system role:** This is the piece that lets the demo claim a trust
+boundary rather than an integration. Postgres stays authoritative and Linear
+becomes a projected surface, so agent correctness never depends on an external
+service being reachable, and the failure mode when Linear is down is
+`projection pending` rather than `mutation half applied`. The trigger makes the
+audit-to-outbox coupling structural, so a committed `task_events` row and its
+projection cannot diverge and no future call site can forget to enqueue. The two
+refusals close the one hole the projection design otherwise opens: during the
+demo a human has Linear open, and without divergence refusal their edit is
+silently overwritten by the next projection. With it, the agent notices and
+declines to act. The claim it supports is deliberately narrow and is the honest
+one: local mutations are transactionally exactly-once, external delivery is
+at-least-once with locally owned deduplication, and not exactly-once end to end.
+
+**Inputs and dependencies:** `001_init.sql`, unedited, for `task_events(id)` and
+the five business tables. `policy.check`'s existing SCOPE step and its
+non-enumeration property. Undo's D-38 projected-state precheck and its
+all-before-any structure. `domain.py` as the only writer of business state and
+business events. Gate B `PASS` from T00B, whose fact 6 establishes that Linear
+advertises no replay semantics, which is why local `UNIQUE(event_id)` is the
+only deduplication layer available. Decisions D-24 through D-29, materialized
+into `docs/DECISIONS.md` by this task, and D-68 for the schedule and scope.
+
+**Outputs and consumers:** `linear_task_state`, a tombstoned side table with no
+foreign key to `tasks`, consumed by T28's reconciler as its write target and by
+T00L's own two refusals as a read. `linear_projections`, the outbox, consumed by
+T27's projector. `sql.SELECT_DIVERGED_TASK_IDS`, `sql.TRUNCATE_ALL_TEST_STATE`,
+`errors.ExternalDivergenceError`, and `UndoReason.EXTERNALLY_MODIFIED`. T29
+inherits the deferred obligation to clear tombstones behind the D-28 projector
+fence, which is why `TRUNCATE_ALL_STATE` and `seed.reset` are untouched here.
+
+**Verification:** Against starting SHA `3be719d`, on real PostgreSQL 16.
+
+Fresh bootstrap, from an empty volume, `docker compose down -v && up -d --wait`:
+seven tables, eight enums, five indexes, five foreign keys, two checks, one
+trigger. `linear_task_state` carries zero foreign keys and `tasks` carries zero
+Linear columns, both asserted rather than described.
+
+Existing-database upgrade, on a populated 001-only database with two tasks and
+three events, upgraded by executing `002_linear.sql` explicitly: both row counts
+preserved, the business-schema column list byte-identical before and after, and
+`linear_projections` empty, proving historical events are not backfilled. A new
+`deleted` event on the upgraded database projected as `archive`.
+
+Trigger behavior: all four mappings observed as `created->create`,
+`updated->update`, `deleted->archive`, `restored->unarchive`. Inside one
+transaction the projection exists alongside its event; after `ROLLBACK` neither
+the event nor the projection remains, and no orphan rows exist.
+
+Tombstone and truncate split: deleting a task left `linear_task_state` intact
+with `diverged` and `external_id` preserved. `TRUNCATE_ALL_STATE` left the
+tombstone and cascaded the outbox to zero, with PostgreSQL itself reporting
+`truncate cascades to table "linear_projections"`. `TRUNCATE_ALL_TEST_STATE`
+cleared the tombstone.
+
+Suites: `ruff check .` clean, `pytest tests/test_invariants.py` 15 passed,
+`pytest -m "not network"` 60 passed with 13 deselected.
+
+**Mutation evidence,** recorded under D-21 because a passing suite cannot show
+these tests bite:
+
+| Mutant | Change | Result |
+|---|---|---|
+| M1 | `_refuse_if_diverged` removed from `policy.check` | KILLED, `DID NOT RAISE PolicyError` |
+| M2 | undo's `if diverged` forced false | KILLED, `applied=1, refused=False` |
+| M3 | divergence lookup joined to `tasks` | KILLED, and only on the tombstone scenario, which is the discriminating case for the absent foreign key |
+| M5 | invariant fixture repointed to `TRUNCATE_ALL_STATE` | **SURVIVED**, 15 passed |
+| M5b | same mutant, after the fixture was changed to assert the cleanup contract | KILLED, 14 errors |
+
+M5 is the finding worth keeping. Task ids are random UUIDs, so a leaked
+tombstone almost never collides with a later test and the leak stayed invisible:
+the entire suite passed while integration state accumulated across it. That is
+exactly the condition under which a stale `diverged = true` row would one day
+satisfy a T00L refusal for the wrong reason. The fixture now asserts
+`linear_task_state` is empty after truncation, which converts a latent leak into
+an immediate failure, and M5b confirms it.
+
+**Limitations and review status:**
+
+Scope was expanded beyond the original T00L row under the user's explicit
+authorization of 2026-08-17, recorded in D-68: the D-31 re-plan companions,
+`docker-compose.yml`, and two test files that already consumed the cleanup
+constant this task splits. `backend/tests/conftest.py` was named in the planning
+prose but does not exist and was not created.
+
+`POST /api/demo/reset` remains Linear-unaware by design. It does not clear
+tombstones, and after T00L it truncates five named tables while clearing six,
+because the cascade reaches the outbox. Both facts are now documented at the
+constant rather than implied.
+
+D-28's two coordination properties, the projector fence and per-task delivery
+serialization, are specified and not implemented. Nothing in T00L needs them,
+because nothing delivers.
+
+The divergence refusal is proven against a flag written directly by the test, as
+a stand-in for the T28 reconciler that sets it. The reconciler's own correctness,
+including excluding archived issues and skipping tasks with a pending
+projection, is T28's integration gate and is not covered here.
+
+`policy.check` step 1b opens a second connection from the pool for its own read,
+following the existing `_load_task_owners` shape. It is therefore not in the
+caller's transaction. That matches the pre-existing scope check exactly and is
+not a new property, but it means the divergence read and the subsequent mutation
+are not one snapshot. Undo's read does use the caller's connection.
+
+D-29 is settled at fifteen named invariants, with D-19's count superseded for
+those two properties only. The CI gate asserts the count so a sixteenth cannot
+arrive by accretion.
+
+T00L modifies correctness-kernel files, so it requires a focused neutral,
+blind, read-only review at an immutable SHA, with the execution phase in a
+Vercel Sandbox. That review has not yet run.
