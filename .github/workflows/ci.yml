@@ -214,24 +214,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Exact in both directions, and cumulative through T00L. The counts
-          # below are the T01 business schema plus exactly what
-          # 002_linear.sql adds: two tables, two enums, one index, one foreign
-          # key. Weakening this to "at least N" would let a stray table ship.
+          # Exact in both directions, and cumulative through T00W. The counts
+          # below are the T01 business schema, plus what 002_linear.sql adds
+          # (two tables, two enums, one index, one foreign key), plus what
+          # 003_linear_agent.sql adds (four tables, two enums, four indexes,
+          # two foreign keys, one check). Weakening this to "at least N" would
+          # let a stray table ship.
+          #
+          # Every value below was introspected from a real 001 -> 002 -> 003
+          # bootstrap rather than derived by hand, and the populated-upgrade
+          # path was separately confirmed to converge on the identical schema.
           tables="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
             "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public';"; } | tr -d '\r')"
-          test "$tables" = "agent_runs,approvals,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
+          test "$tables" = "agent_runs,approvals,linear_agent_inbox,linear_agent_sessions,linear_installations,linear_oauth_states,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
 
           counts="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
             "SELECT
               (SELECT count(*) FROM pg_tables WHERE schemaname = 'public'),
-              (SELECT count(*) FROM pg_type WHERE typname IN ('task_status','task_priority','run_status','event_op','lease_status','approval_state','linear_operation','linear_delivery')),
-              (SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('tasks_owner_idx','agent_runs_status_idx','task_events_run_idx','task_events_task_idx','linear_projections_pending_idx')),
-              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_blocked_by_fkey','task_events_run_id_fkey','tool_invocations_run_id_fkey','approvals_run_id_fkey','linear_projections_event_id_fkey')),
-              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_title_check','approvals_required_reason_check'));"; } | tr -d '\r')"
-          test "$counts" = "7|8|5|5|2"
+              (SELECT count(*) FROM pg_type WHERE typname IN ('task_status','task_priority','run_status','event_op','lease_status','approval_state','linear_operation','linear_delivery','linear_install_status','linear_inbox_status')),
+              (SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('tasks_owner_idx','agent_runs_status_idx','task_events_run_idx','task_events_task_idx','linear_projections_pending_idx','linear_installations_single_active_idx','linear_installations_identity_idx','linear_agent_inbox_claimable_idx','linear_agent_inbox_session_idx')),
+              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_blocked_by_fkey','task_events_run_id_fkey','tool_invocations_run_id_fkey','approvals_run_id_fkey','linear_projections_event_id_fkey','linear_agent_inbox_run_id_fkey','linear_agent_sessions_last_completed_run_id_fkey')),
+              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_title_check','approvals_required_reason_check','linear_agent_inbox_refusal_check'));"; } | tr -d '\r')"
+          test "$counts" = "11|10|9|7|3"
 
-          echo "PASS T01: seven tables, eight enums, five indexes, five foreign keys, and two checks"
+          echo "PASS T01: eleven tables, ten enums, nine indexes, seven foreign keys, and three checks"
 
       - name: Remove CI database resources
         if: always()
@@ -5155,17 +5161,22 @@ jobs:
 
       # Path 1: fresh bootstrap. An empty volume, both migrations applied in
       # filename order by the image entrypoint.
-      - name: Start PostgreSQL from an empty volume and apply 001 then 002
+      - name: Start PostgreSQL from an empty volume and apply 001 then 002 then 003
         run: docker compose up -d --wait
 
-      - name: Verify the exact post-T00L schema and the deliberate absence of a task foreign key
+      - name: Verify the exact cumulative schema and the deliberate absence of a task foreign key
         shell: bash
         run: |
           set -euo pipefail
 
+          # Cumulative through T00W. The T00L assertions below are unchanged and
+          # unaffected by 003_linear_agent.sql, which adds transport tables and
+          # touches neither linear_task_state nor linear_projections. Only the
+          # whole-schema table list moves, because the compose file now mounts a
+          # third migration. See D-69.
           tables="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
             "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public';"; } | tr -d '\r')"
-          test "$tables" = "agent_runs,approvals,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
+          test "$tables" = "agent_runs,approvals,linear_agent_inbox,linear_agent_sessions,linear_installations,linear_oauth_states,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
 
           # The side table's exact shape, and the trigger that must exist.
           state_columns="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
