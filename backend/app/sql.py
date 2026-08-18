@@ -192,6 +192,40 @@ SELECT *
  LIMIT %(limit)s;
 """
 
+# Task history read. Scope is carried by actor_id on the immutable audit rows,
+# not by joining through tasks, because task_events intentionally survives task
+# deletion. The separate scope probe also keeps a deleted task readable when a
+# pagination cursor has moved past its oldest event.
+SELECT_TASK_HISTORY_SCOPE = """
+SELECT
+    EXISTS (
+        SELECT 1
+          FROM task_events
+         WHERE task_id = %(task_id)s
+           AND actor_id = %(actor_id)s
+    ) AS has_events,
+    (
+        SELECT version
+          FROM tasks
+         WHERE id = %(task_id)s
+           AND owner_id = %(actor_id)s
+    ) AS current_version;
+"""
+
+
+SELECT_TASK_EVENTS_FOR_ACTOR = """
+SELECT *
+  FROM task_events
+ WHERE task_id = %(task_id)s
+   AND actor_id = %(actor_id)s
+   AND (
+       %(before_event_id)s::bigint IS NULL
+       OR id < %(before_event_id)s::bigint
+   )
+ ORDER BY id DESC
+ LIMIT %(limit)s;
+"""
+
 # Deliberately unbounded, under D-39. Do not add a LIMIT to this statement.
 #
 # Section 5 requires a LIMIT on every list query, and that rule is about

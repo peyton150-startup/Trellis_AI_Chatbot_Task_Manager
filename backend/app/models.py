@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -190,6 +190,43 @@ ApprovalRequest = ApprovalDecisionRequest
 
 class TasksResponse(TrellisModel):
     tasks: list[Task]
+
+
+class TaskHistoryEffect(str, Enum):
+    CREATED = "created"
+    UPDATED = "updated"
+    DELETED = "deleted"
+
+
+class TaskHistoryChange(TrellisModel):
+    field: Literal[
+        "title",
+        "notes",
+        "due_date",
+        "priority",
+        "status",
+        "blocked_by",
+    ]
+    before: JsonValue | None = None
+    after: JsonValue | None = None
+
+
+class TaskHistoryEntry(TrellisModel):
+    event_id: int
+    operation: EventOperation
+    effect: TaskHistoryEffect
+    occurred_at: datetime
+    version_before: int | None = None
+    version_after: int | None = None
+    changes: list[TaskHistoryChange] = Field(default_factory=list)
+
+
+class TaskHistoryResponse(TrellisModel):
+    task_id: UUID
+    exists_now: bool
+    current_version: int | None = None
+    entries: list[TaskHistoryEntry]
+    next_before_event_id: int | None = None
 
 
 class RunCreatedResponse(TrellisModel):

@@ -1,4 +1,4 @@
-import type { TasksResponse } from "./types";
+import type { TaskHistoryResponse, TasksResponse } from "./types";
 import type { ApprovalDecision, RunDetail } from "./useRun";
 import { withNgrokBypassHeaders } from "./ngrokDemoIngress";
 
@@ -17,6 +17,43 @@ export async function fetchTasks(init?: RequestInit): Promise<TasksResponse> {
   }
 
   return (await response.json()) as TasksResponse;
+}
+
+
+export interface FetchTaskHistoryOptions {
+  limit?: number;
+  beforeEventId?: number;
+}
+
+export async function fetchTaskHistory(
+  taskId: string,
+  options: FetchTaskHistoryOptions = {},
+  init?: RequestInit,
+): Promise<TaskHistoryResponse> {
+  const search = new URLSearchParams();
+
+  if (options.limit !== undefined) {
+    search.set("limit", String(options.limit));
+  }
+  if (options.beforeEventId !== undefined) {
+    search.set("before_event_id", String(options.beforeEventId));
+  }
+
+  const queryString = search.toString();
+  const query = queryString ? `?${queryString}` : "";
+  const path = `${TASKS_PATH}/${encodeURIComponent(taskId)}/history${query}`;
+
+  const response = await fetch(path, {
+    ...init,
+    cache: "no-store",
+    headers: withNgrokBypassHeaders(init?.headers),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Task history request failed with HTTP ${response.status}`);
+  }
+
+  return (await response.json()) as TaskHistoryResponse;
 }
 
 /**

@@ -52,7 +52,7 @@ import json
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import ValidationError
@@ -77,6 +77,7 @@ from app.models import (
     RunCreatedResponse,
     RunDetail,
     RunStatus,
+    TaskHistoryResponse,
     TasksResponse,
 )
 
@@ -150,6 +151,25 @@ def get_tasks() -> TasksResponse:
         tasks = domain.list_tasks(settings.actor_id, ListTasksArgs(), conn=conn)
         conn.commit()
     return TasksResponse(tasks=tasks)
+
+
+@app.get("/api/tasks/{task_id}/history", response_model=TaskHistoryResponse)
+def get_task_history(
+    task_id: UUID,
+    limit: int = Query(default=20, ge=1, le=50),
+    before_event_id: int | None = Query(default=None, ge=1),
+) -> TaskHistoryResponse:
+    """Return one bounded, actor-scoped page of the task's durable audit trail."""
+    with pool.connection() as conn:
+        history = domain.read_task_history(
+            settings.actor_id,
+            task_id,
+            limit=limit,
+            before_event_id=before_event_id,
+            conn=conn,
+        )
+        conn.commit()
+    return history
 
 
 @app.post("/api/runs", response_model=RunCreatedResponse, status_code=201)
