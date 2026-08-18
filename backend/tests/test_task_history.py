@@ -126,7 +126,17 @@ def test_projection_create_update_null_and_wire_contract(db):
         "occurred_at",
         "version_before",
         "version_after",
+        "snapshot",
         "changes",
+    }
+    assert newest["snapshot"] is None
+    assert set(created["snapshot"]) == {
+        "title",
+        "notes",
+        "due_date",
+        "priority",
+        "status",
+        "blocked_by",
     }
 
 

@@ -57,6 +57,7 @@ from .models import (
     TaskHistoryEffect,
     TaskHistoryEntry,
     TaskHistoryResponse,
+    TaskHistoryState,
     UpdateTaskArgs,
 )
 
@@ -442,12 +443,16 @@ def _history_entry(event: TaskEvent) -> TaskHistoryEntry:
     before = _history_task(event.before)
     after = _history_task(event.after)
 
+    snapshot: TaskHistoryState | None
     if before is None and after is not None:
         effect = TaskHistoryEffect.CREATED
+        snapshot = _history_state(after)
     elif before is not None and after is not None:
         effect = TaskHistoryEffect.UPDATED
+        snapshot = None
     elif before is not None and after is None:
         effect = TaskHistoryEffect.DELETED
+        snapshot = _history_state(before)
     else:
         raise RuntimeError("task event has neither a before nor after snapshot")
 
@@ -476,7 +481,17 @@ def _history_entry(event: TaskEvent) -> TaskHistoryEntry:
         occurred_at=event.created_at,
         version_before=before.version if before is not None else None,
         version_after=after.version if after is not None else None,
+        snapshot=snapshot,
         changes=changes,
+    )
+
+
+def _history_state(task: Task) -> TaskHistoryState:
+    return TaskHistoryState.model_validate(
+        task.model_dump(
+            mode="json",
+            include=set(TaskHistoryState.model_fields),
+        )
     )
 
 
