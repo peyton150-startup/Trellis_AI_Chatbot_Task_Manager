@@ -1,3 +1,4 @@
+import { TaskHistory } from "./TaskHistory";
 import type { Task } from "../lib/types";
 
 const dueDateFormatter = new Intl.DateTimeFormat("en-US", {
@@ -91,6 +92,12 @@ export function TaskCard({ task, blockedByTitle }: TaskCardProps) {
           </div>
         </dl>
       </details>
+
+      <TaskHistory
+        key={`${task.id}:${task.version}`}
+        taskId={task.id}
+        currentVersion={task.version}
+      />
     </article>
   );
 }

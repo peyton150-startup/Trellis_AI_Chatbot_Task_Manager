@@ -2247,6 +2247,7 @@ jobs:
           # anyone start an installation flow against this deployment.
           expected = {
               "/api/tasks",
+              "/api/tasks/{task_id}/history",
               "/api/runs",
               "/api/runs/{run_id}",
               "/api/runs/{run_id}/approvals/{tool_call_id}",
@@ -2601,7 +2602,8 @@ jobs:
           # T12B adds the approvals decision route, which it owns under D-44.
           # T00W adds the two Linear ingress routes, which it owns under D-69.
           expected_paths = {
-              "/api/tasks", "/api/runs", "/api/runs/{run_id}", "/api/demo/reset",
+              "/api/tasks", "/api/tasks/{task_id}/history",
+              "/api/runs", "/api/runs/{run_id}", "/api/demo/reset",
               "/api/agui", "/api/runs/{run_id}/approvals/{tool_call_id}",
               "/api/linear/oauth/callback", "/api/linear/webhook",
           }

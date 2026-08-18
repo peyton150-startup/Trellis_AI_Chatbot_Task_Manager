@@ -43,15 +43,20 @@ from psycopg.types.json import Json
 from pydantic import JsonValue
 
 from . import sql
-from .errors import VersionConflictError
+from .errors import OutOfScopeError, VersionConflictError
 from .models import (
     BulkUpdateTasksArgs,
     CreateTaskArgs,
     DeleteTasksArgs,
     EventOperation,
     ListTasksArgs,
+    MutableTaskFields,
     Task,
     TaskEvent,
+    TaskHistoryChange,
+    TaskHistoryEffect,
+    TaskHistoryEntry,
+    TaskHistoryResponse,
     UpdateTaskArgs,
 )
 
@@ -379,6 +384,108 @@ def read_events(
         {"run_id": run_id, "limit": limit},
     ).fetchall()
     return [TaskEvent.model_validate(row) for row in rows]
+
+
+def read_task_history(
+    actor_id: UUID,
+    task_id: UUID,
+    *,
+    limit: int,
+    before_event_id: int | None,
+    conn: Connection,
+) -> TaskHistoryResponse:
+    """Read one actor-scoped page of durable task history, newest first.
+
+    Audit rows authorize deleted history directly. A current owned task with no
+    events is also valid because the administrative seed path predates ordinary
+    event creation. If neither form of ownership evidence exists, missing and
+    foreign ids fail identically.
+    """
+    scope = conn.execute(
+        sql.SELECT_TASK_HISTORY_SCOPE,
+        {"task_id": task_id, "actor_id": actor_id},
+    ).fetchone()
+    if scope is None:
+        raise RuntimeError("task history scope query returned no row")
+
+    current_version = scope["current_version"]
+    if not scope["has_events"] and current_version is None:
+        raise OutOfScopeError()
+
+    rows = conn.execute(
+        sql.SELECT_TASK_EVENTS_FOR_ACTOR,
+        {
+            "task_id": task_id,
+            "actor_id": actor_id,
+            "before_event_id": before_event_id,
+            "limit": limit + 1,
+        },
+    ).fetchall()
+    events = [TaskEvent.model_validate(row) for row in rows]
+
+    has_older = len(events) > limit
+    page = events[:limit]
+    entries = [_history_entry(event) for event in page]
+
+    return TaskHistoryResponse(
+        task_id=task_id,
+        exists_now=current_version is not None,
+        current_version=current_version,
+        entries=entries,
+        next_before_event_id=(
+            entries[-1].event_id if has_older and entries else None
+        ),
+    )
+
+
+def _history_entry(event: TaskEvent) -> TaskHistoryEntry:
+    before = _history_task(event.before)
+    after = _history_task(event.after)
+
+    if before is None and after is not None:
+        effect = TaskHistoryEffect.CREATED
+    elif before is not None and after is not None:
+        effect = TaskHistoryEffect.UPDATED
+    elif before is not None and after is None:
+        effect = TaskHistoryEffect.DELETED
+    else:
+        raise RuntimeError("task event has neither a before nor after snapshot")
+
+    changes: list[TaskHistoryChange] = []
+    if before is not None and after is not None:
+        before_fields = before.model_dump(
+            mode="json", include=set(MutableTaskFields.model_fields)
+        )
+        after_fields = after.model_dump(
+            mode="json", include=set(MutableTaskFields.model_fields)
+        )
+        for field in MutableTaskFields.model_fields:
+            if before_fields[field] != after_fields[field]:
+                changes.append(
+                    TaskHistoryChange(
+                        field=field,
+                        before=before_fields[field],
+                        after=after_fields[field],
+                    )
+                )
+
+    return TaskHistoryEntry(
+        event_id=event.id,
+        operation=event.operation,
+        effect=effect,
+        occurred_at=event.created_at,
+        version_before=before.version if before is not None else None,
+        version_after=after.version if after is not None else None,
+        changes=changes,
+    )
+
+
+def _history_task(snapshot: JsonValue | None) -> Task | None:
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("task event snapshot is not an object")
+    return Task.model_validate(snapshot)
 
 
 def _locked_tasks(
