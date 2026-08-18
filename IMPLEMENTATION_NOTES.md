@@ -2052,7 +2052,8 @@ per-AgentSession serialized lease; `linear_agent_api` for every remote call, via
 a `provider()` indirection so no second HTTP client exists; `linear_installations`
 for the authoritative ACTIVE installation and its rotating credential;
 `linear_agent_sessions.last_completed_run_id` for server-owned continuity;
-`agent.build_agent`'s six tools, `RunEffects`, and `_open_approval`.
+`agent.build_agent`'s tool bodies and `RunEffects`. The Linear profile is four
+tools, `agent.LINEAR_TOOLS`, not the six the browser gets.
 
 **Outputs and consumers:** `agent_runs` rows indistinguishable from AG-UI turns,
 so the browser sees Linear-originated work in the same history; an advanced
@@ -2066,7 +2067,7 @@ before execution      terminal (_Terminal) or released with backoff (_Transient)
 mutation committed    terminal; never retried, run truth preserved
 no mutation           released, run link cleared, cursor untouched
 delivery failed       run stays completed, cursor advances, error recorded
-approval required     run awaiting_approval, cursor NOT advanced, row completed
+deferred request      terminal failure, no approval row, nothing auto-approved
 already has run_id    finalized from the run, never executed a second time
 ```
 
@@ -2092,6 +2093,9 @@ CI step runs with `NVIDIA_API_KEY` and every Linear value empty. The gate is a n
 step inside the existing `T00W Linear webhook bridge` check, whose name is
 unchanged because branch protection already references it.
 
+**Superseded in part.** See the corrective entry below; the limitations
+paragraph that follows describes the first commit and is kept for the record.
+
 **Limitations and review status:** Three facts remain unresolved against the live
 provider. First, prompt location: Linear's documentation names
 `agentActivity.body` for a prompted event while the observed payload nests it
@@ -2106,3 +2110,68 @@ token. Native approval continuation from inside Linear is deliberately out of
 scope: an approval-required turn writes the authoritative pending row through the
 existing bridge and elicits the human to decide in Trellis. The live deployment
 gate remains open, and T00W must not be reported as complete.
+
+## T00W: worker boundary corrections
+
+Corrective findings against `5a9537d`, applied as one commit. Not a redesign:
+the claim, run identity, cursor, and no-replay semantics are unchanged and their
+tests still pass unmodified.
+
+**1. Linear runs a four-tool profile.** The first commit invoked
+`agent.get_agent()`, so a Linear session inherited the whole browser product
+configuration including `delete_tasks` and `bulk_update_tasks`. Reusing
+`Agent.run` was the right call; reusing the AG-UI product configuration was a
+separate decision that was never made deliberately. `build_agent` now takes a
+`toolset`, defaulting to `ALL_TOOLS` so no existing caller changes, and
+`get_linear_agent()` registers `list_tasks`, `create_task`, `update_task`, and
+`propose_plan`. A tool outside the profile is not registered, so it is absent
+from the schema the model sees rather than refused after the fact.
+
+**2. The premature approval bridge is removed.** The first commit wrote a real
+approval row and emitted a Linear elicitation. That was half a bridge: a `select`
+elicitation returns an ordinary user `prompt` activity, which is a new message
+rather than Pydantic AI deferred-tool continuation data, so the card could never
+be decided from Linear. The worker now writes no approval row from this path at
+all. A deferred request fails the turn closed, which the four-tool profile makes
+unreachable anyway; the branch is kept so a later widening cannot land silently.
+T16's browser bridge is untouched.
+
+**3. A `stop` signal can never reach the model.** `activity_signal` is consulted
+before `extract_prompt`, and a stop halts with no model call, no tool, no run,
+and one closing `response` activity. **Known limitation, stated rather than
+papered over:** this stops a turn that has not started. It cannot cancel a turn
+already executing inside `Agent.run`, because Trellis has no cancellation channel
+into a running invocation, and per-session serialization means a stop queued
+behind a leased row waits rather than interrupting it. An unrecognized signal is
+refused the same way instead of falling through to the extractor.
+
+**4. The refresh no longer holds a row lock across the network call.** Inspected
+before changing: the first commit did take `FOR UPDATE` and then called Linear
+inside the same transaction, so the finding was real. The refresh now happens
+outside every transaction and the write back is compare-and-swap, guarded on the
+refresh token that was actually spent, so the loser of a race updates zero rows
+and re-reads the winner's token instead of persisting a superseded one.
+`TOKEN_REFRESH_SKEW_SECONDS` is 300, which keeps the provider round trip off the
+critical path of the ten second acknowledgement window Linear requires on a
+created session.
+
+**5. Prompt extraction is tightened.** For `prompted`: `content.type` must be
+`prompt`, then a non-empty `content.body`, then `agentActivity.body` as a
+documented-prose compatibility fallback, then fail closed. A non-prompt content
+type is refused rather than mined for a body. `promptContext` remains
+`created`-only.
+
+**Verification:** `ruff check .` clean; `pytest tests/test_linear_worker.py -q`
+45 passed; `pytest -m "not network" -q` 225 passed, 13 deselected, against 180
+selected before T00W's worker work began. The four-tool boundary is asserted
+against a constructed agent's registered tools rather than against the constant,
+and the absence of a held lock is proven by querying `pg_locks` from a second
+connection while the refresh is in flight.
+
+**Remaining unresolved live-provider facts:** the prompted body location
+(`content.body` observed, `agentActivity.body` documented, both accepted); the
+`created` payload's prompt location, documented but not yet observed; and
+AgentActivity resubmission, measured live as a conflict, which is why no retry
+exists anywhere around delivery. Cancellation of an in-flight turn is an
+acknowledged gap, not a solved problem. The live deployment gate remains open and
+T00W must not be reported as complete.

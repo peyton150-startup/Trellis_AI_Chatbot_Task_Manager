@@ -12,7 +12,7 @@ prompt                   derived from the stored authenticated payload
 continuity               last_completed_run_id, server-owned
 run                      runs.create_turn, a fresh application run
 history                  runs.load_history, the single source
-model                    agent.get_agent().run, invoked directly
+model                    agent.get_linear_agent().run, four tools only
 persist                  history, usage, terminal status
 deliver                  one AgentActivity, caller-owned UUID
 finalize                 completion and cursor advance, one transaction
@@ -38,6 +38,24 @@ same activity UUID returned HTTP 200 carrying the GraphQL error "conflict on
 insert of AgentActivity". The caller-owned id is therefore a duplicate detector
 at the provider and not a replay token, and `linear_agent_api._request` issues
 exactly one attempt. Nothing here wraps that in a loop.
+
+**Linear runs a four-tool profile, and that is a capability boundary rather
+than a preference.** `agent.get_linear_agent()` registers `list_tasks`,
+`create_task`, `update_task`, and `propose_plan`. The two omitted tools,
+`delete_tasks` and `bulk_update_tasks`, are exactly the two that can require
+approval, and Linear has no channel that can decide one: a `select` elicitation
+returns an ordinary user `prompt` activity, which is a new message rather than a
+resumption of an interrupted invocation. An approval card raised from here would
+be one no Linear answer could ever decide, so the capability is withheld instead
+of half-offered. T16's browser approval bridge is untouched, and native Linear
+approval continuation is work T00W does not attempt.
+
+**A control signal never becomes a prompt.** `activity_signal` is consulted
+before `extract_prompt`, and a `stop` halts without a model call, without a
+tool, without a run, and without any Linear call beyond the single closing
+activity Linear's contract asks for. The limitation is stated where it lives:
+this stops a turn that has not started, and cannot cancel one already inside
+`Agent.run`.
 
 **Prompt extraction is deliberately one small pure function.** Linear's prose
 documentation and the payload shape observed on the wire describe the prompted
@@ -76,7 +94,6 @@ from .models import RunStatus
 # Durable, machine-readable worker outcomes. Never prose and never a payload.
 OUTCOME_IDLE = "idle"
 OUTCOME_COMPLETED = "completed"
-OUTCOME_APPROVAL_REQUIRED = "approval_required"
 OUTCOME_FAILED = "failed"
 OUTCOME_RELEASED = "released"
 
@@ -90,17 +107,33 @@ ERROR_NO_PROMPT = "no_extractable_prompt"
 ERROR_SIGNAL_NOT_PROMPT = "activity_carried_a_signal_not_a_prompt"
 ERROR_ATTEMPTS_EXHAUSTED = "attempt_budget_exhausted"
 ERROR_AMBIGUOUS_TURN = "turn_already_executed_outcome_ambiguous"
-ERROR_APPROVAL_REQUIRED = "approval_required_decide_in_trellis"
+ERROR_UNSUPPORTED_CAPABILITY = "model_requested_a_tool_outside_the_linear_profile"
 ERROR_MUTATION_COMMITTED = "mutation_committed_response_incomplete"
 ERROR_MODEL_FAILED = "model_invocation_failed"
+ERROR_TOKEN_RACE_LOST = "refresh_token_race_lost"
+ERROR_STOPPED = "stopped_by_user_signal"
+
+# How far ahead of expiry a token is refreshed. Deliberately generous: Linear
+# requires the first activity on a created session within ten seconds, and a
+# refresh performed at the moment of expiry puts a provider round trip on that
+# critical path. See `ensure_access_token`.
+TOKEN_REFRESH_SKEW_SECONDS = 300
+
+# The signal Linear sends when a human stops the agent. Handled before anything
+# else, and never as prompt text. See `_handle_signal`.
+SIGNAL_STOP = "stop"
 
 # What the human sees in Linear. Fixed text, because these are the worker's own
 # words and never an echo of a payload or of an exception.
 ACK_BODY = "Working on it. Checking your Trellis tasks."
-APPROVAL_BODY = (
-    "This request needs approval before it can run. Trellis has opened an "
-    "approval card; approve or reject it in the Trellis app and I will "
-    "continue there. I will not act on it from Linear."
+UNSUPPORTED_BODY = (
+    "That request needs a capability I do not have from Linear. Deleting tasks "
+    "and bulk updates require approval, and approval is decided in the Trellis "
+    "app. Nothing was changed."
+)
+STOPPED_BODY = "Stopped. I have taken no further action."
+UNSUPPORTED_SIGNAL_BODY = (
+    "I received a control signal I do not handle, so I stopped without acting."
 )
 FAILURE_BODY = "I could not complete that request. Nothing was changed."
 PARTIAL_BODY = (
@@ -133,6 +166,22 @@ def _text(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def activity_signal(payload: dict) -> str | None:
+    """The control signal on this event, or None for an ordinary message.
+
+    Separate from `extract_prompt` and consulted before it, because a signal is
+    not a degenerate prompt. Linear's schema carries `signal` and
+    `signalMetadata` beside `content` precisely so that a stop is distinguishable
+    from someone typing the word stop, and collapsing the two would make the
+    control channel forgeable by content.
+    """
+    activity = payload.get("agentActivity")
+    if not isinstance(activity, dict):
+        return None
+    signal = activity.get("signal")
+    return signal if isinstance(signal, str) and signal else None
 
 
 def extract_prompt(payload: dict) -> str | None:
@@ -168,13 +217,19 @@ def extract_prompt(payload: dict) -> str | None:
 
         content = activity.get("content")
         if isinstance(content, dict):
+            # Linear's schema makes `content` a required JSONObject and types
+            # the user-authored variant as `prompt`. Any other type is some
+            # other activity, and treating it as a user instruction would let a
+            # non-prompt activity drive the agent.
+            if content.get("type") != "prompt":
+                return None
             body = _text(content.get("body"))
             if body is not None:
                 return body
-        elif isinstance(content, str):
-            body = _text(content)
-            if body is not None:
-                return body
+
+        # Compatibility only. Linear's prose documents the prompted message at
+        # `agentActivity.body`, so this is kept for the case where a payload
+        # matches the prose rather than the schema.
         return _text(activity.get("body"))
 
     if action == linear_agent.ACTION_CREATED:
@@ -224,61 +279,96 @@ def _safe_provider_error(exc: LinearApiError) -> str:
     return f"linear:{exc.operation}:{status}"
 
 
-def ensure_access_token(installation_id: UUID) -> str:
-    """The live access token for one installation, refreshing under a lock.
-
-    The lock is the mechanism, not a precaution. Linear rotates refresh tokens,
-    so two workers that both observed an expired token and both refreshed would
-    leave one of them persisting a value the provider has already superseded,
-    and the stored credential would be dead until the next install. `FOR UPDATE`
-    makes the expiry test and the replacement inseparable: the second worker
-    waits, re-reads inside the same lock, sees a live token, and returns it
-    without calling Linear at all.
-
-    This deliberately holds a transaction across a provider call, which is the
-    opposite of what `linear_install.py` does. The two protect different things.
-    The callback's rule is about a single-use state value, where holding a
-    transaction buys nothing. This is mutual exclusion over a rotating
-    credential, where the lock is the entire point. The provider timeout bounds
-    how long it can be held.
-    """
+def _read_installation(installation_id: UUID) -> dict:
     with pool.connection() as conn:
-        row = conn.execute(sql.LOCK_ACTIVE_LINEAR_INSTALLATION).fetchone()
-        if row is None or row["id"] != installation_id:
-            conn.commit()
-            raise _Terminal(ERROR_NO_INSTALLATION)
+        row = conn.execute(
+            sql.SELECT_ACTIVE_LINEAR_INSTALLATION_BY_ID, {"id": installation_id}
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise _Terminal(ERROR_NO_INSTALLATION)
+    return dict(row)
 
+
+def _is_fresh(row: dict, now) -> bool:
+    expires_at = row["access_token_expires_at"]
+    return (
+        expires_at is not None
+        and (expires_at - now).total_seconds() > TOKEN_REFRESH_SKEW_SECONDS
+    )
+
+
+def ensure_access_token(installation_id: UUID) -> str:
+    """The live access token for one installation, refreshed compare-and-swap.
+
+    **No database transaction is held across the call to Linear**, which is the
+    same rule `linear_install.py` follows and for the same reason: a provider
+    that hangs would otherwise pin a connection and a row lock for the whole
+    timeout, and this call sits on the critical path of an acknowledgement
+    Linear expects within ten seconds.
+
+    Mutual exclusion is still required, because Linear rotates refresh tokens
+    and two workers that both refreshed would leave one persisting a value the
+    provider has already superseded. It is obtained by compare-and-swap instead
+    of by a lock: the refresh happens outside any transaction, and the write
+    back is guarded on the refresh token that was actually spent. The loser of
+    the race updates zero rows, learns that from the row count, and re-reads the
+    winner's token rather than overwriting it.
+
+    Linear documents a grace period in which a refresh may be replayed after a
+    network failure, which is what makes the loser's spent token recoverable
+    rather than merely lost. That allowance is specific to refresh and is not
+    generalized into a retry anywhere else.
+
+    `TOKEN_REFRESH_SKEW_SECONDS` is deliberately generous. A token refreshed
+    only at the moment of expiry puts a provider round trip on the critical path
+    of the ten second acknowledgement window every time it happens; refreshing
+    well ahead of expiry means it usually happens on a turn that has time to
+    spare.
+    """
+    row = _read_installation(installation_id)
+
+    with pool.connection() as conn:
         now = conn.execute("SELECT now() AS now;").fetchone()["now"]
-        expires_at = row["access_token_expires_at"]
-        # A minute of headroom, so a token that would expire mid-request is
-        # refreshed before it is used rather than after it fails.
-        if expires_at is not None and (expires_at - now).total_seconds() > 60:
-            token = row["access_token"]
-            conn.commit()
-            return token
+        conn.commit()
 
-        refresh_token = row["refresh_token"]
-        if not refresh_token:
-            conn.commit()
-            raise _Terminal(ERROR_NO_INSTALLATION)
+    if _is_fresh(row, now):
+        return row["access_token"]
 
-        try:
-            tokens = provider().refresh_tokens(refresh_token)
-        except LinearApiError as exc:
-            conn.rollback()
-            raise _Transient(_safe_provider_error(exc)) from None
+    spent = row["refresh_token"]
+    if not spent:
+        raise _Terminal(ERROR_NO_INSTALLATION)
 
+    # Outside every transaction.
+    try:
+        tokens = provider().refresh_tokens(spent)
+    except LinearApiError as exc:
+        raise _Transient(_safe_provider_error(exc)) from None
+
+    with pool.connection() as conn:
         updated = conn.execute(
-            sql.UPDATE_LINEAR_INSTALLATION_TOKENS,
+            sql.ROTATE_LINEAR_INSTALLATION_TOKENS,
             {
                 "id": installation_id,
+                "spent_refresh_token": spent,
                 "access_token": tokens.access_token,
                 "refresh_token": tokens.refresh_token,
                 "expires_in": tokens.expires_in,
             },
         ).fetchone()
         conn.commit()
-    return updated["access_token"]
+
+    if updated is not None:
+        return updated["access_token"]
+
+    # Another worker rotated first. Its token is the live one; ours is spent.
+    current = _read_installation(installation_id)
+    with pool.connection() as conn:
+        now = conn.execute("SELECT now() AS now;").fetchone()["now"]
+        conn.commit()
+    if _is_fresh(current, now):
+        return current["access_token"]
+    raise _Transient(ERROR_TOKEN_RACE_LOST)
 
 
 # ------------------------------------------------------------------ delivery
@@ -333,23 +423,6 @@ def _complete_and_advance(
                 "agent_session_id": agent_session_id,
                 "run_id": run_id,
             },
-        )
-        conn.commit()
-
-
-def _complete_without_advancing(
-    row_id: UUID, *, run_id: UUID | None, last_error: str | None
-) -> None:
-    """The row is handled and must never run again, but is no continuity source.
-
-    Used when a turn stopped at an approval boundary. The run is
-    `awaiting_approval`, which `runs.create_turn` refuses as a predecessor, so
-    advancing the cursor to it would break the next turn rather than help it.
-    """
-    with pool.connection() as conn:
-        conn.execute(
-            sql.COMPLETE_LINEAR_INBOX,
-            {"id": row_id, "run_id": run_id, "last_error": last_error},
         )
         conn.commit()
 
@@ -451,16 +524,11 @@ def _finalize_ambiguous(row: dict) -> dict:
         )
         return {"outcome": OUTCOME_COMPLETED, "row_id": row_id, "run_id": run_id}
 
-    if run.status is RunStatus.AWAITING_APPROVAL:
-        _complete_without_advancing(
-            row_id, run_id=run_id, last_error=ERROR_APPROVAL_REQUIRED
-        )
-        return {
-            "outcome": OUTCOME_APPROVAL_REQUIRED,
-            "row_id": row_id,
-            "run_id": run_id,
-        }
-
+    # Any other status, `awaiting_approval` included, is a failure here. A
+    # Linear-originated run can no longer reach that state, because the Linear
+    # profile registers no tool that can be deferred, so observing one means the
+    # run was touched by something other than this worker. Advancing the cursor
+    # to it would hand the next turn a predecessor `runs.create_turn` refuses.
     _fail(row_id, run_id=run_id, last_error=ERROR_AMBIGUOUS_TURN)
     return {"outcome": OUTCOME_FAILED, "row_id": row_id, "error": ERROR_AMBIGUOUS_TURN}
 
@@ -522,14 +590,15 @@ def _execute(row: dict, *, agent=None) -> dict:
 
     installation = _load_installation_for(row)
 
+    # Signals are resolved before anything else, because the answer to a stop is
+    # to do nothing rather than to do something smaller.
+    signal = activity_signal(payload)
+    if signal is not None:
+        return _handle_signal(row, installation, signal)
+
     prompt = extract_prompt(payload)
     if prompt is None:
-        activity = payload.get("agentActivity")
-        raise _Terminal(
-            ERROR_SIGNAL_NOT_PROMPT
-            if isinstance(activity, dict) and activity.get("signal") is not None
-            else ERROR_NO_PROMPT
-        )
+        raise _Terminal(ERROR_NO_PROMPT)
 
     access_token = ensure_access_token(installation["id"])
 
@@ -557,7 +626,7 @@ def _execute(row: dict, *, agent=None) -> dict:
     deps = agent_module.TrellisDeps(
         actor_id=settings.actor_id, run_id=run.id, effects=effects
     )
-    runtime = agent if agent is not None else agent_module.get_agent()
+    runtime = agent if agent is not None else agent_module.get_linear_agent()
 
     try:
         result = asyncio.run(
@@ -579,7 +648,7 @@ def _execute(row: dict, *, agent=None) -> dict:
     )
 
     if isinstance(result.output, DeferredToolRequests):
-        return _handle_approval(row, run.id, result.output, access_token)
+        return _handle_unsupported_capability(row, run.id, access_token)
 
     runs.set_status(run.id, RunStatus.COMPLETED)
     delivery_error = _emit(
@@ -600,41 +669,75 @@ def _execute(row: dict, *, agent=None) -> dict:
     }
 
 
-def _handle_approval(
-    row: dict, run_id: UUID, output: DeferredToolRequests, access_token: str
+def _handle_unsupported_capability(
+    row: dict, run_id: UUID, access_token: str
 ) -> dict:
-    """An approval-required call, handed to the existing deterministic bridge.
+    """A deferred request reached a profile that has no deferrable tools.
 
-    T16's boundary is neither weakened nor bypassed. `agent._open_approval`
-    writes the authoritative pending row and moves the run to
-    `awaiting_approval` exactly as the AG-UI path does, and the human decides in
-    Trellis. Native approval continuation from inside Linear is outside the
-    minimum T00W worker, so this says so in the session rather than
-    auto-approving destructive work.
+    Unreachable through `LINEAR_TOOLS`, because the only two tools that can
+    require approval are not registered on the Linear agent. It is kept as a
+    fail-closed branch rather than deleted, because "unreachable" is a property
+    of today's profile and a later widening would otherwise land here silently.
+
+    **No approval row is written and nothing is auto-approved.** T00W has no way
+    to decide an approval from inside Linear: a `select` elicitation returns an
+    ordinary user `prompt` activity, which is a new message rather than a
+    resumption of the interrupted invocation, so an approval card raised here
+    would be one no Linear answer could ever decide. Refusing the turn is the
+    honest outcome, and it leaves T16's browser bridge untouched.
     """
     row_id = row["id"]
-    try:
-        agent_module._open_approval(run_id, output)
-    except Exception as exc:
-        reason = type(exc).__name__
-        runs.set_status(run_id, RunStatus.FAILED, reason)
-        _emit(
-            access_token,
-            row["agent_session_id"],
-            {"type": "error", "body": FAILURE_BODY},
-        )
-        _fail(row_id, run_id=run_id, last_error=reason)
-        return {"outcome": OUTCOME_FAILED, "row_id": row_id, "error": reason}
-
-    delivery_error = _emit(
+    runs.set_status(run_id, RunStatus.FAILED, ERROR_UNSUPPORTED_CAPABILITY)
+    _emit(
         access_token,
         row["agent_session_id"],
-        {"type": "elicitation", "body": APPROVAL_BODY},
+        {"type": "error", "body": UNSUPPORTED_BODY},
     )
-    _complete_without_advancing(
-        row_id, run_id=run_id, last_error=delivery_error or ERROR_APPROVAL_REQUIRED
+    _fail(row_id, run_id=run_id, last_error=ERROR_UNSUPPORTED_CAPABILITY)
+    return {
+        "outcome": OUTCOME_FAILED,
+        "row_id": row_id,
+        "run_id": run_id,
+        "error": ERROR_UNSUPPORTED_CAPABILITY,
+    }
+
+
+def _handle_signal(row: dict, installation: dict, signal: str) -> dict:
+    """A control signal, answered without a model, a tool, or a turn.
+
+    Linear's contract for `stop` is explicit: halt, take no further actions and
+    make no further API calls, then emit one final response or error. So this
+    path calls no model, registers no run, touches no task, and emits exactly
+    one closing activity before finalizing the row.
+
+    **The limitation is stated rather than papered over.** This stops a turn
+    that has not started. It cannot cancel a turn already executing inside
+    `Agent.run`, because Trellis has no cancellation channel into a running
+    invocation, and per-session serialization means a stop for a session whose
+    earlier row is still leased waits behind it rather than interrupting it.
+    Claiming otherwise would be claiming compliance this build does not have.
+
+    An unrecognized signal is refused the same way rather than falling through
+    to `extract_prompt`. A control message this worker does not understand is
+    the last thing that should be handed to a model as an instruction.
+    """
+    row_id = row["id"]
+    reason = ERROR_STOPPED if signal == SIGNAL_STOP else ERROR_SIGNAL_NOT_PROMPT
+
+    try:
+        access_token = ensure_access_token(installation["id"])
+    except (_Terminal, _Transient):
+        # No credential means no closing activity is possible. The row is still
+        # finalized: a stop must not be retried into a turn later.
+        _fail(row_id, run_id=None, last_error=reason)
+        return {"outcome": OUTCOME_FAILED, "row_id": row_id, "error": reason}
+
+    body = STOPPED_BODY if signal == SIGNAL_STOP else UNSUPPORTED_SIGNAL_BODY
+    delivery_error = _emit(
+        access_token, row["agent_session_id"], {"type": "response", "body": body}
     )
-    return {"outcome": OUTCOME_APPROVAL_REQUIRED, "row_id": row_id, "run_id": run_id}
+    _fail(row_id, run_id=None, last_error=delivery_error or reason)
+    return {"outcome": OUTCOME_FAILED, "row_id": row_id, "error": reason}
 
 
 def _handle_execution_failure(

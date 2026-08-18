@@ -134,6 +134,39 @@ _APPROVAL_ARGS_MODELS = {
     ToolName.BULK_UPDATE_TASKS.value: BulkUpdateTasksArgs,
 }
 
+# The full product profile. Every existing caller gets this and nothing changes
+# for the browser transport.
+ALL_TOOLS = frozenset(name.value for name in ToolName)
+
+# T00W. The profile a Linear AgentSession runs under, and it is deliberately
+# four tools rather than six.
+#
+# The two omitted tools are exactly the two that can require approval, and that
+# is the whole argument. Trellis decides destructive work through a human
+# pressing Approve on a card the server wrote, and the AG-UI transport carries
+# that decision back as Pydantic AI deferred-tool continuation data. Linear has
+# no such channel: an `elicitation` of type `select` returns an ordinary user
+# `prompt` activity, which is a new message and not a resumption of an
+# interrupted invocation. Wiring a Linear select into an approval row would
+# produce a card no Linear answer can decide, which is worse than not offering
+# the capability, because it looks like an approval boundary while being a dead
+# end.
+#
+# So the boundary is enforced by absence. `delete_tasks` and
+# `bulk_update_tasks` are not registered on the Linear agent at all: the model
+# never sees them in the schema, cannot name them, and cannot reach their bodies
+# by any prompt. Native Linear approval continuation is T16-adjacent work that
+# T00W does not attempt, and this is what it looks like to not attempt it
+# honestly.
+LINEAR_TOOLS = frozenset(
+    {
+        ToolName.LIST_TASKS.value,
+        ToolName.CREATE_TASK.value,
+        ToolName.UPDATE_TASK.value,
+        ToolName.PROPOSE_PLAN.value,
+    }
+)
+
 
 @dataclass(slots=True)
 class RunEffects:
@@ -174,8 +207,12 @@ def _runtime_model() -> Model:
     return OpenAIChatModel(settings.model_id, provider=provider)
 
 
-def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
-    """Construct the six-tool agent from production or injected model state.
+def build_agent(
+    model: Model | str | None = None,
+    *,
+    toolset: frozenset[str] = ALL_TOOLS,
+) -> Agent[TrellisDeps]:
+    """Construct the agent from production or injected model state.
 
     NVIDIA hosted inference is the sole production provider. `_runtime_model`
     owns its OpenAI-compatible endpoint and credential, while `MODEL_ID`
@@ -186,7 +223,24 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
     when a model is supplied. The parameter lets deterministic gates drive this
     identical toolset and prompt against a `FunctionModel` without credentials
     or a provider call.
+
+    **`toolset` is a capability boundary, not a convenience.** A tool that is
+    not registered does not exist for that agent: the model cannot see it in the
+    schema, cannot name it, and cannot reach its body by any prompt. That is a
+    stronger guarantee than refusing the call after the fact, because it removes
+    the call rather than judging it, and it is why `LINEAR_TOOLS` is enforced
+    here rather than by a check inside the worker.
+
+    Defaulting to `ALL_TOOLS` keeps every existing caller, `get_agent` included,
+    on exactly the profile it had before this parameter existed.
     """
+    unknown = toolset - ALL_TOOLS
+    if unknown:
+        # A misspelled name would otherwise silently narrow the profile, and a
+        # profile narrower than intended fails as a missing capability much
+        # later and somewhere else.
+        raise ValueError(f"unknown tools in toolset: {sorted(unknown)}")
+
     runtime_model = _runtime_model() if model is None else model
     agent = Agent(
         runtime_model,
@@ -214,14 +268,25 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
     # tool's JSON schema, so the model sees section 10's explicit fields and
     # enums rather than a nested wrapper object.
 
-    @agent.tool
+    def _tool(name: str, **kwargs):
+        """Register a tool only when the profile includes it.
+
+        A tool outside `toolset` is discarded rather than registered and later
+        refused, so it is absent from the schema the model is shown. See the
+        `LINEAR_TOOLS` note above for why absence is the boundary.
+        """
+        if name not in toolset:
+            return lambda func: func
+        return agent.tool(**kwargs)
+
+    @_tool(ToolName.LIST_TASKS.value)
     def list_tasks(
         ctx: RunContext[TrellisDeps], arguments: ListTasksArgs
     ) -> list[domain.TaskSnapshot]:
         """Read the user's tasks with typed status, date, priority, and limit filters."""
         return tools.list_tasks(_tool_context(ctx), arguments)
 
-    @agent.tool
+    @_tool(ToolName.CREATE_TASK.value)
     def create_task(
         ctx: RunContext[TrellisDeps], arguments: CreateTaskArgs
     ) -> list[domain.TaskSnapshot]:
@@ -230,7 +295,7 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
         ctx.deps.effects.mutation_committed = True
         return result
 
-    @agent.tool
+    @_tool(ToolName.UPDATE_TASK.value)
     def update_task(
         ctx: RunContext[TrellisDeps], arguments: UpdateTaskArgs
     ) -> list[domain.TaskSnapshot]:
@@ -239,7 +304,7 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
         ctx.deps.effects.mutation_committed = True
         return result
 
-    @agent.tool
+    @_tool(ToolName.BULK_UPDATE_TASKS.value)
     def bulk_update_tasks(
         ctx: RunContext[TrellisDeps], arguments: BulkUpdateTasksArgs
     ) -> list[domain.TaskSnapshot]:
@@ -253,7 +318,7 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
     # `bulk_update_tasks` raises from inside its own body instead. The framework
     # defers this call before the body runs at all, so `delete_tasks` never
     # reaches its own D-12 step 0 on this route.
-    @agent.tool(requires_approval=True)
+    @_tool(ToolName.DELETE_TASKS.value, requires_approval=True)
     def delete_tasks(
         ctx: RunContext[TrellisDeps], arguments: DeleteTasksArgs
     ) -> list[domain.TaskSnapshot]:
@@ -262,7 +327,7 @@ def build_agent(model: Model | str | None = None) -> Agent[TrellisDeps]:
         ctx.deps.effects.mutation_committed = True
         return result
 
-    @agent.tool
+    @_tool(ToolName.PROPOSE_PLAN.value)
     def propose_plan(
         ctx: RunContext[TrellisDeps], arguments: ProposePlanArgs
     ) -> list[dict]:
@@ -288,6 +353,23 @@ def get_agent() -> Agent[TrellisDeps]:
     seam in the route.
     """
     return build_agent()
+
+
+@cache
+def get_linear_agent() -> Agent[TrellisDeps]:
+    """The process-wide Linear AgentSession agent. T00W.
+
+    Same model, same prompt, same tool bodies, same kernel. The one difference
+    is the capability profile, and it is the difference that matters: a Linear
+    session cannot reach `delete_tasks` or `bulk_update_tasks` because they are
+    not registered on this agent. See `LINEAR_TOOLS`.
+
+    Separate from `get_agent` rather than parameterized at the call site, so
+    that "which profile does Linear run under" is answered by one cached
+    function a reader can grep for rather than by an argument any caller could
+    pass differently.
+    """
+    return build_agent(toolset=LINEAR_TOOLS)
 
 
 async def handle_agui_request(request: Request) -> Response:

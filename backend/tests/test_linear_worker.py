@@ -221,6 +221,19 @@ def session_row(session_id=SESSION_A) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def _pending_approvals() -> int:
+    """Approval rows anywhere in the database.
+
+    Counted globally rather than per run, because the property is that a Linear
+    turn raises no approval at all, and a per-run count would pass if the row
+    were attached to some other run.
+    """
+    with pool.connection() as conn:
+        count = conn.execute("SELECT count(*) AS n FROM approvals;").fetchone()["n"]
+        conn.commit()
+    return count
+
+
 def task_titles() -> list[str]:
     with pool.connection() as conn:
         rows = conn.execute(
@@ -266,8 +279,18 @@ def creating_agent(title: str, fail_after=False):
     )
 
 
-def deleting_agent(task_id: UUID):
-    """An agent that proposes the one declaratively gated tool."""
+async def _silent(messages, info: AgentInfo) -> ModelResponse:
+    """A model that says nothing. Used where only construction is under test."""
+    return ModelResponse(parts=[TextPart("")])
+
+
+def _registered(built) -> set[str]:
+    """The tool names actually registered on a constructed agent."""
+    return set(built._function_toolset.tools)
+
+
+def _deleting_function_model(task_id: UUID) -> FunctionModel:
+    """A model that keeps trying to delete, whatever it is told."""
 
     async def model(messages, info: AgentInfo) -> ModelResponse:
         return ModelResponse(
@@ -275,14 +298,21 @@ def deleting_agent(task_id: UUID):
                 ToolCallPart(
                     tool_name="delete_tasks",
                     args={"task_ids": [str(task_id)]},
-                    tool_call_id="call-worker-delete",
+                    tool_call_id=f"call-worker-delete-{uuid4()}",
                 )
             ]
         )
 
-    return agent_module.build_agent(
-        FunctionModel(model, model_name="t00w-worker-delete")
-    )
+    return FunctionModel(model, model_name="t00w-worker-delete")
+
+
+def deleting_agent(task_id: UUID):
+    """The full six-tool agent proposing the declaratively gated tool.
+
+    Deliberately not the Linear profile. It exists to manufacture a deferred
+    request so the worker's fail-closed branch can be tested at all.
+    """
+    return agent_module.build_agent(_deleting_function_model(task_id))
 
 
 # --------------------------------------------------------- prompt extraction
@@ -310,6 +340,24 @@ def test_prompted_activity_carrying_a_signal_is_never_a_prompt():
     payload = prompted_payload("stop")
     payload["agentActivity"]["signal"] = "stop"
     assert worker.extract_prompt(payload) is None
+    assert worker.activity_signal(payload) == "stop"
+
+
+def test_a_non_prompt_content_type_is_not_a_user_message():
+    """Only the user-authored variant drives the agent.
+
+    Linear types the user-authored activity as `prompt`. Any other type is some
+    other activity, and accepting its body would let a non-user activity issue
+    instructions.
+    """
+    payload = prompted_payload()
+    payload["agentActivity"]["content"] = {"type": "thought", "body": "do the thing"}
+    assert worker.extract_prompt(payload) is None
+
+
+def test_an_ordinary_message_carries_no_signal():
+    assert worker.activity_signal(prompted_payload()) is None
+    assert worker.activity_signal({"action": "prompted"}) is None
 
 
 def test_created_prompt_comes_from_prompt_context_not_an_activity():
@@ -461,16 +509,85 @@ def test_a_payload_that_names_no_installation_fails_before_parsing(fake_provider
     assert fake_provider.activities == []
 
 
-def test_signal_payload_fails_with_its_own_reason(fake_provider):
+def test_a_stop_signal_never_reaches_the_model_or_a_tool(fake_provider):
+    """Linear's contract: halt, take no further action, emit one closing message.
+
+    Driven with an agent that would create a task if it ran at all, so "no tool
+    executed" is proven by the board rather than by a call counter.
+    """
     install_active()
     payload = prompted_payload("stop")
     payload["agentActivity"]["signal"] = "stop"
     row = insert_inbox(payload)
 
-    result = worker.process_next(agent=text_agent())
+    result = worker.process_next(agent=creating_agent("Should never exist"))
+
+    assert result["outcome"] == worker.OUTCOME_FAILED
+    assert result["error"] == worker.ERROR_STOPPED
+    # No model call, no tool, no run, no board change.
+    assert task_titles() == []
+    assert result.get("run_id") is None
+
+    stored = inbox_row(row["id"])
+    assert stored["status"] == "failed"
+    assert stored["run_id"] is None
+    assert session_row() is None
+
+    # Exactly one closing activity, and no acknowledgement thought before it.
+    assert [a["content"]["type"] for a in fake_provider.activities] == ["response"]
+    assert fake_provider.activities[0]["content"]["body"] == worker.STOPPED_BODY
+
+
+def test_a_stop_signal_is_never_retried_into_a_turn(fake_provider):
+    install_active()
+    payload = prompted_payload("stop")
+    payload["agentActivity"]["signal"] = "stop"
+    insert_inbox(payload)
+
+    worker.process_next(agent=creating_agent("Should never exist"))
+    assert worker.process_next(agent=creating_agent("Should never exist"))[
+        "outcome"
+    ] == worker.OUTCOME_IDLE
+    assert task_titles() == []
+
+
+def test_an_unrecognized_signal_also_refuses_to_become_a_prompt(fake_provider):
+    """A control message this worker does not understand is not an instruction."""
+    install_active()
+    payload = prompted_payload("do something clever")
+    payload["agentActivity"]["signal"] = "some_future_signal"
+    row = insert_inbox(payload)
+
+    result = worker.process_next(agent=creating_agent("Should never exist"))
 
     assert result["error"] == worker.ERROR_SIGNAL_NOT_PROMPT
+    assert task_titles() == []
     assert inbox_row(row["id"])["status"] == "failed"
+
+
+def test_a_stop_signal_is_still_finalized_when_no_credential_is_available(
+    fake_provider,
+):
+    """A stop must not be left pending because the closing message could not send."""
+    installation = install_active()
+    fake_provider.refresh_error = LinearApiError("oauth_refresh", 400, "no")
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE linear_installations SET access_token_expires_at = now() "
+            "- interval '1 hour' WHERE id = %s",
+            (installation["id"],),
+        )
+        conn.commit()
+
+    payload = prompted_payload("stop")
+    payload["agentActivity"]["signal"] = "stop"
+    row = insert_inbox(payload)
+
+    result = worker.process_next(agent=creating_agent("Should never exist"))
+
+    assert result["error"] == worker.ERROR_STOPPED
+    assert inbox_row(row["id"])["status"] == "failed"
+    assert fake_provider.activities == []
 
 
 def test_attempt_budget_exhaustion_is_terminal(fake_provider):
@@ -639,8 +756,90 @@ def test_a_failed_turn_does_not_advance_the_session_cursor(fake_provider):
 # ------------------------------------------------------------------ approvals
 
 
-def test_an_approval_required_call_stops_at_the_trellis_boundary(fake_provider):
-    """T16 is preserved: the row is written, nothing is auto-approved."""
+def test_the_linear_profile_is_exactly_four_tools():
+    """The capability boundary, asserted on the built agent rather than a list.
+
+    `LINEAR_TOOLS` is a constant and a constant proves nothing about what was
+    registered. This reads the toolset off a constructed agent, so renaming a
+    tool or forgetting a guard fails here.
+    """
+    linear = agent_module.build_agent(
+        FunctionModel(_silent, model_name="t00w-profile"),
+        toolset=agent_module.LINEAR_TOOLS,
+    )
+    assert _registered(linear) == {
+        "list_tasks",
+        "create_task",
+        "update_task",
+        "propose_plan",
+    }
+
+
+def test_the_browser_profile_still_carries_all_six_tools():
+    """The default is unchanged, so T16 and the AG-UI transport are untouched."""
+    full = agent_module.build_agent(FunctionModel(_silent, model_name="t00w-profile"))
+    assert _registered(full) == {
+        "list_tasks",
+        "create_task",
+        "update_task",
+        "bulk_update_tasks",
+        "delete_tasks",
+        "propose_plan",
+    }
+
+
+def test_an_unknown_tool_name_in_a_profile_is_refused():
+    """A typo would otherwise silently narrow the profile."""
+    with pytest.raises(ValueError):
+        agent_module.build_agent(
+            FunctionModel(_silent, model_name="t00w-profile"),
+            toolset=frozenset({"delete_evrything"}),
+        )
+
+
+def test_a_linear_session_cannot_reach_delete_tasks_at_all(fake_provider):
+    """Not refused after the fact. Absent, so there is nothing to refuse.
+
+    A model running the Linear profile insists on calling `delete_tasks`. The
+    tool is not registered, so the call cannot execute, the task survives, and
+    no approval row is written. Absence is a stronger property than refusal
+    because it removes the call rather than judging it.
+    """
+    install_active()
+    with pool.connection() as conn:
+        task = conn.execute(
+            "INSERT INTO tasks (owner_id, title) VALUES (%s, %s) RETURNING *;",
+            (ACTOR_ID, "Delete me"),
+        ).fetchone()
+        conn.commit()
+
+    insert_inbox(prompted_payload("Delete the task."))
+    linear_profile = agent_module.build_agent(
+        _deleting_function_model(task["id"]), toolset=agent_module.LINEAR_TOOLS
+    )
+    result = worker.process_next(agent=linear_profile)
+
+    # The framework reports an unknown tool and the invocation ultimately fails,
+    # which is a legitimate outcome. What must hold, however it is reported, is
+    # that nothing was deleted, no approval was ever raised, and the session
+    # cursor did not advance on the strength of a call that never ran.
+    assert task_titles() == ["Delete me"]
+    assert result["outcome"] != worker.OUTCOME_COMPLETED
+    assert _pending_approvals() == 0
+    assert session_row()["last_completed_run_id"] is None
+
+    # And the deletion never becomes reachable by draining the queue again.
+    worker.process_next(agent=linear_profile)
+    assert task_titles() == ["Delete me"]
+
+
+def test_a_deferred_request_fails_closed_without_writing_an_approval(fake_provider):
+    """Unreachable through the Linear profile, and fail-closed if it ever is.
+
+    Driven with the full six-tool agent so a deferred request can actually be
+    produced. The point is what the worker does with one: no approval row, no
+    auto-approval, no completed row, and an error activity.
+    """
     install_active()
     with pool.connection() as conn:
         task = conn.execute(
@@ -652,20 +851,19 @@ def test_an_approval_required_call_stops_at_the_trellis_boundary(fake_provider):
     row = insert_inbox(prompted_payload("Delete the task."))
     result = worker.process_next(agent=deleting_agent(task["id"]))
 
-    assert result["outcome"] == worker.OUTCOME_APPROVAL_REQUIRED
-    assert runs.load(result["run_id"], ACTOR_ID).status is RunStatus.AWAITING_APPROVAL
-    assert runs.load_pending_approval(result["run_id"]) is not None
-    # The task is still there. Nothing was approved on the model's word.
+    assert result["outcome"] == worker.OUTCOME_FAILED
+    assert result["error"] == worker.ERROR_UNSUPPORTED_CAPABILITY
     assert task_titles() == ["Delete me"]
+    assert runs.load(result["run_id"], ACTOR_ID).status is RunStatus.FAILED
+    assert runs.load_pending_approval(result["run_id"]) is None
 
     stored = inbox_row(row["id"])
-    assert stored["status"] == "completed"
-    # An awaiting_approval run is not an eligible continuity predecessor, so the
-    # cursor deliberately stays where it was.
+    assert stored["status"] == "failed"
     assert session_row()["last_completed_run_id"] is None
-
-    kinds = [a["content"]["type"] for a in fake_provider.activities]
-    assert kinds == ["thought", "elicitation"]
+    assert [a["content"]["type"] for a in fake_provider.activities] == [
+        "thought",
+        "error",
+    ]
 
 
 # --------------------------------------------------------- ordering and leases
@@ -831,6 +1029,104 @@ def test_a_response_without_a_rotation_keeps_the_existing_refresh_token(fake_pro
         ).fetchone()
         conn.commit()
     assert stored["refresh_token"] == "stored-refresh"
+
+
+def test_no_database_transaction_is_held_across_the_refresh_call(fake_provider):
+    """The lock-across-HTTP shape, refuted by observation rather than by reading.
+
+    The fake provider asks PostgreSQL, from a second connection, whether any
+    other backend is blocked or holding a row lock on `linear_installations` at
+    the moment the refresh is in flight. A `FOR UPDATE` held across the call
+    would show up as a granted row-exclusive lock from another backend.
+    """
+    installation = install_active()
+    observed = {}
+
+    def observing_refresh(refresh_token, *, client=None):
+        with pool.connection() as probe:
+            observed["locks"] = probe.execute(
+                """
+                SELECT count(*) AS n
+                  FROM pg_locks l
+                  JOIN pg_class c ON c.oid = l.relation
+                 WHERE c.relname = 'linear_installations'
+                   AND l.pid <> pg_backend_pid()
+                   AND l.mode IN ('RowExclusiveLock', 'ExclusiveLock');
+                """
+            ).fetchone()["n"]
+            probe.commit()
+        return fake_provider.next_tokens
+
+    fake_provider.refresh_tokens = observing_refresh
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE linear_installations SET access_token_expires_at = now() "
+            "- interval '1 hour' WHERE id = %s",
+            (installation["id"],),
+        )
+        conn.commit()
+
+    assert worker.ensure_access_token(installation["id"]) == "rotated-access"
+    assert observed["locks"] == 0
+
+
+def test_the_loser_of_a_rotation_race_reads_the_winners_token(fake_provider):
+    """Compare-and-swap, not last write wins.
+
+    The stored refresh token is rotated by another worker while this one's
+    refresh is in flight. The guarded update matches nothing, and the loser must
+    return the winner's live access token rather than overwrite it with a value
+    the provider has already superseded.
+    """
+    installation = install_active()
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE linear_installations SET access_token_expires_at = now() "
+            "- interval '1 hour' WHERE id = %s",
+            (installation["id"],),
+        )
+        conn.commit()
+
+    def racing_refresh(refresh_token, *, client=None):
+        # Another worker wins while this refresh is in flight.
+        with pool.connection() as other:
+            other.execute(
+                "UPDATE linear_installations "
+                "SET access_token = 'winner-access', "
+                "    refresh_token = 'winner-refresh', "
+                "    access_token_expires_at = now() + interval '1 hour' "
+                "WHERE id = %s",
+                (installation["id"],),
+            )
+            other.commit()
+        return fake_provider.next_tokens
+
+    fake_provider.refresh_tokens = racing_refresh
+
+    assert worker.ensure_access_token(installation["id"]) == "winner-access"
+
+    with pool.connection() as conn:
+        stored = conn.execute(
+            "SELECT * FROM linear_installations WHERE id = %s", (installation["id"],)
+        ).fetchone()
+        conn.commit()
+    assert stored["refresh_token"] == "winner-refresh"
+    assert stored["access_token"] == "winner-access"
+
+
+def test_a_token_inside_the_refresh_skew_is_refreshed_early(fake_provider):
+    """Proactive skew keeps the provider round trip off the ten second path."""
+    installation = install_active()
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE linear_installations SET access_token_expires_at = now() "
+            "+ make_interval(secs => %s) WHERE id = %s",
+            (worker.TOKEN_REFRESH_SKEW_SECONDS - 30, installation["id"]),
+        )
+        conn.commit()
+
+    assert worker.ensure_access_token(installation["id"]) == "rotated-access"
+    assert fake_provider.refreshes == ["stored-refresh"]
 
 
 def test_a_failed_refresh_releases_the_row_without_running_a_model(fake_provider):

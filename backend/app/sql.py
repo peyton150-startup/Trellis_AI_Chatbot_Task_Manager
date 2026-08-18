@@ -799,27 +799,38 @@ UPDATE linear_agent_inbox
 RETURNING *;
 """
 
-# The refresh lock. `FOR UPDATE` rather than a bare SELECT, because the decision
-# "is this token expired" and the act of replacing it must not be separable: two
-# workers that both read an expired token would both refresh, and Linear rotates
-# refresh tokens, so the loser would persist a value the provider has already
-# superseded.
-LOCK_ACTIVE_LINEAR_INSTALLATION = """
+SELECT_ACTIVE_LINEAR_INSTALLATION_BY_ID = """
 SELECT *
   FROM linear_installations
- WHERE status = 'active'
-   FOR UPDATE;
+ WHERE id = %(id)s
+   AND status = 'active';
 """
 
-# Rotation persistence. Linear issues a new refresh token on every refresh, so
-# the returned value replaces the stored one. COALESCE keeps the existing token
-# when a response carries none rather than nulling a credential that still works.
-UPDATE_LINEAR_INSTALLATION_TOKENS = """
+# Rotation persistence, compare-and-swap.
+#
+# `refresh_token = %(spent_refresh_token)s` is the whole mechanism, and it is
+# here rather than expressed as a `FOR UPDATE` lock for one reason: Linear
+# rotates refresh tokens, and the refresh itself is a network call. Holding a row
+# lock across that call pins a connection for the provider's full timeout, on the
+# path of an acknowledgement Linear expects within ten seconds.
+#
+# Guarding on the token that was actually spent gives the same safety without the
+# lock. Two workers that both refreshed produce two rotations; the first to reach
+# this statement matches and wins, and the second matches nothing, updates zero
+# rows, and learns from the empty result that it must re-read rather than
+# overwrite the winner's live credential. Last-write-wins would instead persist a
+# token the provider has already superseded.
+#
+# COALESCE keeps the existing refresh token when a response carries none, rather
+# than nulling a credential that still works.
+ROTATE_LINEAR_INSTALLATION_TOKENS = """
 UPDATE linear_installations
    SET access_token = %(access_token)s,
        refresh_token = COALESCE(%(refresh_token)s, refresh_token),
        access_token_expires_at = now() + make_interval(secs => %(expires_in)s),
        updated_at = now()
  WHERE id = %(id)s
+   AND status = 'active'
+   AND refresh_token = %(spent_refresh_token)s
 RETURNING *;
 """
