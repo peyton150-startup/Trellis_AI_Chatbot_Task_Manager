@@ -2283,3 +2283,25 @@ The following stages are recorded as follow-up ownership only. They are not part
 **Verification:** Before PR #54 merges, run `cd backend && python -m ruff check .`, the focused task-history tests, the model/profile tests, the deterministic non-network suite, and the D-71-specific CI job. Record the final observed counts in this entry or the PR description after the last code change. The pre-amendment local evidence was Ruff clean, 8 focused task-history tests passed, and 246 deterministic tests passed with 13 network tests deselected.
 
 **Limitations and review status:** PR #54 still cannot discover an unknown deleted task from title alone and cannot guarantee that a named current task beyond the bounded `list_tasks` result is resolvable. Those are discovery limitations, not failures of history persistence. The planned resolver owns that follow-up. Creation/deletion boundary snapshots, browser reload continuity, and conversation compaction are also deliberately deferred. D-71 does not authorize those changes. A final neutral review should evaluate the PR against this narrowed scope and the recorded verification evidence.
+
+## D-72: task-history boundary snapshots
+
+**Local role:** D-72 extends the existing read-only task-history
+projection with an optional typed `snapshot`. Creation entries expose
+their stored `after` task, deletion entries expose their stored `before`
+task, and ordinary updates remain field-diff only with no snapshot.
+
+**Whole-system role:** PostgreSQL already contains this memory. D-72
+changes only how that existing authoritative event state is projected
+to history consumers. It does not create a second history store or
+change how events are written.
+
+**Scope:** `TaskHistoryEntry`, `_history_entry()`, focused history tests,
+documentation, and the D-72 CI gate. No migration, SQL, resolver,
+endpoint, approval, browser-continuity, or persistence changes.
+
+**Verification:** focused Ruff passed. The combined history-tool and
+history-API suites reported 13 passed, including compact create/delete
+snapshots and the browser wire contract. The final deterministic backend
+suite reported 247 passed, 13 deselected. GitHub evidence is recorded
+after the branch is pushed.

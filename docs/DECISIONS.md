@@ -3197,3 +3197,30 @@ recorded audit events; the agent must not invent an original v1 snapshot.
 
 Deleted-task history is supported when the authoritative task id is known.
 Resolving an unknown deleted task from title alone remains out of scope.
+
+---
+## Task-memory follow-up recorded 2026-08-18
+
+### D-72: expose stored task-history boundary snapshots
+
+PR #54 deliberately deferred creation/deletion boundary snapshots.
+The user has now authorized that follow-up.
+
+`task_events` already stores the authoritative boundary state:
+creation stores the complete task in `after`, and deletion stores the
+complete task in `before`. No new persistence is required.
+
+The history projection therefore follows this contract:
+
+- created: `snapshot = after`, `changes = []`
+- updated: `snapshot = null`, existing field-level `changes`
+- deleted: `snapshot = before`, `changes = []`
+
+`TaskHistoryEntry.snapshot` is optional and typed as
+`TaskHistoryState`, a compact projection containing only title, notes,
+due date, priority, status, and blocker state. Raw authority/storage
+fields such as task id, owner id, and timestamps remain hidden.
+
+No migration, SQL change, event-writing change, resolver, new endpoint,
+approval change, browser-continuity change, or second memory store is
+authorized by D-72.

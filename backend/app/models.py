@@ -212,6 +212,15 @@ class TaskHistoryChange(TrellisModel):
     after: JsonValue | None = None
 
 
+class TaskHistoryState(TrellisModel):
+    title: TaskTitle
+    notes: str
+    due_date: date | None
+    priority: TaskPriority
+    status: TaskStatus
+    blocked_by: UUID | None
+
+
 class TaskHistoryEntry(TrellisModel):
     event_id: int
     operation: EventOperation
@@ -219,6 +228,7 @@ class TaskHistoryEntry(TrellisModel):
     occurred_at: datetime
     version_before: int | None = None
     version_after: int | None = None
+    snapshot: TaskHistoryState | None = None
     changes: list[TaskHistoryChange] = Field(default_factory=list)
 
 

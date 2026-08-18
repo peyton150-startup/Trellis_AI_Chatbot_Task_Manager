@@ -27,6 +27,15 @@ ACTOR_ID = UUID("00000000-0000-0000-0000-000000000001")
 OTHER_ACTOR_ID = UUID("00000000-0000-0000-0000-000000000002")
 MISSING_TASK_ID = UUID("00000000-0000-0000-0000-0000000000ff")
 
+HISTORY_STATE_FIELDS = {
+    "title",
+    "notes",
+    "due_date",
+    "priority",
+    "status",
+    "blocked_by",
+}
+
 
 @pytest.fixture
 def db():
@@ -343,6 +352,44 @@ def test_deleted_task_history_is_available_by_known_id(db):
 
     assert result["entries"][0]["effect"] == "deleted"
     assert result["entries"][-1]["effect"] == "created"
+
+
+def test_history_exposes_boundary_snapshots(db):
+    created = _create_task(db, ACTOR_ID, "Boundary original")
+    updated = _update_title(
+        db,
+        ACTOR_ID,
+        created.id,
+        created.version,
+        "Boundary edited",
+    )
+    _delete_task(db, ACTOR_ID, updated.id)
+
+    run_id = _insert_run(db)
+    result = tools.get_task_history(
+        _context(run_id, "history-boundary"),
+        GetTaskHistoryArgs(task_id=updated.id),
+    )
+
+    deleted, changed, created_entry = result["entries"]
+
+    assert deleted["effect"] == "deleted"
+    assert deleted["snapshot"] == updated.model_dump(mode="json", include=HISTORY_STATE_FIELDS)
+    assert deleted["changes"] == []
+
+    assert changed["effect"] == "updated"
+    assert changed["snapshot"] is None
+    assert changed["changes"] == [
+        {
+            "field": "title",
+            "before": "Boundary original",
+            "after": "Boundary edited",
+        }
+    ]
+
+    assert created_entry["effect"] == "created"
+    assert created_entry["snapshot"] == created.model_dump(mode="json", include=HISTORY_STATE_FIELDS)
+    assert created_entry["changes"] == []
 
 
 def test_history_tool_passes_keyset_pagination_through(db):
