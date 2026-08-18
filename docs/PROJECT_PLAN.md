@@ -263,6 +263,18 @@ current repository state
         |
         v
    DEMO FREEZE
+        |
+        v
+      T00W        (the one authorized exception, D-69)
+        |
+        v
+   T00W REVIEW  (immutable SHA, neutral, read-only)
+        |
+        v
+   LIVE DEPLOYMENT GATE  (OAuth install, signed webhook,
+        |                 Agent Activity, reboot survival)
+        v
+   DEMO FREEZE resumes
 ```
 
 T00L was scheduled after T25 by D-46. The user pulled it forward against the
@@ -282,6 +294,21 @@ timebox after T00L and its review. That is a budget cut, not a status change.
 After the review is green, planned implementation is frozen; a genuine
 demo-blocking defect can be fixed only through a new explicit user-authorized
 exception, which is not a route back into deferred roadmap work.
+
+**T00W is that exception, granted once on 2026-08-17 and recorded as D-69.** The
+demo requires operating Trellis from inside Linear, which the frozen build cannot
+do at all, so this is a demo-blocking gap rather than resumed roadmap work. T00W
+adds a conversation plane over OAuth and AgentSession webhooks. It creates and
+mutates no Linear issue, and `T26 -> T27 -> T28 -> T29` remains deferred in that
+order and undesigned. Its schedule cost is paid from the same remaining pre-demo
+implementation timebox, on the same terms: a budget cut, not a status change.
+
+T00W's completion has two gates rather than one. The deterministic gate is
+ordinary CI. The live gate needs credentials, an Ubuntu host, and a stable ngrok
+domain that CI does not have, so it is proven by hand and stays open until it is.
+Until then the status is `T00W IMPLEMENTATION COMPLETE / LIVE DEPLOYMENT GATE
+OPEN`, and the Definition of Done is not narrowed to whatever deterministic CI
+could reach on its own.
 
 ### Runtime decision and surprise-change drill
 

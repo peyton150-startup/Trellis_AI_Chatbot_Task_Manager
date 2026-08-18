@@ -3,6 +3,13 @@ name: trellis-ai-agent
 services:
   postgres:
     image: postgres:16
+    # T00W. The database survives a host reboot on its own, so nothing else has
+    # to own its lifecycle. In particular the backend service does not: a
+    # FastAPI unit that ran `docker compose up` as a start precondition would
+    # need access to the Docker control socket merely to check that a database
+    # is reachable, which is a large privilege for a small question. Deployment
+    # reconciles this container; the backend only probes readiness. See README.
+    restart: unless-stopped
     environment:
       POSTGRES_DB: trellis
       POSTGRES_USER: trellis
@@ -10,18 +17,36 @@ services:
       # D-60. Pins what was previously inherited from the image default. A
       # SQL_ASCII cluster fails five deterministic tests on bytes versus str.
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.utf8"
+    # T00W. Both loopback address families, and the pair is the point.
+    #
+    # The short form "55432:5432" publishes on every interface, which on a public
+    # host exposes PostgreSQL with the demo credentials above. Publishing IPv4
+    # loopback alone is not the fix either: `getaddrinfo("localhost")` returns
+    # ::1 first, so every DSN that says `localhost` tries IPv6, and against an
+    # IPv4-only publish that attempt times out rather than being refused.
+    # Measured here: the approval bridge suite went from 11 seconds and 7 passes
+    # to 137 seconds with 4 connection-pool timeouts, and a direct probe showed
+    # IPv6 TimeoutError beside IPv4 CONNECTED.
+    #
+    # Binding both loopback families keeps `localhost` working on its first
+    # attempt whichever family it resolves to, while no external interface
+    # carries the port. That avoids rewriting the DSN in 27 CI job definitions
+    # and avoids a deployment-only override.
     ports:
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
+      - "[::1]:55432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Applied in filename order by the image entrypoint on an empty volume,
-      # so 001 creates the business schema and 002 adds the T00L Linear
-      # boundary on top of it. An existing database is upgraded by executing
-      # 002_linear.sql against it explicitly; a second `docker compose up` is
-      # not an upgrade mechanism, because the entrypoint skips a populated
-      # volume entirely.
+      # so 001 creates the business schema, 002 adds the T00L Linear boundary on
+      # top of it, and 003 adds the T00W OAuth and AgentSession transport on top
+      # of that. An existing database is upgraded by executing the later
+      # migration against it explicitly; a second `docker compose up` is not an
+      # upgrade mechanism, because the entrypoint skips a populated volume
+      # entirely.
       - ./backend/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
       - ./backend/migrations/002_linear.sql:/docker-entrypoint-initdb.d/002_linear.sql:ro
+      - ./backend/migrations/003_linear_agent.sql:/docker-entrypoint-initdb.d/003_linear_agent.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U trellis -d trellis"]
       interval: 2s

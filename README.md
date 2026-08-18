@@ -550,6 +550,343 @@ PostgreSQL remains authoritative. Linear is an external projection and reconcili
 
 External SaaS state cannot participate in the same PostgreSQL transaction as the local domain, so the integration is designed around an explicit consistency boundary instead of pretending the two systems commit atomically.
 
+## T00W live deployment procedure
+
+T00W adds a native Linear agent over OAuth and AgentSession webhooks. See D-69
+and D-70. This section is the deployment path for the live gate, and it exists
+because the two most expensive failures here are not code defects.
+
+### Applying migration 003 to an existing database
+
+**`003_linear_agent.sql` will not apply itself on an existing deployment.** The
+PostgreSQL image runs `/docker-entrypoint-initdb.d` scripts only when it
+initializes an empty data directory, and skips them entirely when a database is
+already present. Neither of these applies it to a live server:
+
+```bash
+git pull && docker compose restart
+docker compose up -d
+```
+
+The migration is also not idempotent: it is plain `CREATE TYPE` and
+`CREATE TABLE`, so running it twice fails. Check first:
+
+```bash
+docker compose exec -T postgres psql -At -U trellis -d trellis -c "SELECT to_regclass('public.linear_installations');"
+```
+
+An empty result means it has not been applied. Apply it exactly once:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis < backend/migrations/003_linear_agent.sql
+```
+
+Then confirm all four transport tables exist: `linear_installations`,
+`linear_oauth_states`, `linear_agent_inbox`, `linear_agent_sessions`.
+
+> **Never run `docker compose down -v` against the live database.** The `-v`
+> removes the volume. That is not an upgrade path, it is deleting the demo.
+
+### Who owns what at runtime
+
+Four processes, four responsibilities, and no overlap:
+
+```text
+Docker         PostgreSQL lifecycle, via restart: unless-stopped
+deployment     reconciling tracked Compose configuration
+systemd        FastAPI lifecycle and readiness
+ngrok service  the public tunnel
+```
+
+**This deployment already has its own systemd and Compose layering, and it is
+not what the paragraphs above originally assumed.** Preflight on the Ubuntu host
+found `trellis-backend.service` depending on an existing
+`trellis-postgres.service`, which in turn uses a server-side override at
+`/etc/trellis/compose.server.yml`. **Do not create a second Postgres unit and do
+not add another override file.** Both mechanisms exist; adjust them rather than
+replacing them.
+
+The backend still must not control the Postgres container directly. A
+`trellis-backend` unit whose `ExecStartPre` ran `docker compose up` would need
+access to the Docker control socket merely to answer "is the database
+reachable", which is a large privilege for a small question, and it lets a
+backend restart mutate container configuration as a side effect. Here that
+concern is already handled by the existing unit ordering, so the remaining work
+is a readiness wait rather than a new service.
+
+**The server override is IPv4-only, and that interacts with a real trap.** It
+contains:
+
+```yaml
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:55432:5432"
+```
+
+`!override` replaces the tracked list entirely, so the dual-loopback publish in
+`docker-compose.yml` does **not** apply on this host: the effective binding is
+IPv4 loopback only. That is the exact configuration that cost 137 seconds and
+four connection-pool timeouts during local verification, because
+`getaddrinfo("localhost")` returns `::1` first and an IPv4-only publish makes
+that first attempt time out rather than be refused.
+
+So on this host, one of the following is required, and the second is preferred:
+
+```text
+DATABASE_URL uses 127.0.0.1, never localhost
+or
+the server override publishes both loopback families:
+  ports: !override
+    - "127.0.0.1:55432:5432"
+    - "[::1]:55432:5432"
+```
+
+Verify whichever is chosen with a direct probe of both families before trusting
+it, rather than inferring it from the file.
+
+**Two reconciliations are outstanding on the host.** The running container still
+carries the old public binding (`0.0.0.0` / `[::]`), so the override has never
+been applied to it, and the effective Postgres configuration currently has no
+`restart:` policy. Both are fixed by the same reconciling deployment step, and
+neither is fixed by a restart:
+
+```bash
+docker compose up -d --wait postgres
+```
+
+`compose up` recreates a service whose configuration changed, which is exactly
+what applies the loopback binding and `restart: unless-stopped`.
+`compose restart` restarts containers without re-reading the file and would
+leave both problems in place. This is why the database backup below comes first.
+
+After reconciling, confirm the effective state rather than assuming it:
+
+```bash
+docker compose -f docker-compose.yml -f /etc/trellis/compose.server.yml config
+docker inspect --format '{{json .HostConfig.PortBindings}}' "$(docker compose ps -q postgres)"
+docker version --format '{{.Server.Version}}'
+```
+
+Require exactly one `55432` mapping per address family, no `0.0.0.0` and no
+`:::`, `RestartPolicy` of `unless-stopped`, and a healthy container. Docker
+server versions before 28.0.0 carry a localhost-publishing caveat involving
+hosts on the same L2 segment; record the version during preflight.
+
+**Uvicorn already binds privately to `127.0.0.1:8000`, and ngrok is already
+installed and running as a systemd service forwarding to that port.** The
+remaining work there is configuration, not installation: add `--no-access-log`
+to the Uvicorn invocation so the callback query string stays out of the journal,
+and set `inspect: false` on the ngrok tunnel with cloud Full Capture left off.
+
+### The Linear worker is a second systemd unit, not part of the backend
+
+**`trellis-backend.service` runs Uvicorn and does not drain the Linear inbox.**
+The webhook route commits an inbox row and returns; a separate long-running
+process turns that row into a Trellis run and an Agent Activity. Without the
+unit below, Linear webhooks are accepted and acknowledged and then nothing ever
+happens, which is the most misleading failure this deployment can have because
+every HTTP response is a 200.
+
+It is deliberately not started from a FastAPI lifespan hook. Uvicorn's process
+count is a web-serving decision, and hanging a background loop off it would
+start one drain loop per worker process, silently multiplying model spend the
+day someone tunes `--workers`. A model turn also takes far longer than the five
+second budget the webhook answers within, so the two workloads want different
+restart and timeout behavior.
+
+So the runtime ownership table above gains one row:
+
+```text
+systemd  trellis-backend.service        FastAPI lifecycle and readiness
+systemd  trellis-linear-worker.service  draining the Linear AgentSession inbox
+```
+
+**Exactly one worker drains, and that is enforced rather than assumed.** On
+start the process takes a PostgreSQL session advisory lock. A second instance,
+whether from a duplicated unit or a stray manual run, logs that the lock is held
+and exits non-zero rather than blocking, so systemd reports it instead of the
+process looking healthy while draining nothing. The lock is session scoped, so a
+killed worker leaves nothing to clean up by hand.
+
+The claim SQL is already safe under concurrency, `FOR UPDATE SKIP LOCKED` plus
+the earlier-pending-row predicate, so competing workers would be correct and
+merely wasteful. The lock makes "one drains" observable instead of tolerable.
+
+Create `/etc/systemd/system/trellis-linear-worker.service`. Same virtualenv,
+same `WorkingDirectory`, and the same environment files as
+`trellis-backend.service`; read that unit first and copy its values rather than
+trusting the paths below, which are the defaults this repository assumes:
+
+```ini
+[Unit]
+Description=Trellis Linear AgentSession worker
+# The worker needs the database, and nothing else needs the worker.
+After=network-online.target trellis-postgres.service
+Wants=network-online.target
+Requires=trellis-postgres.service
+
+[Service]
+Type=simple
+User=trellis
+WorkingDirectory=/opt/trellis/backend
+EnvironmentFile=/etc/trellis/trellis.env
+ExecStart=/opt/trellis/.venv/bin/python -m app.linear_agent_worker
+Restart=always
+RestartSec=5
+# SIGTERM is what the worker installs a handler for. It finishes the turn in
+# flight and then exits, so a deploy does not kill a model call mid-run and
+# leave a claimed row with no recorded outcome. Comfortably longer than one
+# model turn plus the Linear round trip.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# The journal is the only sink. The worker never logs a token, a webhook body,
+# or a stored payload; durable errors are a fixed vocabulary plus a provider
+# operation and status.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install, enable, and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now trellis-linear-worker.service
+systemctl status trellis-linear-worker.service --no-pager
+```
+
+Confirm it is actually draining rather than merely running:
+
+```bash
+journalctl -u trellis-linear-worker.service -n 30 --no-pager
+```
+
+A healthy start logs `Trellis Linear worker started`. If it instead logs that
+another worker holds the single-instance lock and exits, a second copy is
+already running; find it before enabling anything else:
+
+```bash
+systemctl list-units 'trellis-*' --no-pager
+pgrep -af 'app.linear_agent_worker'
+```
+
+Prove the whole path end to end after enabling, because a green unit only says
+the loop is alive:
+
+```bash
+sudo -u postgres psql -d trellis -c "SELECT status, attempt_count, last_error, run_id FROM linear_agent_inbox ORDER BY received_at DESC LIMIT 5;"
+```
+
+A row that stays `pending` with `attempt_count` at 0 means the worker is not
+reaching the queue at all. A row that reaches `completed` with a `run_id` is the
+proof that Linear, PostgreSQL, the model, and the Agent Activity delivery are
+all connected.
+
+Restarting the backend does not restart the worker, and that separation is the
+point. Restart both after a deploy:
+
+```bash
+sudo systemctl restart trellis-backend.service trellis-linear-worker.service
+```
+
+### Deploy an exact commit, not a branch head
+
+T00W is not merged, so the usual `git pull --ff-only origin master` does not
+contain it. Deploy the immutable commit whose CI is green, and confirm the
+deployed `git rev-parse HEAD` equals it before restarting. Live-testing a
+moving branch head makes a failure unreproducible.
+
+### Keep the OAuth callback out of logs
+
+Linear returns the authorization `code` and `state` in the callback query
+string, and Uvicorn's access logger writes the path with its query string. For
+this deployment, run Uvicorn with `--no-access-log`, which leaves application
+and error logging intact. Set `inspect: false` on the ngrok tunnel and leave
+ngrok cloud Full Capture off. Do not rely on ngrok replay for the callback.
+
+The callback response is already generic and sends `no-store`, `no-referrer`,
+`nosniff`, and a deny-all CSP, and never echoes the code, state, or any token.
+
+### Configuration order
+
+`allowed_linear_user_id` is captured into the installation row at install time,
+so the authorized human must be known before the OAuth flow runs, not after.
+
+Obtain that UUID out of band. Using a temporary personal Linear credential
+outside this application, query the authenticated viewer, confirm the name and
+email are the intended person, keep only the returned id, and revoke the
+temporary credential. **No personal API key belongs in Trellis**, its
+environment, or CI; `LINEAR_API_KEY` remains prohibited and CI asserts it.
+
+Then set `LINEAR_ALLOWED_USER_ID`, `TRELLIS_PUBLIC_ORIGIN`, `LINEAR_CLIENT_ID`,
+`LINEAR_CLIENT_SECRET`, and `LINEAR_WEBHOOK_SECRET`, restart the backend, and
+only then begin a new installation with:
+
+```bash
+python -m app.linear_install
+```
+
+`TRELLIS_PUBLIC_ORIGIN` is validated at startup and must be a bare HTTPS origin
+with no path, query, fragment, or credentials. Both public URLs derive from it,
+so it is the only place the hostname is configured.
+
+### Linear application settings
+
+When ingress appears dead, check these before reading code: the app is private
+with the `authorization_code` grant and `actor=app`; the installer is a
+workspace admin; the exact callback and webhook URLs are registered; agent
+session events are enabled; the app is mentionable and assignable; the demo team
+is accessible to the agent; the client name does not contain the word `Linear`;
+and the installation is not pending workspace approval.
+
+### The retry-identity probe
+
+Linear documents the retry schedule but not which identifiers survive a retry.
+The unknown is whether one logical retry regenerates `webhookTimestamp`, the
+body, the signature, and the delivery id, or reuses them. Both dedupe identities
+depend on the answer.
+
+There is a trap in the timing. Linear's first retry is roughly a minute after
+failure, and the recommended freshness window is also roughly a minute. If
+Linear preserves the original signed timestamp, the retry will correctly fail
+the normal freshness check, and a probe that records metadata after that check
+would observe nothing at all.
+
+So the temporary instrumentation records **after HMAC verification and before
+the freshness check**:
+
+```text
+exact raw body -> verify HMAC
+  if valid: record probe metadata
+-> unchanged production freshness check
+-> unchanged production behavior
+```
+
+Record only `Linear-Delivery`, `webhookTimestamp`, `body_sha256`, a short
+signature fingerprint, `webhookId`, and the receive time. Never the raw body,
+the full signature, `promptContext`, or any credential.
+
+**Do not widen or bypass the production freshness rule for the probe**, and do
+not leave a second webhook path behind. The instrumentation and the deliberate
+pre-durable failure are temporary, uncommitted, and removed immediately
+afterwards, with `git status --short` clean before continuing.
+
+If one logical retry changes both the delivery id and the signed body hash, stop
+before the worker: the two committed dedupe identities would not be able to
+recognize a provider retry, and a semantic event identity is a design decision
+rather than something to improvise during a live test.
+
+### What the live gate proves, and what it does not
+
+Ingress alone proves the OAuth install, a real signed webhook, and a committed
+inbox row inside Linear's five-second budget. The AgentSession will appear
+unresponsive after about ten seconds, because the worker that emits Agent
+Activities does not exist yet. That is expected at this stage and must not be
+"fixed" by running the model or emitting an activity inside the webhook request.
+
 ## Deliberately not built
 
 The project is intentionally scoped. It is not trying to look production-grade by accumulating infrastructure that does not strengthen the interview thesis.

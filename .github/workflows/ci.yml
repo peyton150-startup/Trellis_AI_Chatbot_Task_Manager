@@ -214,24 +214,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Exact in both directions, and cumulative through T00L. The counts
-          # below are the T01 business schema plus exactly what
-          # 002_linear.sql adds: two tables, two enums, one index, one foreign
-          # key. Weakening this to "at least N" would let a stray table ship.
+          # Exact in both directions, and cumulative through T00W. The counts
+          # below are the T01 business schema, plus what 002_linear.sql adds
+          # (two tables, two enums, one index, one foreign key), plus what
+          # 003_linear_agent.sql adds (four tables, two enums, four indexes,
+          # two foreign keys, one check). Weakening this to "at least N" would
+          # let a stray table ship.
+          #
+          # Every value below was introspected from a real 001 -> 002 -> 003
+          # bootstrap rather than derived by hand, and the populated-upgrade
+          # path was separately confirmed to converge on the identical schema.
           tables="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
             "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public';"; } | tr -d '\r')"
-          test "$tables" = "agent_runs,approvals,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
+          test "$tables" = "agent_runs,approvals,linear_agent_inbox,linear_agent_sessions,linear_installations,linear_oauth_states,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
 
           counts="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
             "SELECT
               (SELECT count(*) FROM pg_tables WHERE schemaname = 'public'),
-              (SELECT count(*) FROM pg_type WHERE typname IN ('task_status','task_priority','run_status','event_op','lease_status','approval_state','linear_operation','linear_delivery')),
-              (SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('tasks_owner_idx','agent_runs_status_idx','task_events_run_idx','task_events_task_idx','linear_projections_pending_idx')),
-              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_blocked_by_fkey','task_events_run_id_fkey','tool_invocations_run_id_fkey','approvals_run_id_fkey','linear_projections_event_id_fkey')),
-              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_title_check','approvals_required_reason_check'));"; } | tr -d '\r')"
-          test "$counts" = "7|8|5|5|2"
+              (SELECT count(*) FROM pg_type WHERE typname IN ('task_status','task_priority','run_status','event_op','lease_status','approval_state','linear_operation','linear_delivery','linear_install_status','linear_inbox_status')),
+              (SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('tasks_owner_idx','agent_runs_status_idx','task_events_run_idx','task_events_task_idx','linear_projections_pending_idx','linear_installations_single_active_idx','linear_installations_identity_idx','linear_agent_inbox_claimable_idx','linear_agent_inbox_session_idx')),
+              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_blocked_by_fkey','task_events_run_id_fkey','tool_invocations_run_id_fkey','approvals_run_id_fkey','linear_projections_event_id_fkey','linear_agent_inbox_run_id_fkey','linear_agent_sessions_last_completed_run_id_fkey')),
+              (SELECT count(*) FROM pg_constraint WHERE conname IN ('tasks_title_check','approvals_required_reason_check','linear_agent_inbox_refusal_check'));"; } | tr -d '\r')"
+          test "$counts" = "11|10|9|7|3"
 
-          echo "PASS T01: seven tables, eight enums, five indexes, five foreign keys, and two checks"
+          echo "PASS T01: eleven tables, ten enums, nine indexes, seven foreign keys, and three checks"
 
       - name: Remove CI database resources
         if: always()
@@ -2234,6 +2240,11 @@ jobs:
           # widening this comment sanctions: by the owning task, and never to
           # make something green.
           paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
+          # T00W adds the two Linear ingress routes, which it owns under D-69.
+          # The same sanctioned widening: by the owning task, still exact in
+          # both directions. There is deliberately no /api/linear/install route,
+          # because an unauthenticated endpoint that mints OAuth state would let
+          # anyone start an installation flow against this deployment.
           expected = {
               "/api/tasks",
               "/api/runs",
@@ -2241,6 +2252,8 @@ jobs:
               "/api/runs/{run_id}/approvals/{tool_call_id}",
               "/api/demo/reset",
               "/api/agui",
+              "/api/linear/oauth/callback",
+              "/api/linear/webhook",
           }
           check(paths == expected, f"the route surface is {sorted(paths)}, expected {sorted(expected)}")
           check(
@@ -2586,9 +2599,11 @@ jobs:
           # on the same assertion in the T08 gate.
           paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
           # T12B adds the approvals decision route, which it owns under D-44.
+          # T00W adds the two Linear ingress routes, which it owns under D-69.
           expected_paths = {
               "/api/tasks", "/api/runs", "/api/runs/{run_id}", "/api/demo/reset",
-              "/api/agui", "/api/runs/{run_id}/approvals/{tool_call_id}"
+              "/api/agui", "/api/runs/{run_id}/approvals/{tool_call_id}",
+              "/api/linear/oauth/callback", "/api/linear/webhook",
           }
           check(paths == expected_paths, f"route surface is {sorted(paths)}")
 
@@ -4997,6 +5012,165 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  t00w-linear-webhook-bridge:
+    name: T00W Linear webhook bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      # The positive proof D-69 deferred until the implementation existed. This
+      # gate asserts what T00W DOES; the T00L gate asserts what nothing may do.
+      #
+      # Runs with no Linear credential, no network, and no live workspace. Every
+      # provider call is driven through httpx.MockTransport, and the webhook path
+      # makes no outbound call at all by design, so there is nothing here that a
+      # secret would enable. The empty environment values are the assertion: if
+      # any path silently required a credential, this step would fail rather than
+      # skip.
+      - name: Verify the provider boundary is credential-free and offline
+        working-directory: backend
+        env:
+          LINEAR_CLIENT_ID: ""
+          LINEAR_CLIENT_SECRET: ""
+          LINEAR_WEBHOOK_SECRET: ""
+          LINEAR_ALLOWED_USER_ID: ""
+          TRELLIS_PUBLIC_ORIGIN: ""
+        run: python -m pytest tests/test_linear_provider.py -q
+
+      - name: Start PostgreSQL and apply 001 then 002 then 003
+        run: docker compose up -d --wait
+
+      - name: Verify the T00W transport schema
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tables="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
+            "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'linear_%';"; } | tr -d '\r')"
+          test "$tables" = "linear_agent_inbox,linear_agent_sessions,linear_installations,linear_oauth_states,linear_projections,linear_task_state"
+
+          # The single ACTIVE installation rule is a database guarantee, so it is
+          # proven by making it fail rather than by reading the index definition.
+          docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis -c \
+            "INSERT INTO linear_installations (organization_id, oauth_client_id, app_user_id, allowed_linear_user_id, access_token, access_token_expires_at, granted_scopes) VALUES ('o','c','a','u','t', now() + interval '1 day', 's');"
+
+          if docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis -c \
+            "INSERT INTO linear_installations (organization_id, oauth_client_id, app_user_id, allowed_linear_user_id, access_token, access_token_expires_at, granted_scopes) VALUES ('o2','c2','a2','u2','t2', now() + interval '1 day', 's');" ; then
+            echo "FAIL: a second ACTIVE installation was accepted"
+            exit 1
+          fi
+
+          docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U trellis -d trellis -c \
+            "TRUNCATE linear_installations;"
+
+          echo "PASS: four transport tables, and one active installation enforced"
+
+      - name: Verify production reset cannot clear Linear transport state
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c "
+          from app import sql
+          transport = ('linear_installations', 'linear_oauth_states', 'linear_agent_inbox', 'linear_agent_sessions')
+          for table in transport:
+              assert table not in sql.TRUNCATE_ALL_STATE, f'production reset would clear {table}'
+              assert table in sql.TRUNCATE_ALL_TEST_STATE, f'deterministic cleanup misses {table}'
+          print('PASS: production reset stays Linear-unaware; deterministic cleanup does not')
+          "
+
+      - name: Verify the deterministic ingress and OAuth callback contract
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: python -m pytest tests/test_linear_ingress.py -q
+
+      # The worker, which is the half of T00W no ingress test can reach. Runs
+      # with the same empty Linear environment as the provider step above, and
+      # with no model credential either: every model invocation is a
+      # FunctionModel and every provider call is a fake, so a path that silently
+      # required NVIDIA, OpenAI, or a Linear credential fails here rather than
+      # skipping.
+      - name: Verify the deterministic AgentSession worker
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+          LINEAR_CLIENT_ID: ""
+          LINEAR_CLIENT_SECRET: ""
+          LINEAR_WEBHOOK_SECRET: ""
+          LINEAR_ALLOWED_USER_ID: ""
+          TRELLIS_PUBLIC_ORIGIN: ""
+          NVIDIA_API_KEY: ""
+        run: python -m pytest tests/test_linear_worker.py -q
+
+      # The worker is a separate process, so "does it start" is a real question
+      # that no unit test of its internals answers. Asserted structurally: the
+      # module must be runnable with -m, and the FastAPI application must not
+      # import it, because wiring the drain loop into a lifespan hook would
+      # start one loop per Uvicorn worker process.
+      - name: Verify the worker entry point exists and the web process does not start it
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -c "
+          import importlib.util
+          spec = importlib.util.find_spec('app.linear_agent_worker')
+          assert spec is not None, 'the worker module is not importable as app.linear_agent_worker'
+          from app import linear_agent_worker as w
+          assert callable(w.main) and callable(w.run_forever)
+          print('PASS: python -m app.linear_agent_worker has an entry point')
+          "
+
+          if grep -nE '^(from|import).*linear_agent_worker' app/main.py app/agent.py; then
+            echo "FAIL: the web application imports the worker"
+            echo "The worker is a separate systemd unit. Starting it from a FastAPI"
+            echo "lifespan hook would run one drain loop per Uvicorn worker process."
+            exit 1
+          fi
+          echo "PASS: the web process does not start the worker"
+
+      # The whole cumulative suite, because T00W touches main.py, sql.py, and
+      # config.py, and a route or statement change can break a gate that never
+      # mentions Linear.
+      - name: Verify the cumulative deterministic suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: python -m pytest -m "not network" -q
+
+      - name: Verify the webhook path cannot reach Linear
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Linear allows five seconds, and nothing on the ingress path needs a
+          # provider round trip. Asserted structurally rather than by timing: the
+          # ingress module must not import the provider boundary at all, so it
+          # cannot call Linear even by accident.
+          if grep -nE '^(from|import).*linear_agent_api' backend/app/linear_agent.py; then
+            echo "FAIL: the webhook boundary imports the provider client"
+            exit 1
+          fi
+          echo "PASS: ingress cannot reach Linear, because it cannot name it"
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
   t00l-linear-boundary:
     name: T00L Linear boundary
     runs-on: ubuntu-latest
@@ -5027,30 +5201,83 @@ jobs:
         run: npm ci
 
       # Runs before any database starts, because it needs none and fails fast.
-      # T00L must contain zero remote Linear behavior; the projector, the
-      # reconciler, the GraphQL client, and Linear-aware reset are T26 to T29.
       # A grep gate is crude, but the property it defends is exactly the kind a
       # green test suite cannot see: code that works offline today because the
       # network path is simply never exercised in CI.
-      - name: Verify T00L ships no remote Linear behavior
+      #
+      # Amended at T00W under D-69. The job name is a required status check and
+      # does not change. What changed is the shape of the assertion, in three
+      # ways, and each is deliberate.
+      #
+      # 1. It now names the four actual provider endpoints instead of matching
+      #    any string containing `linear.app`. The old pattern
+      #    `api\.linear\.app|linear\.app/graphql` had a hole, because Linear's
+      #    authorization endpoint is on `linear.app`, so a file could carry
+      #    `https://linear.app/oauth/authorize` straight through a gate that
+      #    advertised itself as exclusive. Banning the bare host instead would
+      #    be the opposite error: Agent Activity content legitimately contains
+      #    ordinary Linear links in Markdown, and what is being defended is
+      #    remote provider egress, not any mention of Linear.
+      #
+      # 2. Exactly one file may hold such a literal,
+      #    `backend/app/linear_agent_api.py`. Every other file failing this
+      #    check is the finding. The assertion does not require that file to
+      #    exist, which is what lets the D-69 re-plan commit stay green before
+      #    the provider module is written.
+      #
+      # 3. The issue mutations and `LINEAR_API_KEY` stay banned everywhere in
+      #    scope, including inside the provider boundary itself. The exemption
+      #    covers endpoint literals only. T00W talks to Linear; it does not
+      #    touch a Linear issue, and T26 through T29 still own that.
+      #
+      # The search stays scoped to backend/app/ and backend/migrations/ and must
+      # never be widened to the repository. `backend/tests/fixtures/linear_contract.json`
+      # contains `api.linear.app/graphql` and all four issue mutations as
+      # legitimate T00B evidence, and a well-meant widening would break that
+      # proof rather than strengthen this one.
+      - name: Verify no remote Linear behavior outside the authorized boundary
         shell: bash
         run: |
           set -euo pipefail
 
-          if grep -rniE 'api\.linear\.app|linear\.app/graphql|LINEAR_API_KEY|issueCreate|issueUpdate|issueArchive|issueUnarchive' \
+          PROVIDER_ENDPOINTS='https://linear\.app/oauth/authorize|https://api\.linear\.app/oauth/(token|revoke)|https://api\.linear\.app/graphql'
+          ALLOWED_BOUNDARY='backend/app/linear_agent_api.py'
+
+          # `|| true` because grep exits 1 on no matches, which is the expected
+          # state before T00W implementation lands and would otherwise trip
+          # `set -e` into reporting success as a failure.
+          # --exclude-dir and -I keep this on source rather than build output. A
+          # compiled .pyc embeds the string constants of the module it came from,
+          # so a __pycache__ left by any earlier step would report the boundary's
+          # own literals as an offender in a second file. The gate is ordered
+          # before anything imports the application today, but relying on step
+          # order for correctness is exactly the kind of accident this file is
+          # supposed to catch rather than depend on.
+          offenders="$(grep -rlIE --exclude-dir=__pycache__ "$PROVIDER_ENDPOINTS" backend/app/ backend/migrations/ 2>/dev/null | grep -vFx "$ALLOWED_BOUNDARY" || true)"
+          if [ -n "$offenders" ]; then
+            echo "FAIL: Linear provider endpoint found outside $ALLOWED_BOUNDARY"
+            echo "$offenders"
+            echo "Reaching Linear from any other module is a D-69 violation."
+            echo "Do not split, encode, or move the literal into configuration to evade this check."
+            exit 1
+          fi
+
+          if grep -rniIE --exclude-dir=__pycache__ 'LINEAR_API_KEY|issueCreate|issueUpdate|issueArchive|issueUnarchive' \
                backend/app/ backend/migrations/ ; then
-            echo "FAIL T00L: remote Linear behavior found in shipped application code"
+            echo "FAIL: Linear issue mutation or personal API key found in shipped application code"
+            echo "Issue projection is T26 through T29 and remains deferred."
             exit 1
           fi
 
           for forbidden in backend/app/linear.py backend/app/projector.py backend/app/reconciler.py; do
             if [ -f "$forbidden" ]; then
-              echo "FAIL T00L: $forbidden belongs to T26 through T29 and must not exist yet"
+              echo "FAIL: $forbidden belongs to T26 through T29 and must not exist yet"
               exit 1
             fi
           done
 
-          echo "PASS T00L: no Linear client, projector, reconciler, credential, or GraphQL mutation"
+          echo "PASS: no projector, reconciler, personal API key, or issue mutation,"
+          echo "PASS: and no provider endpoint outside $ALLOWED_BOUNDARY"
 
       # The production/test truncate split is load bearing and the two constants
       # differ by one table name, so a later edit could reconnect them without
@@ -5109,17 +5336,22 @@ jobs:
 
       # Path 1: fresh bootstrap. An empty volume, both migrations applied in
       # filename order by the image entrypoint.
-      - name: Start PostgreSQL from an empty volume and apply 001 then 002
+      - name: Start PostgreSQL from an empty volume and apply 001 then 002 then 003
         run: docker compose up -d --wait
 
-      - name: Verify the exact post-T00L schema and the deliberate absence of a task foreign key
+      - name: Verify the exact cumulative schema and the deliberate absence of a task foreign key
         shell: bash
         run: |
           set -euo pipefail
 
+          # Cumulative through T00W. The T00L assertions below are unchanged and
+          # unaffected by 003_linear_agent.sql, which adds transport tables and
+          # touches neither linear_task_state nor linear_projections. Only the
+          # whole-schema table list moves, because the compose file now mounts a
+          # third migration. See D-69.
           tables="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \
             "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public';"; } | tr -d '\r')"
-          test "$tables" = "agent_runs,approvals,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
+          test "$tables" = "agent_runs,approvals,linear_agent_inbox,linear_agent_sessions,linear_installations,linear_oauth_states,linear_projections,linear_task_state,task_events,tasks,tool_invocations"
 
           # The side table's exact shape, and the trigger that must exist.
           state_columns="$({ docker compose exec -T postgres psql -At -U trellis -d trellis -c \

@@ -774,24 +774,49 @@ No provider abstraction. There is one external system and it is Linear.
 `linear.py` is a client, not an interface with one implementation. `FakeTracker`
 exists for offline tests, not to suggest Jira could be dropped in.
 
-No webhooks. Polling with a reconciliation cursor is sufficient at demo scale.
-Webhooks are an event delivery design choice rather than an optimization, and
-they become worth it if low-latency inbound sync or dropping the cursor becomes
-a requirement. Neither is true here.
+**Three of the exclusions below were superseded by D-69 on 2026-08-17, and they
+are kept rather than deleted because each remains correct about the plane it was
+written for.** T00W adds a conversation plane: a native Linear agent reached over
+OAuth and AgentSession webhooks. The projection plane described by the rest of
+this document is unchanged, still polls, and still owns issue synchronization at
+T26 through T29. Read each exclusion below as a statement about issue
+projection, and read D-69 for what T00W adds beside it.
 
-No OAuth. A personal API key is sufficient for a single hardcoded actor. Note
-that Linear personal keys are user-scoped rather than team-scoped, so the demo
-team restriction is a policy check in our code and not an API guarantee. Say
-that out loud rather than implying the key is scoped.
+No webhooks, for projection. Polling with a reconciliation cursor is sufficient
+at demo scale. Webhooks are an event delivery design choice rather than an
+optimization, and they become worth it if low-latency inbound sync or dropping
+the cursor becomes a requirement. Neither is true for projection. Superseded in
+part by D-69: T00W receives inbound `AgentSessionEvent` webhooks, because a
+conversation cannot be polled for on a reconciliation cursor. Projection still
+does not use webhooks.
+
+No OAuth for issue projection, and no personal API key at all. This originally
+read that a personal API key was sufficient for a single hardcoded actor.
+D-69 supersedes that, and the direction is stricter rather than looser: T00W
+installs as an `actor=app` OAuth application and that installation becomes the
+one credential lifecycle. `LINEAR_API_KEY` stays prohibited, and T26 is expected
+to consume the T00W installation rather than introduce a second credential path.
+The original note still applies to why a key would have been the weaker choice:
+Linear personal keys are user-scoped rather than team-scoped, so any team
+restriction is a policy check in our code and not an API guarantee. Say that out
+loud rather than implying a credential is scoped. T00W says it out loud by
+binding one Linear human through `LINEAR_ALLOWED_USER_ID` and refusing everyone
+else, in application code, on structured provider identity rather than on prompt
+text.
 
 No bidirectional field sync. The reconciler flags and imports. It never merges.
 
-Not built as a Linear Agent. Linear's own agent platform installs an agent into
-a workspace as a member that replies in comment threads. Building there would
-mean losing the assistant-ui chat, the approval card and its diff preview, the
-Run Inspector, and the undo control, which are four of the ten acceptance
-criteria including two must-haves. A comment thread cannot show a diff preview
-or a deduplicated retry.
+Not built as a Linear Agent, for the primary demo surface. Linear's own agent
+platform installs an agent into a workspace as a member that replies in comment
+threads. Building there **instead** would mean losing the assistant-ui chat, the
+approval card and its diff preview, the Run Inspector, and the undo control,
+which are four of the ten acceptance criteria including two must-haves. A comment
+thread cannot show a diff preview or a deduplicated retry. Superseded in part by
+D-69: T00W builds a Linear agent **in addition to** the primary surface, not
+instead of it. That is why the reasoning above survives intact and why T00W
+exposes a deliberately reduced four-tool profile with no destructive or bulk
+capability. The approval-gated operations stay on the surface that can render an
+approval card, and the AG-UI path is unchanged.
 
 ---
 
@@ -806,7 +831,8 @@ remaining Linear expansion begins, so the delta ships as optional post-T25 work.
 |---|---|---|---|---|
 | T00B | Gate B: Linear API probe, completed after T06 | **OPUS ONLY** | `scripts/linear_probe.py`, `tests/fixtures/linear_contract.json`, `tests/test_contract.py`, `tests/fakes.py`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, BUILD_SPEC section 12 row, `CLAUDE.md` sources-of-truth line | Six facts recorded, fixture written, GATE B PASS |
 | T00L | Linear boundary retrofit, pulled forward under D-68 | **OPUS ONLY** | `migrations/002_linear.sql`, `docker-compose.yml`, `errors.py`, `policy.py`, `sql.py`, `undo.py`, `models.py`, `domain.py` documentation, `tests/test_invariants.py`, `tests/test_approval_bridge.py`, `tests/test_t17_continuity.py`, BUILD_SPEC sections 3, 4, 6, 11, `docs/ARCHITECTURE.md` parts 2 and 4, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, this file, `CLAUDE.md`, `.github/workflows/ci.yml`, `IMPLEMENTATION_NOTES.md` | Invariant suite passes at the fifteen D-29 concludes, both migration paths proven, no network |
-| T26 | Linear client and name to id resolution | SOL | `linear.py`, `config.py`, BUILD_SPEC section 10, `docs/ARCHITECTURE.md` part 5 | Enums build from the live workspace; `FakeTracker` satisfies the same contract |
+| T00W | Native Linear webhook and OAuth bridge, authorized under D-69 | **OPUS ONLY** | `migrations/003_linear_agent.sql`, `linear_agent_api.py`, `linear_agent.py`, `linear_agent_worker.py`, `linear_install.py`, `agent.py`, `runs.py`, `sql.py`, `models.py`, `config.py`, `main.py`, `docker-compose.yml`, `.env.example`, T00W tests, `docs/BUILD_SPEC.md`, `docs/DECISIONS.md`, `docs/PROJECT_PLAN.md`, `docs/ARCHITECTURE.md`, this file, `CLAUDE.md`, `.github/workflows/ci.yml`, `IMPLEMENTATION_NOTES.md`, `README.md` | Deterministic gate green, and separately the live gate: real OAuth install, signed AgentSessionEvent, visible Agent Activity, stable ngrok URLs, reboot survival |
+| T26 | Linear client and name to id resolution | SOL | `linear.py`, `config.py`, BUILD_SPEC section 10, `docs/ARCHITECTURE.md` part 5 | Enums build from the live workspace; `FakeTracker` satisfies the same contract. Consumes the T00W OAuth installation rather than a second credential, and reuses or explicitly supersedes `linear_agent_api.py` |
 | T27 | Projector worker | SOL | `projector.py`, `docs/ARCHITECTURE.md` part 8 | Outbox drains in order, serialized per task, remote id written back atomically with completion, unmapped updates completed without a remote call, retry with backoff |
 | T28 | Reconciler | SOL WRITES, OPUS REVIEWS | `reconciler.py`, `docs/ARCHITECTURE.md` parts 10 and 11 | External edit sets `diverged`; archived issues excluded; a pending projection does not cause divergence; an issue created in Linear imports |
 | T29 | Linear-aware reset | SOL | `seed.py`, `main.py`, `docs/ARCHITECTURE.md` part 6 | Reset fences the projector, archives the team, clears tombstones, and recreates eleven on both sides |

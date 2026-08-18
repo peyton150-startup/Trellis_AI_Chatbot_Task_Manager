@@ -508,9 +508,14 @@ RESTART IDENTITY CASCADE;
 # The split is proven rather than trusted to naming: the T00L gate asserts that
 # seed.reset uses TRUNCATE_ALL_STATE and that this statement is the one the
 # deterministic fixtures call.
+# T00W adds the four transport tables here and deliberately not above. Under
+# D-69 production reset must never revoke an OAuth installation or discard
+# accepted webhook work: resetting the demo board is a business operation, and
+# an operator who resets the board does not expect to reinstall the app.
 TRUNCATE_ALL_TEST_STATE = """
 TRUNCATE TABLE tasks, task_events, agent_runs, tool_invocations, approvals,
-               linear_task_state
+               linear_task_state, linear_installations, linear_oauth_states,
+               linear_agent_inbox, linear_agent_sessions
 RESTART IDENTITY CASCADE;
 """
 
@@ -535,5 +540,297 @@ UPDATE agent_runs
        error = %(error)s,
        ended_at = now()
  WHERE status = 'running'
+RETURNING *;
+"""
+
+
+# ---------------------------------------------------------------------------
+# T00W. OAuth installation and AgentSession transport. See D-69 and D-70.
+# ---------------------------------------------------------------------------
+
+INSERT_LINEAR_OAUTH_STATE = """
+INSERT INTO linear_oauth_states (state_hash, expires_at)
+VALUES (%(state_hash)s, now() + make_interval(secs => %(ttl_seconds)s))
+RETURNING *;
+"""
+
+# The whole single-use guarantee, in one statement.
+#
+# Matching, unexpired, and unconsumed are all predicates on the UPDATE rather
+# than checks a caller performs first. A SELECT that observed an unconsumed row
+# followed by an unguarded UPDATE is the check-then-act race that lets two
+# callbacks both consume one state, and the OAuth state exists precisely to make
+# a replayed callback fail. Zero rows back means refuse, and the caller cannot
+# learn which of the three reasons applied.
+CONSUME_LINEAR_OAUTH_STATE = """
+UPDATE linear_oauth_states
+   SET consumed_at = now()
+ WHERE state_hash = %(state_hash)s
+   AND expires_at > now()
+   AND consumed_at IS NULL
+RETURNING *;
+"""
+
+INSERT_LINEAR_INSTALLATION = """
+INSERT INTO linear_installations (
+  organization_id, oauth_client_id, app_user_id, allowed_linear_user_id,
+  access_token, refresh_token, access_token_expires_at, granted_scopes
+) VALUES (
+  %(organization_id)s, %(oauth_client_id)s, %(app_user_id)s,
+  %(allowed_linear_user_id)s, %(access_token)s, %(refresh_token)s,
+  now() + make_interval(secs => %(expires_in)s), %(granted_scopes)s
+)
+RETURNING *;
+"""
+
+SELECT_ACTIVE_LINEAR_INSTALLATION = """
+SELECT *
+  FROM linear_installations
+ WHERE status = 'active';
+"""
+
+# The installation binding an AgentSessionEvent must match. All three provider
+# identifiers together, because any one alone is insufficient: an organization
+# can install several apps, one OAuth client serves many organizations, and an
+# app user is only meaningful within its workspace.
+SELECT_LINEAR_INSTALLATION_FOR_EVENT = """
+SELECT *
+  FROM linear_installations
+ WHERE organization_id = %(organization_id)s
+   AND oauth_client_id = %(oauth_client_id)s
+   AND app_user_id = %(app_user_id)s
+   AND status = 'active';
+"""
+
+# Revocation, guarded by when the revocation actually happened.
+#
+# `created_at <= %(revocation_created_at)s` is the reinstall guard and it is the
+# reason this statement takes the provider's event time at all. Linear retries a
+# failed delivery for up to six hours, so a revocation of an installation that
+# has since been replaced can arrive after the replacement exists. Without the
+# predicate that replay would revoke the new installation and take the demo down
+# with a stale message.
+#
+# The event's own `createdAt` is used rather than `webhookTimestamp`, because
+# the first is when the revocation happened and the second is when this delivery
+# attempt was sent. A six hour old revocation redelivered now carries a fresh
+# delivery timestamp and would defeat the guard entirely.
+REVOKE_LINEAR_INSTALLATION = """
+UPDATE linear_installations
+   SET status = 'revoked',
+       updated_at = now()
+ WHERE organization_id = %(organization_id)s
+   AND oauth_client_id = %(oauth_client_id)s
+   AND status = 'active'
+   AND created_at <= %(revocation_created_at)s
+RETURNING *;
+"""
+
+# Durable ingress. `ON CONFLICT DO NOTHING` rather than catching a unique
+# violation, because a duplicate delivery is ordinary expected traffic and not
+# an exceptional condition. Catching `UniqueViolation` would also catch a
+# constraint the caller never reasoned about and report it as a duplicate.
+#
+# Zero rows back means one of the two dedupe identities already exists, and the
+# caller classifies which by reading them back. It never means the insert
+# failed for an unrelated reason: those still raise.
+INSERT_LINEAR_INBOX = """
+INSERT INTO linear_agent_inbox (
+  delivery_id, body_sha256, organization_id, agent_session_id, action,
+  payload, status, refusal_reason
+) VALUES (
+  %(delivery_id)s, %(body_sha256)s, %(organization_id)s, %(agent_session_id)s,
+  %(action)s, %(payload)s, %(status)s, %(refusal_reason)s
+)
+ON CONFLICT DO NOTHING
+RETURNING *;
+"""
+
+# Conflict classification. Read both identities separately so the caller can
+# tell an ordinary duplicate from the case where one identity matches one row
+# and the other matches a different row.
+SELECT_LINEAR_INBOX_BY_DELIVERY = """
+SELECT * FROM linear_agent_inbox WHERE delivery_id = %(delivery_id)s;
+"""
+
+SELECT_LINEAR_INBOX_BY_BODY = """
+SELECT * FROM linear_agent_inbox WHERE body_sha256 = %(body_sha256)s;
+"""
+
+
+# T00W worker dequeue.
+#
+# Correctness is in the predicate, not merely ORDER BY:
+#
+# * a row must itself be pending, due, and unleased/lease-expired;
+# * any earlier pending row for the same organization + AgentSession blocks it,
+#   even when that earlier row is leased or backing off via not_before;
+# * therefore prompt N+1 cannot overtake prompt N;
+# * another AgentSession remains independently claimable;
+# * FOR UPDATE SKIP LOCKED lets concurrent workers avoid waiting on the same
+#   candidate without weakening the per-session ordering predicate.
+#
+# The lease and attempt increment happen in the same statement that chooses the
+# row. There is no SELECT-then-UPDATE claim race.
+CLAIM_LINEAR_INBOX = """
+WITH candidate AS (
+    SELECT i.id
+      FROM linear_agent_inbox AS i
+     WHERE i.status = 'pending'
+       AND i.not_before <= now()
+       AND (i.claimed_until IS NULL OR i.claimed_until <= now())
+       AND NOT EXISTS (
+           SELECT 1
+             FROM linear_agent_inbox AS earlier
+            WHERE earlier.organization_id = i.organization_id
+              AND earlier.agent_session_id = i.agent_session_id
+              AND earlier.status = 'pending'
+              AND (earlier.received_at, earlier.id)
+                  < (i.received_at, i.id)
+       )
+     ORDER BY i.received_at, i.id
+     FOR UPDATE SKIP LOCKED
+     LIMIT 1
+)
+UPDATE linear_agent_inbox AS inbox
+   SET claimed_until = now() + (%(lease_seconds)s * interval '1 second'),
+       attempt_count = inbox.attempt_count + 1
+  FROM candidate
+ WHERE inbox.id = candidate.id
+RETURNING inbox.*;
+"""
+
+
+# ---------------------------------------------------------------------------
+# T00W worker. Session continuity, turn finalization, and token rotation.
+# ---------------------------------------------------------------------------
+
+# The per-AgentSession continuity cursor, created on demand.
+#
+# `ON CONFLICT ... DO UPDATE` rather than `DO NOTHING`, because `DO NOTHING`
+# returns no row on the second call and the caller needs the current cursor, not
+# an absence it would have to re-read in a second statement that could race.
+UPSERT_LINEAR_AGENT_SESSION = """
+INSERT INTO linear_agent_sessions (organization_id, agent_session_id)
+VALUES (%(organization_id)s, %(agent_session_id)s)
+ON CONFLICT (organization_id, agent_session_id)
+DO UPDATE SET updated_at = now()
+RETURNING *;
+"""
+
+SELECT_LINEAR_AGENT_SESSION = """
+SELECT *
+  FROM linear_agent_sessions
+ WHERE organization_id = %(organization_id)s
+   AND agent_session_id = %(agent_session_id)s;
+"""
+
+# The run this inbox row executed, recorded before the model is invoked.
+#
+# Written first so that a crash mid-turn leaves the link durable. The worker
+# treats a claimed row that already carries a run_id as a turn whose outcome it
+# cannot re-derive, and refuses to execute it a second time. That is the whole
+# duplicate-mutation defense, and it only works if this write precedes execution.
+SET_LINEAR_INBOX_RUN = """
+UPDATE linear_agent_inbox
+   SET run_id = %(run_id)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+# Terminal success for one turn. Half of an atomic pair; see the worker.
+COMPLETE_LINEAR_INBOX = """
+UPDATE linear_agent_inbox
+   SET status = 'completed',
+       claimed_until = NULL,
+       completed_at = now(),
+       run_id = %(run_id)s,
+       last_error = %(last_error)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+# The other half. Advances the continuity cursor to the run just completed.
+#
+# This statement and COMPLETE_LINEAR_INBOX run in one transaction and commit
+# together. A cursor advanced without the completion would replay the turn on a
+# successor it already influenced; a completion without the advance would drop
+# the conversation's history. Neither is acceptable, so neither is separable.
+ADVANCE_LINEAR_AGENT_SESSION = """
+INSERT INTO linear_agent_sessions (
+  organization_id, agent_session_id, last_completed_run_id
+) VALUES (
+  %(organization_id)s, %(agent_session_id)s, %(run_id)s
+)
+ON CONFLICT (organization_id, agent_session_id)
+DO UPDATE SET last_completed_run_id = EXCLUDED.last_completed_run_id,
+              updated_at = now()
+RETURNING *;
+"""
+
+# Transient release. The row stays pending, the lease is dropped, and not_before
+# moves forward so a hot loop cannot spin on a failing row.
+#
+# `run_id` is set back to NULL deliberately. The caller reaches this path only
+# after establishing that no mutation committed, which is what makes a second
+# execution safe; leaving the id set would make the duplicate-execution guard
+# refuse the retry this path exists to permit.
+RELEASE_LINEAR_INBOX = """
+UPDATE linear_agent_inbox
+   SET claimed_until = NULL,
+       run_id = NULL,
+       not_before = now() + make_interval(secs => %(backoff_seconds)s),
+       last_error = %(last_error)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+# Terminal local failure. Distinct from 'refused': refused is a permanent answer
+# reached at ingress about authorization, and failed is a turn that was accepted
+# and could not be completed. The CHECK constraint keeps refusal_reason NULL here.
+FAIL_LINEAR_INBOX = """
+UPDATE linear_agent_inbox
+   SET status = 'failed',
+       claimed_until = NULL,
+       completed_at = now(),
+       run_id = %(run_id)s,
+       last_error = %(last_error)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+SELECT_ACTIVE_LINEAR_INSTALLATION_BY_ID = """
+SELECT *
+  FROM linear_installations
+ WHERE id = %(id)s
+   AND status = 'active';
+"""
+
+# Rotation persistence, compare-and-swap.
+#
+# `refresh_token = %(spent_refresh_token)s` is the whole mechanism, and it is
+# here rather than expressed as a `FOR UPDATE` lock for one reason: Linear
+# rotates refresh tokens, and the refresh itself is a network call. Holding a row
+# lock across that call pins a connection for the provider's full timeout, on the
+# path of an acknowledgement Linear expects within ten seconds.
+#
+# Guarding on the token that was actually spent gives the same safety without the
+# lock. Two workers that both refreshed produce two rotations; the first to reach
+# this statement matches and wins, and the second matches nothing, updates zero
+# rows, and learns from the empty result that it must re-read rather than
+# overwrite the winner's live credential. Last-write-wins would instead persist a
+# token the provider has already superseded.
+#
+# COALESCE keeps the existing refresh token when a response carries none, rather
+# than nulling a credential that still works.
+ROTATE_LINEAR_INSTALLATION_TOKENS = """
+UPDATE linear_installations
+   SET access_token = %(access_token)s,
+       refresh_token = COALESCE(%(refresh_token)s, refresh_token),
+       access_token_expires_at = now() + make_interval(secs => %(expires_in)s),
+       updated_at = now()
+ WHERE id = %(id)s
+   AND status = 'active'
+   AND refresh_token = %(spent_refresh_token)s
 RETURNING *;
 """

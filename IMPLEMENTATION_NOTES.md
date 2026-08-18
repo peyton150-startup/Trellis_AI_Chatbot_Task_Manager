@@ -1973,3 +1973,269 @@ arrive by accretion.
 T00L modifies correctness-kernel files, so it requires a focused neutral,
 blind, read-only review at an immutable SHA, with the execution phase in a
 Vercel Sandbox. That review has not yet run.
+
+## T00W re-plan: authorizing the native Linear bridge
+
+**Local role:** This commit writes no provider code. It records D-69, reconciles
+the permanent contracts that forbade what T00W is now authorized to build, and
+amends the `T00L Linear boundary` CI gate so a single provider module can exist
+without the gate either failing or being weakened.
+
+**Whole-system role:** The demo requires operating Trellis from inside Linear,
+which the frozen post-T00L build cannot do at all. D-68 froze planned
+implementation and required an explicit exception for any later change; D-69 is
+that exception, granted once. It opens a conversation plane over OAuth and
+AgentSession webhooks and deliberately decides nothing about the projection
+plane. T26 through T29 remain deferred and undesigned.
+
+**Inputs and dependencies:** Post-T00L `master` at `b314017`, which includes the
+PostgreSQL readiness fix from PR #51. T00W's CI job starts PostgreSQL the same
+way every other database job does, so it inherits that fix and could not have
+been branched from `3120f8a`. The live Linear Developer Preview preflight ran
+before any edit and confirmed every provider assumption, including that
+`agentSession.creatorId` is nullable while `agentActivity.userId` is not, and
+that `AgentActivityCreateInput` accepts a caller-supplied UUID v4.
+
+**Outputs and consumers:** D-69; the amended T00L gate; `backend/app/linear_agent_api.py`
+authorized as the sole remote provider boundary; reconciled `CLAUDE.md`,
+`BUILD_SPEC.md`, `LINEAR_INTEGRATION.md`, `ARCHITECTURE.md`, and
+`PROJECT_PLAN.md`. The T00W implementation commits consume all of it, and T26 is
+directed to consume the OAuth installation rather than introduce a second
+credential.
+
+**Verification:** The amended gate was executed locally against this tree, in
+three states rather than one, because a gate that has only been seen passing has
+not been shown to work:
+
+```text
+current tree, no provider module        -> PASS
+planted offender outside the boundary   -> correctly FAILED, named the file
+same literal inside the boundary file   -> correctly exempted
+```
+
+The old pattern was also run against `https://linear.app/oauth/authorize` and
+confirmed not to match it, which is the hole D-69 describes rather than a claim
+taken on trust. The probe files were removed and `git status` confirmed clean
+before commit.
+
+**Limitations and review status:** This commit is documentation and CI contract
+only. No provider module, migration, route, worker, test, or agent profile
+exists yet, and the positive `T00W Linear webhook bridge` gate is deliberately
+absent so this commit stays green on its own; it lands with the implementation it
+proves. T00W ships in more than one commit, a narrow deviation from one task, one
+commit that D-69 records and that applies to T00W alone. The live deployment gate
+is untouched and open. Neither this commit nor the implementation that follows
+may be reported as `T00W COMPLETE`.
+
+## T00W: AgentSession worker
+
+**Local role:** `backend/app/linear_agent_worker.py` turns one claimed
+`linear_agent_inbox` row into one Trellis application run and one Linear Agent
+Activity. It owns prompt extraction from the stored authenticated payload,
+credential freshness, continuity resolution, direct invocation of the existing
+`agent.get_agent()` toolset, terminal persistence of history, usage, and run
+status, outbound delivery, and the finalization of the inbox row.
+
+**Whole-system role:** It is the second half of the D-69 conversation plane.
+Ingress proves a webhook is authentic and authorized and stops there, because
+Linear allows five seconds and a model turn does not fit inside it. This module
+is where a Linear message becomes real Trellis work while every existing trust
+boundary stays where it was: `runs.create_turn` still issues the run id,
+`runs.load_history` is still the only source of history, `policy.check` still
+governs every mutation, and the approval bridge still decides destructive work in
+Trellis rather than on the model's word. No transport-neutral execution core was
+introduced; the worker calls `Agent.run` directly, which is what proves the
+existing seam was already transport-independent.
+
+**Inputs and dependencies:** `linear_agent.claim_next_linear_inbox` for the
+per-AgentSession serialized lease; `linear_agent_api` for every remote call, via
+a `provider()` indirection so no second HTTP client exists; `linear_installations`
+for the authoritative ACTIVE installation and its rotating credential;
+`linear_agent_sessions.last_completed_run_id` for server-owned continuity;
+`agent.build_agent`'s tool bodies and `RunEffects`. The Linear profile is four
+tools, `agent.LINEAR_TOOLS`, not the six the browser gets.
+
+**Outputs and consumers:** `agent_runs` rows indistinguishable from AG-UI turns,
+so the browser sees Linear-originated work in the same history; an advanced
+session cursor; a completed, failed, or released inbox row carrying a durable
+machine-readable `last_error`; and one Agent Activity per turn.
+
+**Failure semantics, which are the point of the module:**
+
+```text
+before execution      terminal (_Terminal) or released with backoff (_Transient)
+mutation committed    terminal; never retried, run truth preserved
+no mutation           released, run link cleared, cursor untouched
+delivery failed       run stays completed, cursor advances, error recorded
+deferred request      terminal failure, no approval row, nothing auto-approved
+already has run_id    finalized from the run, never executed a second time
+```
+
+Trellis mutation success and Linear delivery success are separate facts and are
+recorded separately. A committed mutation followed by a failed
+`agentActivityCreate` is a completed run and a failed delivery, in that order.
+`inbox.run_id` is written before the model is invoked, which is what makes the
+duplicate-execution guard state rather than care.
+
+**Verification:**
+
+```powershell
+cd backend; ruff check .
+cd backend; python -m pytest tests/test_linear_worker.py -q
+cd backend; python -m pytest -m "not network" -q
+```
+
+Observed: ruff clean; `tests/test_linear_worker.py` 33 passed; the four Linear
+files together 153 passed; the cumulative deterministic suite 213 passed, 13
+deselected, against 180 selected before this change. `FunctionModel` drives every
+model invocation and a fake provider stands in for `linear_agent_api`, so the new
+CI step runs with `NVIDIA_API_KEY` and every Linear value empty. The gate is a new
+step inside the existing `T00W Linear webhook bridge` check, whose name is
+unchanged because branch protection already references it.
+
+**Superseded in part.** See the corrective entry below; the limitations
+paragraph that follows describes the first commit and is kept for the record.
+
+**Limitations and review status:** Three facts remain unresolved against the live
+provider. First, prompt location: Linear's documentation names
+`agentActivity.body` for a prompted event while the observed payload nests it
+under `agentActivity.content`; `extract_prompt` accepts both, content first, and
+is pure so a live payload corrects it without touching execution. Second, the
+`created` action's prompt is taken from `promptContext` and falls back to the
+originating comment, which is documented but not yet observed on a live payload.
+Third, resubmitting an AgentActivity UUID was measured live to return a GraphQL
+"conflict on insert" error, so no retry was added anywhere around delivery and
+the caller-owned id is treated as a duplicate detector rather than a replay
+token. Native approval continuation from inside Linear is deliberately out of
+scope: an approval-required turn writes the authoritative pending row through the
+existing bridge and elicits the human to decide in Trellis. The live deployment
+gate remains open, and T00W must not be reported as complete.
+
+## T00W: worker boundary corrections
+
+Corrective findings against `5a9537d`, applied as one commit. Not a redesign:
+the claim, run identity, cursor, and no-replay semantics are unchanged and their
+tests still pass unmodified.
+
+**1. Linear runs a four-tool profile.** The first commit invoked
+`agent.get_agent()`, so a Linear session inherited the whole browser product
+configuration including `delete_tasks` and `bulk_update_tasks`. Reusing
+`Agent.run` was the right call; reusing the AG-UI product configuration was a
+separate decision that was never made deliberately. `build_agent` now takes a
+`toolset`, defaulting to `ALL_TOOLS` so no existing caller changes, and
+`get_linear_agent()` registers `list_tasks`, `create_task`, `update_task`, and
+`propose_plan`. A tool outside the profile is not registered, so it is absent
+from the schema the model sees rather than refused after the fact.
+
+**2. The premature approval bridge is removed.** The first commit wrote a real
+approval row and emitted a Linear elicitation. That was half a bridge: a `select`
+elicitation returns an ordinary user `prompt` activity, which is a new message
+rather than Pydantic AI deferred-tool continuation data, so the card could never
+be decided from Linear. The worker now writes no approval row from this path at
+all. A deferred request fails the turn closed, which the four-tool profile makes
+unreachable anyway; the branch is kept so a later widening cannot land silently.
+T16's browser bridge is untouched.
+
+**3. A `stop` signal can never reach the model.** `activity_signal` is consulted
+before `extract_prompt`, and a stop halts with no model call, no tool, no run,
+and one closing `response` activity. **Known limitation, stated rather than
+papered over:** this stops a turn that has not started. It cannot cancel a turn
+already executing inside `Agent.run`, because Trellis has no cancellation channel
+into a running invocation, and per-session serialization means a stop queued
+behind a leased row waits rather than interrupting it. An unrecognized signal is
+refused the same way instead of falling through to the extractor.
+
+**4. The refresh no longer holds a row lock across the network call.** Inspected
+before changing: the first commit did take `FOR UPDATE` and then called Linear
+inside the same transaction, so the finding was real. The refresh now happens
+outside every transaction and the write back is compare-and-swap, guarded on the
+refresh token that was actually spent, so the loser of a race updates zero rows
+and re-reads the winner's token instead of persisting a superseded one.
+`TOKEN_REFRESH_SKEW_SECONDS` is 300, which keeps the provider round trip off the
+critical path of the ten second acknowledgement window Linear requires on a
+created session.
+
+**5. Prompt extraction is tightened.** For `prompted`: `content.type` must be
+`prompt`, then a non-empty `content.body`, then `agentActivity.body` as a
+documented-prose compatibility fallback, then fail closed. A non-prompt content
+type is refused rather than mined for a body. `promptContext` remains
+`created`-only.
+
+**Verification:** `ruff check .` clean; `pytest tests/test_linear_worker.py -q`
+45 passed; `pytest -m "not network" -q` 225 passed, 13 deselected, against 180
+selected before T00W's worker work began. The four-tool boundary is asserted
+against a constructed agent's registered tools rather than against the constant,
+and the absence of a held lock is proven by querying `pg_locks` from a second
+connection while the refresh is in flight.
+
+**Remaining unresolved live-provider facts:** the prompted body location
+(`content.body` observed, `agentActivity.body` documented, both accepted); the
+`created` payload's prompt location, documented but not yet observed; and
+AgentActivity resubmission, measured live as a conflict, which is why no retry
+exists anywhere around delivery. Cancellation of an in-flight turn is an
+acknowledged gap, not a solved problem. The live deployment gate remains open and
+T00W must not be reported as complete.
+
+## T00W: worker process startup
+
+**The blocker this closes.** At `b3f98ed` nothing started the worker. Grep
+proved it: no module in `backend/app/` imported `linear_agent_worker`, and
+`main.py` had no lifespan or startup hook. The webhook committed inbox rows and
+returned 200, and no process ever drained them. Every HTTP response looked
+healthy, which is what made it worth catching before merge rather than during
+the live gate.
+
+**Local role:** `python -m app.linear_agent_worker` is the process. `main()`
+installs SIGTERM and SIGINT handlers and calls `run_forever`, which takes a
+PostgreSQL session advisory lock, drains the inbox, sleeps
+`LINEAR_WORKER_POLL_SECONDS` when idle, and returns 0 on a clean stop or 1 when
+another worker already holds the lock.
+
+**Whole-system role:** it is the runtime half of the D-69 conversation plane.
+`trellis-backend.service` keeps its five second webhook budget and its web
+process model; the worker gets its own restart policy and a 90 second stop
+timeout sized for a model turn. A crash loop in one cannot take down the other.
+
+**Why not a FastAPI lifespan hook:** Uvicorn's process count is a web-serving
+decision, so a loop hung off startup would run once per worker process and
+multiply model spend silently the day someone tunes `--workers`. A CI step now
+fails if `main.py` or `agent.py` imports the worker at all, so the shortcut
+cannot be taken later by accident.
+
+**Single instance:** `pg_try_advisory_lock`, not `pg_advisory_lock`, so a second
+copy exits and says so instead of blocking while looking healthy to systemd.
+The lock is defense in depth rather than the correctness mechanism, since
+`CLAIM_LINEAR_INBOX` is already concurrency-safe; it makes "exactly one drains"
+observable. **One real bug was found by its own test:** `pool.connection()`
+returns the connection to the pool rather than closing it, so a session-scoped
+advisory lock outlived `run_forever` and a later borrower of that pooled
+connection would have refused to start. `run_forever` now releases the lock in a
+`finally`.
+
+**No migration.** Advisory locks need no schema, and no table or column changed.
+
+**Inputs and dependencies:** `settings.linear_worker_poll_seconds`, new and
+defaulting to 2; the existing pool; `process_next`.
+
+**Verification:**
+
+```powershell
+cd backend; ruff check .
+cd backend; python -m pytest tests/test_linear_worker.py -q
+cd backend; python -m pytest -m "not network" -q
+```
+
+Observed: ruff clean; worker module 52 passed; cumulative suite 232 passed, 13
+deselected. Seven of the new tests cover the process seam: the entry point
+exists, the web application does not import the worker, `main.py` has no
+lifespan or `@app.on_event` hook, two workers cannot both hold the lock, the
+lock is released when the connection goes away, a second worker exits non-zero
+with the queue untouched, the loop drains and stops cleanly on its event, and
+the loop survives an unexpected failure instead of dying on one bad row.
+
+**Limitations and review status:** the systemd unit lives in the README rather
+than as a tracked file, so installing it is an operator step and the paths must
+be copied from the real `trellis-backend.service` rather than trusted from the
+example. Nothing in CI can prove the unit is installed on the Ubuntu host; that
+belongs to the live deployment gate, which remains open. T00W must not be
+reported as complete until that gate passes.
