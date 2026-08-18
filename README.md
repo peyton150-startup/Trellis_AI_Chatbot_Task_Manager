@@ -29,7 +29,7 @@ A chatbot can produce convincing text while being wrong about what actually happ
 The important properties are:
 
 - **Server-owned state.** The browser and model do not decide what the current task list or conversation history is.
-- **Typed tools.** The model acts through six narrow Pydantic schemas instead of arbitrary code or free-form SQL.
+- **Typed tools.** The model acts through narrow Pydantic schemas selected by an explicit capability profile instead of arbitrary code or free-form SQL.
 - **Policy before mutation.** Actor scope, provenance, blast radius, and approval requirements are deterministic checks.
 - **Human control.** Destructive or high-blast-radius actions require a server-recorded approval.
 - **Retry safety.** Repeating the same tool call cannot silently perform the same mutation twice.
@@ -52,7 +52,7 @@ Instead:
 1. The browser sends the new user message to FastAPI over AG-UI.
 2. The server maps the request to a server-owned application run.
 3. Previous browser-supplied messages are not trusted as history. Canonical history comes from PostgreSQL.
-4. Pydantic AI gives the model that history plus six typed tools.
+4. Pydantic AI gives the model that history plus the typed tools exposed by the current capability profile.
 5. The model chooses a tool and proposes structured arguments.
 6. Deterministic code checks scope, safety, approvals, and retry state.
 7. If allowed, domain code mutates PostgreSQL and writes the audit event in the same transaction.
@@ -315,22 +315,38 @@ tool_invocations = whether a requested consequence may execute again
 approvals = whether a human-authorized consequence may proceed
 ```
 
-## The six tools
+## Tool capability profiles
 
-The model cannot run arbitrary application code. It receives six narrow tools:
+The model cannot run arbitrary application code. Trellis exposes narrow,
+typed tools through an explicit capability profile.
 
-| Tool | Purpose | Approval |
-|---|---|---|
-| `list_tasks` | Read tasks through typed filters | No |
-| `create_task` | Create one task | No |
-| `update_task` | Update one versioned task | No |
-| `bulk_update_tasks` | Update a bounded set of tasks | Required above the blast-radius threshold |
-| `delete_tasks` | Delete selected tasks | Always |
-| `propose_plan` | Return a plan for display without mutating domain state | No |
+The browser / AG-UI profile exposes seven tools. The Linear AgentSession
+profile exposes five: it includes the read-only history capability but
+continues to omit `bulk_update_tasks` and `delete_tasks`, whose execution can
+depend on the browser approval-continuation path.
 
-Schemas use explicit fields and enums. There is no arbitrary SQL tool and no free-form filter field.
+| Tool | Purpose | Browser / AG-UI | Linear | Approval |
+|---|---|---|---|---|
+| `list_tasks` | Read current tasks through typed filters | Yes | Yes | No |
+| `get_task_history` | Read recorded durable history for one task | Yes | Yes | No |
+| `create_task` | Create one task | Yes | Yes | No |
+| `update_task` | Update one versioned task | Yes | Yes | No |
+| `bulk_update_tasks` | Update a bounded set of tasks | Yes | No | Required above the blast-radius threshold |
+| `delete_tasks` | Delete selected tasks | Yes | No | Always |
+| `propose_plan` | Return a plan without mutating domain state | Yes | Yes | No |
 
-Narrow tools reduce the number of invalid things the model is capable of asking the application to do.
+`get_task_history` consumes the same actor-scoped `task_events` history
+projection used by the HTTP history endpoint. It does not create a second
+history store. It supports current tasks, deleted tasks when their
+authoritative id is known, pagination, and current seeded tasks that have no
+recorded audit events.
+
+Schemas use explicit fields and enums. There is no arbitrary SQL tool and no
+free-form task filter field.
+
+Narrow capability profiles reduce the number of invalid things the model is
+capable of asking the application to do while keeping transport-specific
+limitations truthful.
 
 ## Prompt provenance
 
@@ -794,10 +810,14 @@ sudo systemctl restart trellis-backend.service trellis-linear-worker.service
 
 ### Deploy an exact commit, not a branch head
 
-T00W is not merged, so the usual `git pull --ff-only origin master` does not
-contain it. Deploy the immutable commit whose CI is green, and confirm the
-deployed `git rev-parse HEAD` equals it before restarting. Live-testing a
-moving branch head makes a failure unreproducible.
+T00W is merged. The normal production update path may therefore fast-forward
+the deployed checkout from `origin/master`.
+
+The exact-SHA discipline still applies to release verification: record the
+green commit being deployed and confirm the deployed `git rev-parse HEAD`
+matches it before treating live behavior as evidence for that release. Do not
+live-test an unreviewed moving branch head and then attribute the result to a
+different commit.
 
 ### Keep the OAuth callback out of logs
 

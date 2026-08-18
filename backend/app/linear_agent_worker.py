@@ -12,7 +12,7 @@ prompt                   derived from the stored authenticated payload
 continuity               last_completed_run_id, server-owned
 run                      runs.create_turn, a fresh application run
 history                  runs.load_history, the single source
-model                    agent.get_linear_agent().run, four tools only
+model                    agent.get_linear_agent().run, five-tool safe profile
 persist                  history, usage, terminal status
 deliver                  one AgentActivity, caller-owned UUID
 finalize                 completion and cursor advance, one transaction
@@ -39,16 +39,18 @@ insert of AgentActivity". The caller-owned id is therefore a duplicate detector
 at the provider and not a replay token, and `linear_agent_api._request` issues
 exactly one attempt. Nothing here wraps that in a loop.
 
-**Linear runs a four-tool profile, and that is a capability boundary rather
-than a preference.** `agent.get_linear_agent()` registers `list_tasks`,
-`create_task`, `update_task`, and `propose_plan`. The two omitted tools,
-`delete_tasks` and `bulk_update_tasks`, are exactly the two that can require
-approval, and Linear has no channel that can decide one: a `select` elicitation
-returns an ordinary user `prompt` activity, which is a new message rather than a
+**Linear runs a five-tool safe profile, and that is a capability boundary
+rather than a preference.** `agent.get_linear_agent()` registers `list_tasks`,
+`get_task_history`, `create_task`, `update_task`, and `propose_plan`. The two
+omitted tools, `delete_tasks` and `bulk_update_tasks`, are exactly the two that
+can require approval. `get_task_history` is read-only and requires no approval,
+so D-71 safely exposes the same durable history projection from Linear. Linear
+still has no channel that can decide an approval: a `select` elicitation returns
+an ordinary user `prompt` activity, which is a new message rather than a
 resumption of an interrupted invocation. An approval card raised from here would
-be one no Linear answer could ever decide, so the capability is withheld instead
-of half-offered. T16's browser approval bridge is untouched, and native Linear
-approval continuation is work T00W does not attempt.
+be one no Linear answer could ever decide, so the destructive capabilities stay
+withheld. T16's browser approval bridge is untouched, and native Linear approval
+continuation is work T00W does not attempt.
 
 **A control signal never becomes a prompt.** `activity_signal` is consulted
 before `extract_prompt`, and a `stop` halts without a model call, without a

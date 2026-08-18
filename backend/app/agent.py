@@ -2,7 +2,7 @@
 
 Gate A already proved the transport and interrupt shapes on Day 1. This module
 does not re-answer that question. It wires the proven shape to the real agent,
-the real six tools, the real prompt boundary, the real `agent_runs` record, and
+the registered Trellis tools, the real prompt boundary, the real `agent_runs` record, and
 the real server-owned history, without letting the browser become an authority
 for any of them.
 
@@ -104,6 +104,7 @@ from .models import (
     BulkUpdateTasksArgs,
     CreateTaskArgs,
     DeleteTasksArgs,
+    GetTaskHistoryArgs,
     ListTasksArgs,
     ProposePlanArgs,
     RunStatus,
@@ -139,7 +140,7 @@ _APPROVAL_ARGS_MODELS = {
 ALL_TOOLS = frozenset(name.value for name in ToolName)
 
 # T00W. The profile a Linear AgentSession runs under, and it is deliberately
-# four tools rather than six.
+# five tools rather than the full browser profile.
 #
 # The two omitted tools are exactly the two that can require approval, and that
 # is the whole argument. Trellis decides destructive work through a human
@@ -161,6 +162,7 @@ ALL_TOOLS = frozenset(name.value for name in ToolName)
 LINEAR_TOOLS = frozenset(
     {
         ToolName.LIST_TASKS.value,
+        ToolName.GET_TASK_HISTORY.value,
         ToolName.CREATE_TASK.value,
         ToolName.UPDATE_TASK.value,
         ToolName.PROPOSE_PLAN.value,
@@ -258,9 +260,9 @@ def build_agent(
         output_type=[str, DeferredToolRequests],
     )
 
-    # The six tools from BUILD_SPEC section 10. Each wrapper does exactly one
-    # thing: translate `RunContext` into `ToolContext` and call the T10 body
-    # unchanged. No policy, idempotency, or domain decision is made here. The
+    # The registered Trellis tools. Each wrapper does exactly one thing:
+    # translate `RunContext` into `ToolContext` and call its deterministic tool
+    # body. No policy, idempotency, or domain decision is made here. The
     # model chooses which typed tool to request; deterministic code still decides
     # what is allowed and what commits.
     #
@@ -285,6 +287,14 @@ def build_agent(
     ) -> list[domain.TaskSnapshot]:
         """Read the user's tasks with typed status, date, priority, and limit filters."""
         return tools.list_tasks(_tool_context(ctx), arguments)
+
+    @_tool(ToolName.GET_TASK_HISTORY.value)
+    def get_task_history(
+        ctx: RunContext[TrellisDeps],
+        arguments: GetTaskHistoryArgs,
+    ) -> dict:
+        """Read one authoritative page of durable history for a task."""
+        return tools.get_task_history(_tool_context(ctx), arguments)
 
     @_tool(ToolName.CREATE_TASK.value)
     def create_task(

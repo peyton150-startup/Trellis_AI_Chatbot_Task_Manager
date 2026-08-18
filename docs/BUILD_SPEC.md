@@ -952,8 +952,76 @@ if settings.demo_unsafe_prompt_mode and settings.app_env != "demo":
 
 The name and the guard exist so that anyone reading the repository sees a deliberately disabled protection rather than an unexplained security bypass.
 
----
+### Post-T00W task-history capability amendment (D-71)
 
+The six-tool language above remains the historical T10 contract. D-71 is a
+narrow post-T00W capability amendment and does not rewrite what T10 originally
+implemented.
+
+Current capability profiles are:
+
+    browser / AG-UI
+      list_tasks
+      get_task_history
+      create_task
+      update_task
+      bulk_update_tasks
+      delete_tasks
+      propose_plan
+
+    Linear AgentSession
+      list_tasks
+      get_task_history
+      create_task
+      update_task
+      propose_plan
+
+`ALL_TOOLS` is derived from `ToolName`, so adding
+`GET_TASK_HISTORY = "get_task_history"` widens the full/browser profile to
+seven. `LINEAR_TOOLS` is an explicit safe profile and deliberately adds
+`get_task_history` while continuing to omit `bulk_update_tasks` and
+`delete_tasks`. `_APPROVAL_ARGS_MODELS` remains unchanged.
+
+The argument contract is `task_id: UUID`, `limit` defaulting to 20 and bounded
+from 1 through 50, and optional positive `before_event_id`.
+
+`domain.read_task_history()` remains the sole history authority. The tool adds
+no migration, SQL statement, history table, endpoint, frontend history path, or
+historical title-search subsystem.
+
+History authorization is intentionally different from ordinary live-task
+scope. `get_task_history` passes `target_ids=[]` and `blast_radius_count=0`
+through the ordinary read-only policy pipeline because deleted-task ownership
+evidence survives in actor-scoped `task_events`, while
+`policy.resolve_scope()` understands current task rows.
+
+A fresh request performs a bounded pre-lease `domain.read_task_history()` probe.
+Foreign and nonexistent task ids therefore raise the same `OUT_OF_SCOPE`
+before any invocation lease exists. The probe value is discarded. After
+`idempotency.acquire()` grants `EXECUTE`, the tool reads the history page again
+and stores only that post-lease result as the completed invocation. A completed
+identical call replays its stored page; the same call id with different
+arguments remains an idempotency conflict.
+
+History is read-only: it writes zero task events, creates no approval row, and
+never sets `mutation_committed`.
+
+The domain/tool boundary returns newest-first keyset pages. When a user asks
+for complete history, the prompt follows `next_before_event_id` until null and
+then presents the collected events oldest to newest unless another order was
+requested.
+
+A current task with no recorded events is reported as exactly that. The model
+must not fabricate a v1 audit snapshot from current state. Deleted history is
+available when the authoritative task id is known; historical title search
+remains out of scope.
+
+Focused deterministic coverage lives in
+`backend/tests/test_task_history_tool.py` and proves current history, replay,
+argument-hash conflict, foreign/missing no-lease refusal, known-id deleted
+history, keyset pagination, and the current/no-events case.
+
+---
 ## 11. Tests
 
 ### `tests/test_invariants.py`: fifteen tests, no LLM, must pass 100%

@@ -3361,6 +3361,7 @@ jobs:
 
           tool_names = (
               "list_tasks",
+              "get_task_history",
               "create_task",
               "update_task",
               "bulk_update_tasks",
@@ -5542,6 +5543,101 @@ jobs:
       - name: Build production frontend
         working-directory: frontend
         run: npm run build
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  d71-task-history-agent:
+    name: D71 task history agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migrations
+        run: docker compose up -d --wait
+
+      - name: Verify D-71 task history mechanics and capability profiles
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check \
+            app/prompts.py \
+            tests/test_task_history_tool.py \
+            tests/test_models.py \
+            tests/test_linear_worker.py
+
+          python -m pytest tests/test_task_history_tool.py -q
+
+          python -m pytest \
+            tests/test_models.py::test_get_task_history_arguments_match_history_contract \
+            tests/test_models.py::test_list_tasks_enforces_limit_bounds \
+            -q
+
+          python -m pytest \
+            tests/test_linear_worker.py::test_the_linear_profile_is_exactly_five_tools \
+            tests/test_linear_worker.py::test_the_browser_profile_carries_all_seven_tools \
+            -q
+
+      - name: Verify D-71 model-facing history navigation contract
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from app.prompts import SYSTEM_PROMPT
+
+          prompt = " ".join(SYSTEM_PROMPT.split()).lower()
+
+          required = (
+              "reuse authoritative task ids already present in canonical trellis history",
+              "reuse that id directly with get_task_history",
+              "do not call list_tasks merely to rediscover",
+              "server-side actor scope remains authoritative",
+              "a task absent from a bounded list_tasks result is not proof",
+              "request limit=50",
+              "until next_before_event_id is null",
+              "combine all returned pages",
+              "oldest to newest",
+              "do not reconstruct a v1 snapshot",
+              "history is read-only",
+          )
+
+          missing = [fragment for fragment in required if fragment not in prompt]
+
+          if missing:
+              raise SystemExit(
+                  "D-71 history navigation contract is incomplete:\n- "
+                  + "\n- ".join(missing)
+              )
+
+          print("PASS D-71 model-facing history navigation contract")
+          PY
+
+      # This gate proves the deterministic application contract: the tool,
+      # schemas, capability profiles, and prompt instructions support D-71.
+      # It deliberately does not claim that any particular LLM will always
+      # choose the optimal tool path; model compliance belongs to eval/demo
+      # testing rather than deterministic CI.
+      - name: Report D-71 deterministic boundary
+        run: |
+          echo "PASS D71: task history mechanics, argument bounds,"
+          echo "PASS D71: browser/Linear capability profiles,"
+          echo "PASS D71: and model-facing navigation instructions are pinned"
 
       - name: Remove CI database resources
         if: always()

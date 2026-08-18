@@ -759,7 +759,7 @@ def test_a_failed_turn_does_not_advance_the_session_cursor(fake_provider):
 # ------------------------------------------------------------------ approvals
 
 
-def test_the_linear_profile_is_exactly_four_tools():
+def test_the_linear_profile_is_exactly_five_tools():
     """The capability boundary, asserted on the built agent rather than a list.
 
     `LINEAR_TOOLS` is a constant and a constant proves nothing about what was
@@ -772,17 +772,19 @@ def test_the_linear_profile_is_exactly_four_tools():
     )
     assert _registered(linear) == {
         "list_tasks",
+        "get_task_history",
         "create_task",
         "update_task",
         "propose_plan",
     }
 
 
-def test_the_browser_profile_still_carries_all_six_tools():
-    """The default is unchanged, so T16 and the AG-UI transport are untouched."""
+def test_the_browser_profile_carries_all_seven_tools():
+    """History is additive; every existing browser capability remains present."""
     full = agent_module.build_agent(FunctionModel(_silent, model_name="t00w-profile"))
     assert _registered(full) == {
         "list_tasks",
+        "get_task_history",
         "create_task",
         "update_task",
         "bulk_update_tasks",
