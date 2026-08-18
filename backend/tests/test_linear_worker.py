@@ -19,6 +19,9 @@ credentials           rotation persists, and no secret reaches a durable error
 
 import json
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -1177,3 +1180,157 @@ def test_the_worker_source_holds_no_provider_endpoint_and_no_retry_loop():
     assert "api.linear.app" not in source
     assert "linear.app/oauth" not in source
     assert "httpx" not in source
+
+
+# --------------------------------------------------------- the process seam
+
+
+def test_the_worker_is_not_started_by_importing_the_application():
+    """The web process must not grow a background worker by accident.
+
+    `main.py` has no lifespan or startup hook, and nothing in the application
+    package imports the worker. Asserted rather than assumed, because wiring the
+    loop into FastAPI would start one drain loop per Uvicorn process and the
+    breakage would be silent: the queue would still drain, just several times
+    over.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    importers = [
+        path.name
+        for path in app_dir.glob("*.py")
+        if path.name != "linear_agent_worker.py"
+        and "linear_agent_worker" in path.read_text(encoding="utf-8")
+        and "import" in path.read_text(encoding="utf-8")
+    ]
+    # linear_agent_api.py names the module in prose only. An actual import
+    # statement is what matters.
+    for name in importers:
+        source = (app_dir / name).read_text(encoding="utf-8")
+        assert "import linear_agent_worker" not in source, name
+        assert "from .linear_agent_worker" not in source, name
+        assert "from app.linear_agent_worker" not in source, name
+
+    main_source = (app_dir / "main.py").read_text(encoding="utf-8")
+    assert "lifespan" not in main_source
+    # Anchored on the decorator. A bare "on_event" also matches the middle of
+    # `accept_agent_session_event`, which would make this pass for the wrong
+    # reason today and fail confusingly later.
+    assert "@app.on_event" not in main_source
+    assert "add_event_handler" not in main_source
+
+
+def test_the_module_exposes_a_process_entry_point():
+    """`python -m app.linear_agent_worker` is what the systemd unit runs."""
+    assert callable(worker.main)
+    assert callable(worker.run_forever)
+    source = (
+        Path(__file__).resolve().parents[1] / "app" / "linear_agent_worker.py"
+    ).read_text(encoding="utf-8")
+    assert 'if __name__ == "__main__":' in source
+
+
+def test_only_one_worker_can_hold_the_single_instance_lock():
+    """Two connections, one lock. The second is refused rather than blocked."""
+    with pool.connection() as first:
+        assert worker.acquire_single_instance_lock(first) is True
+        with pool.connection() as second:
+            assert worker.acquire_single_instance_lock(second) is False
+            second.execute(
+                "SELECT pg_advisory_unlock(%s);", (worker.WORKER_ADVISORY_LOCK_KEY,)
+            )
+            second.commit()
+        first.execute(
+            "SELECT pg_advisory_unlock(%s);", (worker.WORKER_ADVISORY_LOCK_KEY,)
+        )
+        first.commit()
+
+
+def test_the_lock_is_released_when_the_connection_goes_away():
+    """Session scoped, so a killed worker leaves no lock to clear by hand."""
+    with pool.connection() as first:
+        assert worker.acquire_single_instance_lock(first) is True
+        first.execute(
+            "SELECT pg_advisory_unlock(%s);", (worker.WORKER_ADVISORY_LOCK_KEY,)
+        )
+        first.commit()
+
+    with pool.connection() as later:
+        assert worker.acquire_single_instance_lock(later) is True
+        later.execute(
+            "SELECT pg_advisory_unlock(%s);", (worker.WORKER_ADVISORY_LOCK_KEY,)
+        )
+        later.commit()
+
+
+def test_a_second_worker_exits_nonzero_instead_of_draining(fake_provider):
+    """The duplicated-unit case, proven by the queue still being full."""
+    install_active()
+    row = insert_inbox(prompted_payload())
+
+    with pool.connection() as holder:
+        assert worker.acquire_single_instance_lock(holder) is True
+        try:
+            status = worker.run_forever(
+                poll_seconds=0, stop=threading.Event(), agent=text_agent()
+            )
+        finally:
+            holder.execute(
+                "SELECT pg_advisory_unlock(%s);", (worker.WORKER_ADVISORY_LOCK_KEY,)
+            )
+            holder.commit()
+
+    assert status == 1
+    assert inbox_row(row["id"])["status"] == "pending"
+    assert fake_provider.activities == []
+
+
+def test_the_loop_drains_the_queue_and_stops_when_asked(fake_provider):
+    """One turn, then a clean exit on the stop event rather than a kill."""
+    install_active()
+    row = insert_inbox(prompted_payload())
+
+    stop = threading.Event()
+
+    def drain():
+        return worker.run_forever(poll_seconds=0.01, stop=stop, agent=text_agent())
+
+    with ThreadPoolExecutor(max_workers=1) as pool_of_one:
+        future = pool_of_one.submit(drain)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if inbox_row(row["id"])["status"] == "completed":
+                break
+            time.sleep(0.05)
+        stop.set()
+        assert future.result(timeout=30) == 0
+
+    assert inbox_row(row["id"])["status"] == "completed"
+    assert session_row()["last_completed_run_id"] is not None
+
+
+def test_the_loop_survives_an_unexpected_failure(fake_provider, monkeypatch):
+    """A worker that dies on one bad row stops draining every later one."""
+    install_active()
+    calls = {"n": 0}
+
+    def exploding(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("something nobody predicted")
+
+    monkeypatch.setattr(worker, "process_next", exploding)
+
+    stop = threading.Event()
+
+    def drain():
+        return worker.run_forever(poll_seconds=0.01, stop=stop)
+
+    with ThreadPoolExecutor(max_workers=1) as pool_of_one:
+        future = pool_of_one.submit(drain)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and calls["n"] < 3:
+            time.sleep(0.05)
+        stop.set()
+        assert future.result(timeout=30) == 0
+
+    # It kept going rather than dying on the first one.
+    assert calls["n"] >= 3

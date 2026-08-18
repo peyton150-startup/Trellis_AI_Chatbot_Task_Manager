@@ -5115,6 +5115,34 @@ jobs:
           NVIDIA_API_KEY: ""
         run: python -m pytest tests/test_linear_worker.py -q
 
+      # The worker is a separate process, so "does it start" is a real question
+      # that no unit test of its internals answers. Asserted structurally: the
+      # module must be runnable with -m, and the FastAPI application must not
+      # import it, because wiring the drain loop into a lifespan hook would
+      # start one loop per Uvicorn worker process.
+      - name: Verify the worker entry point exists and the web process does not start it
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -c "
+          import importlib.util
+          spec = importlib.util.find_spec('app.linear_agent_worker')
+          assert spec is not None, 'the worker module is not importable as app.linear_agent_worker'
+          from app import linear_agent_worker as w
+          assert callable(w.main) and callable(w.run_forever)
+          print('PASS: python -m app.linear_agent_worker has an entry point')
+          "
+
+          if grep -nE '^(from|import).*linear_agent_worker' app/main.py app/agent.py; then
+            echo "FAIL: the web application imports the worker"
+            echo "The worker is a separate systemd unit. Starting it from a FastAPI"
+            echo "lifespan hook would run one drain loop per Uvicorn worker process."
+            exit 1
+          fi
+          echo "PASS: the web process does not start the worker"
+
       # The whole cumulative suite, because T00W touches main.py, sql.py, and
       # config.py, and a route or statement change can break a gate that never
       # mentions Linear.

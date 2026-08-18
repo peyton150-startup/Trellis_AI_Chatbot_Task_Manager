@@ -77,6 +77,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import signal
+import sys
+import threading
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -118,6 +122,12 @@ ERROR_STOPPED = "stopped_by_user_signal"
 # refresh performed at the moment of expiry puts a provider round trip on that
 # critical path. See `ensure_access_token`.
 TOKEN_REFRESH_SKEW_SECONDS = 300
+
+# The single-instance advisory lock key. An arbitrary but fixed 64 bit constant:
+# PostgreSQL advisory locks are keyed by number, not by name, so the value only
+# has to be stable and not collide with another advisory lock in this database.
+# Nothing else in this build takes one.
+WORKER_ADVISORY_LOCK_KEY = 7700_2026_0818
 
 # The signal Linear sends when a human stops the agent. Handled before anything
 # else, and never as prompt text. See `_handle_signal`.
@@ -779,3 +789,139 @@ def _handle_execution_failure(
         last_error=ERROR_MODEL_FAILED,
     )
     return {"outcome": OUTCOME_RELEASED, "row_id": row_id, "error": ERROR_MODEL_FAILED}
+
+
+# ------------------------------------------------------------- process entry
+
+log = logging.getLogger("trellis.linear_worker")
+
+
+def acquire_single_instance_lock(conn) -> bool:
+    """Take the process-wide worker lock on `conn`, or report that it is held.
+
+    `pg_try_advisory_lock` rather than `pg_advisory_lock`, because a second
+    worker should exit and say so rather than block forever looking healthy to
+    systemd while draining nothing.
+
+    The lock is session scoped, so it is held for exactly as long as `conn`
+    stays checked out and is released automatically if the process dies. That is
+    the property a lock file does not have: a killed worker leaves no stale lock
+    to clear by hand before the service will start again.
+
+    **This is defense in depth, not the correctness mechanism.** `CLAIM_LINEAR_INBOX`
+    is already safe under concurrency: `FOR UPDATE SKIP LOCKED` plus the
+    earlier-pending-row predicate means two workers cannot take the same row and
+    cannot reorder one session's turns. Competing workers would be correct and
+    merely wasteful. This makes "exactly one drains" observable instead of
+    merely tolerable, so a duplicated systemd unit or a stray manual run is
+    reported at startup rather than discovered later in the model bill.
+    """
+    held = conn.execute(
+        "SELECT pg_try_advisory_lock(%(key)s) AS held;",
+        {"key": WORKER_ADVISORY_LOCK_KEY},
+    ).fetchone()["held"]
+    conn.commit()
+    return bool(held)
+
+
+def run_forever(
+    *,
+    poll_seconds: float | None = None,
+    stop: threading.Event | None = None,
+    agent=None,
+) -> int:
+    """Drain the inbox until asked to stop. The production loop.
+
+    Returns a process exit status: 0 for a clean shutdown, 1 if another worker
+    already holds the single-instance lock.
+
+    `stop` is an `Event` rather than a boolean flag so the idle wait is
+    interruptible. A loop that slept through its shutdown signal would make
+    every deploy wait the full poll interval, and systemd would eventually
+    escalate to SIGKILL mid-turn, which is exactly the crash the ambiguous-turn
+    guard exists to survive rather than something to cause on purpose.
+
+    Shutdown is checked between rows, never inside one. A turn that has started
+    runs to its finalization, so the loop never leaves a claimed row leased with
+    its outcome unrecorded when it can avoid it.
+    """
+    interval = (
+        settings.linear_worker_poll_seconds if poll_seconds is None else poll_seconds
+    )
+    stopping = stop if stop is not None else threading.Event()
+
+    with pool.connection() as lock_conn:
+        if not acquire_single_instance_lock(lock_conn):
+            log.error(
+                "another Trellis Linear worker already holds the single-instance "
+                "lock; exiting without draining"
+            )
+            return 1
+
+        try:
+            log.info("Trellis Linear worker started, poll interval %ss", interval)
+            return _drain_until_stopped(stopping, interval, agent)
+        finally:
+            # Explicit, and not merely tidiness. The lock is scoped to the
+            # database session, and `pool.connection()` returns the connection
+            # to the pool rather than closing it, so the session outlives this
+            # block and would carry the lock with it. A later caller borrowing
+            # that same pooled connection would find the worker lock already
+            # held by itself and refuse to start.
+            release_single_instance_lock(lock_conn)
+            log.info("Trellis Linear worker stopped")
+
+
+def release_single_instance_lock(conn) -> None:
+    """Hand the worker lock back. See the note in `run_forever`."""
+    conn.execute(
+        "SELECT pg_advisory_unlock(%(key)s);", {"key": WORKER_ADVISORY_LOCK_KEY}
+    )
+    conn.commit()
+
+
+def _drain_until_stopped(stopping, interval, agent) -> int:
+    """The loop itself, so the lock lifetime above stays one readable block."""
+    while not stopping.is_set():
+        try:
+            result = process_next(agent=agent)
+        except Exception:
+            # `process_next` already converts ordinary failures into outcomes,
+            # so reaching here means something unexpected. The loop must not die
+            # on it: the claimed row's lease expires and the row becomes
+            # reclaimable, which is the behavior the lease exists for.
+            # `exception` logs the traceback, which carries no payload and no
+            # credential because nothing here interpolates one.
+            log.exception("unexpected worker failure; continuing")
+            stopping.wait(interval)
+            continue
+
+        if result["outcome"] == OUTCOME_IDLE:
+            stopping.wait(interval)
+    return 0
+
+
+def main() -> int:
+    """`python -m app.linear_agent_worker`. The systemd entry point.
+
+    SIGTERM is what systemd sends on `stop` and `restart`, and SIGINT is what a
+    terminal sends. Both set the same event, so an operator pressing Ctrl-C and
+    a deploy restarting the unit take the identical path.
+    """
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    stopping = threading.Event()
+
+    def _request_stop(signum, _frame) -> None:
+        log.info("received signal %s; finishing the current turn", signum)
+        stopping.set()
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+
+    return run_forever(stop=stopping)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -45,6 +45,7 @@ class Settings(BaseModel):
     linear_inbox_lease_seconds: int
     linear_inbox_max_attempts: int
     linear_http_timeout_seconds: int
+    linear_worker_poll_seconds: int
 
     @field_validator("trellis_public_origin")
     @classmethod
@@ -130,6 +131,11 @@ settings = Settings(
     linear_inbox_lease_seconds=os.getenv("LINEAR_INBOX_LEASE_SECONDS", "120"),
     linear_inbox_max_attempts=os.getenv("LINEAR_INBOX_MAX_ATTEMPTS", "5"),
     linear_http_timeout_seconds=os.getenv("LINEAR_HTTP_TIMEOUT_SECONDS", "15"),
+    # How long the worker sleeps when the inbox is empty. Polling rather than
+    # LISTEN/NOTIFY because the inbox already has a durable claim protocol and
+    # a notification adds a second delivery path that can be missed across a
+    # restart. Two seconds is well inside what a conversational reply tolerates.
+    linear_worker_poll_seconds=os.getenv("LINEAR_WORKER_POLL_SECONDS", "2"),
 )
 
 if settings.demo_unsafe_prompt_mode and settings.app_env != "demo":

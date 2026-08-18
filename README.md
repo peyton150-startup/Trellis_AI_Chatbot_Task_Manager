@@ -679,6 +679,119 @@ remaining work there is configuration, not installation: add `--no-access-log`
 to the Uvicorn invocation so the callback query string stays out of the journal,
 and set `inspect: false` on the ngrok tunnel with cloud Full Capture left off.
 
+### The Linear worker is a second systemd unit, not part of the backend
+
+**`trellis-backend.service` runs Uvicorn and does not drain the Linear inbox.**
+The webhook route commits an inbox row and returns; a separate long-running
+process turns that row into a Trellis run and an Agent Activity. Without the
+unit below, Linear webhooks are accepted and acknowledged and then nothing ever
+happens, which is the most misleading failure this deployment can have because
+every HTTP response is a 200.
+
+It is deliberately not started from a FastAPI lifespan hook. Uvicorn's process
+count is a web-serving decision, and hanging a background loop off it would
+start one drain loop per worker process, silently multiplying model spend the
+day someone tunes `--workers`. A model turn also takes far longer than the five
+second budget the webhook answers within, so the two workloads want different
+restart and timeout behavior.
+
+So the runtime ownership table above gains one row:
+
+```text
+systemd  trellis-backend.service        FastAPI lifecycle and readiness
+systemd  trellis-linear-worker.service  draining the Linear AgentSession inbox
+```
+
+**Exactly one worker drains, and that is enforced rather than assumed.** On
+start the process takes a PostgreSQL session advisory lock. A second instance,
+whether from a duplicated unit or a stray manual run, logs that the lock is held
+and exits non-zero rather than blocking, so systemd reports it instead of the
+process looking healthy while draining nothing. The lock is session scoped, so a
+killed worker leaves nothing to clean up by hand.
+
+The claim SQL is already safe under concurrency, `FOR UPDATE SKIP LOCKED` plus
+the earlier-pending-row predicate, so competing workers would be correct and
+merely wasteful. The lock makes "one drains" observable instead of tolerable.
+
+Create `/etc/systemd/system/trellis-linear-worker.service`. Same virtualenv,
+same `WorkingDirectory`, and the same environment files as
+`trellis-backend.service`; read that unit first and copy its values rather than
+trusting the paths below, which are the defaults this repository assumes:
+
+```ini
+[Unit]
+Description=Trellis Linear AgentSession worker
+# The worker needs the database, and nothing else needs the worker.
+After=network-online.target trellis-postgres.service
+Wants=network-online.target
+Requires=trellis-postgres.service
+
+[Service]
+Type=simple
+User=trellis
+WorkingDirectory=/opt/trellis/backend
+EnvironmentFile=/etc/trellis/trellis.env
+ExecStart=/opt/trellis/.venv/bin/python -m app.linear_agent_worker
+Restart=always
+RestartSec=5
+# SIGTERM is what the worker installs a handler for. It finishes the turn in
+# flight and then exits, so a deploy does not kill a model call mid-run and
+# leave a claimed row with no recorded outcome. Comfortably longer than one
+# model turn plus the Linear round trip.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# The journal is the only sink. The worker never logs a token, a webhook body,
+# or a stored payload; durable errors are a fixed vocabulary plus a provider
+# operation and status.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install, enable, and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now trellis-linear-worker.service
+systemctl status trellis-linear-worker.service --no-pager
+```
+
+Confirm it is actually draining rather than merely running:
+
+```bash
+journalctl -u trellis-linear-worker.service -n 30 --no-pager
+```
+
+A healthy start logs `Trellis Linear worker started`. If it instead logs that
+another worker holds the single-instance lock and exits, a second copy is
+already running; find it before enabling anything else:
+
+```bash
+systemctl list-units 'trellis-*' --no-pager
+pgrep -af 'app.linear_agent_worker'
+```
+
+Prove the whole path end to end after enabling, because a green unit only says
+the loop is alive:
+
+```bash
+sudo -u postgres psql -d trellis -c "SELECT status, attempt_count, last_error, run_id FROM linear_agent_inbox ORDER BY received_at DESC LIMIT 5;"
+```
+
+A row that stays `pending` with `attempt_count` at 0 means the worker is not
+reaching the queue at all. A row that reaches `completed` with a `run_id` is the
+proof that Linear, PostgreSQL, the model, and the Agent Activity delivery are
+all connected.
+
+Restarting the backend does not restart the worker, and that separation is the
+point. Restart both after a deploy:
+
+```bash
+sudo systemctl restart trellis-backend.service trellis-linear-worker.service
+```
+
 ### Deploy an exact commit, not a branch head
 
 T00W is not merged, so the usual `git pull --ff-only origin master` does not

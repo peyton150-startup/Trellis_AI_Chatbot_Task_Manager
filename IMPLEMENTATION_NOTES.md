@@ -2175,3 +2175,67 @@ AgentActivity resubmission, measured live as a conflict, which is why no retry
 exists anywhere around delivery. Cancellation of an in-flight turn is an
 acknowledged gap, not a solved problem. The live deployment gate remains open and
 T00W must not be reported as complete.
+
+## T00W: worker process startup
+
+**The blocker this closes.** At `b3f98ed` nothing started the worker. Grep
+proved it: no module in `backend/app/` imported `linear_agent_worker`, and
+`main.py` had no lifespan or startup hook. The webhook committed inbox rows and
+returned 200, and no process ever drained them. Every HTTP response looked
+healthy, which is what made it worth catching before merge rather than during
+the live gate.
+
+**Local role:** `python -m app.linear_agent_worker` is the process. `main()`
+installs SIGTERM and SIGINT handlers and calls `run_forever`, which takes a
+PostgreSQL session advisory lock, drains the inbox, sleeps
+`LINEAR_WORKER_POLL_SECONDS` when idle, and returns 0 on a clean stop or 1 when
+another worker already holds the lock.
+
+**Whole-system role:** it is the runtime half of the D-69 conversation plane.
+`trellis-backend.service` keeps its five second webhook budget and its web
+process model; the worker gets its own restart policy and a 90 second stop
+timeout sized for a model turn. A crash loop in one cannot take down the other.
+
+**Why not a FastAPI lifespan hook:** Uvicorn's process count is a web-serving
+decision, so a loop hung off startup would run once per worker process and
+multiply model spend silently the day someone tunes `--workers`. A CI step now
+fails if `main.py` or `agent.py` imports the worker at all, so the shortcut
+cannot be taken later by accident.
+
+**Single instance:** `pg_try_advisory_lock`, not `pg_advisory_lock`, so a second
+copy exits and says so instead of blocking while looking healthy to systemd.
+The lock is defense in depth rather than the correctness mechanism, since
+`CLAIM_LINEAR_INBOX` is already concurrency-safe; it makes "exactly one drains"
+observable. **One real bug was found by its own test:** `pool.connection()`
+returns the connection to the pool rather than closing it, so a session-scoped
+advisory lock outlived `run_forever` and a later borrower of that pooled
+connection would have refused to start. `run_forever` now releases the lock in a
+`finally`.
+
+**No migration.** Advisory locks need no schema, and no table or column changed.
+
+**Inputs and dependencies:** `settings.linear_worker_poll_seconds`, new and
+defaulting to 2; the existing pool; `process_next`.
+
+**Verification:**
+
+```powershell
+cd backend; ruff check .
+cd backend; python -m pytest tests/test_linear_worker.py -q
+cd backend; python -m pytest -m "not network" -q
+```
+
+Observed: ruff clean; worker module 52 passed; cumulative suite 232 passed, 13
+deselected. Seven of the new tests cover the process seam: the entry point
+exists, the web application does not import the worker, `main.py` has no
+lifespan or `@app.on_event` hook, two workers cannot both hold the lock, the
+lock is released when the connection goes away, a second worker exits non-zero
+with the queue untouched, the loop drains and stops cleanly on its event, and
+the loop survives an unexpected failure instead of dying on one bad row.
+
+**Limitations and review status:** the systemd unit lives in the README rather
+than as a tracked file, so installing it is an operator step and the paths must
+be copied from the real `trellis-backend.service` rather than trusted from the
+example. Nothing in CI can prove the unit is installed on the Ubuntu host; that
+belongs to the live deployment gate, which remains open. T00W must not be
+reported as complete until that gate passes.
