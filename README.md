@@ -598,64 +598,86 @@ systemd        FastAPI lifecycle and readiness
 ngrok service  the public tunnel
 ```
 
-**The backend must not control the Postgres container.** A `trellis-backend`
-unit whose `ExecStartPre` ran `docker compose up` would need access to the
-Docker control socket merely to answer "is the database reachable", which is a
-large privilege for a small question, and it lets a backend restart mutate
-container configuration as a side effect. `restart: unless-stopped` already
-brings PostgreSQL back after a reboot on its own.
+**This deployment already has its own systemd and Compose layering, and it is
+not what the paragraphs above originally assumed.** Preflight on the Ubuntu host
+found `trellis-backend.service` depending on an existing
+`trellis-postgres.service`, which in turn uses a server-side override at
+`/etc/trellis/compose.server.yml`. **Do not create a second Postgres unit and do
+not add another override file.** Both mechanisms exist; adjust them rather than
+replacing them.
 
-The backend's start precondition is a bounded, non-mutating readiness probe run
-through the same interpreter systemd already uses for Trellis. Something of this
-shape, with the real venv path substituted after inspecting the unit:
+The backend still must not control the Postgres container directly. A
+`trellis-backend` unit whose `ExecStartPre` ran `docker compose up` would need
+access to the Docker control socket merely to answer "is the database
+reachable", which is a large privilege for a small question, and it lets a
+backend restart mutate container configuration as a side effect. Here that
+concern is already handled by the existing unit ordering, so the remaining work
+is a readiness wait rather than a new service.
 
-```ini
-[Unit]
-Requires=docker.service
-After=docker.service
-
-[Service]
-ExecStartPre=/path/to/venv/bin/python -c "import os,time,psycopg,sys
-d=os.environ['DATABASE_URL']
-for _ in range(60):
-    try:
-        psycopg.connect(d, connect_timeout=2).execute('SELECT 1'); sys.exit(0)
-    except Exception: time.sleep(1)
-sys.exit(1)"
-ExecStart=/path/to/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
-```
-
-It fails service startup if the database never becomes ready, and it can change
-nothing. Do not create a `trellis-postgres.service`; Docker already owns that.
-
-**Bind PostgreSQL to loopback on the deployment host.** The tracked
-`docker-compose.yml` publishes `55432` on all interfaces, which is correct for
-CI and local development but would expose the database with demo credentials on
-a public host. Do not change the tracked file: every DSN in CI says `localhost`,
-which resolves to `::1` first on some platforms, and an IPv4-only publish makes
-those connections fall back slowly. Add a host-only override instead:
+**The server override is IPv4-only, and that interacts with a real trap.** It
+contains:
 
 ```yaml
-# docker-compose.override.yml, on the Ubuntu host only, not committed
 services:
   postgres:
-    ports:
+    ports: !override
       - "127.0.0.1:55432:5432"
 ```
 
-and set `DATABASE_URL` on that host to use `127.0.0.1` rather than `localhost`.
-A firewall rule on the published port is an equally good alternative.
+`!override` replaces the tracked list entirely, so the dual-loopback publish in
+`docker-compose.yml` does **not** apply on this host: the effective binding is
+IPv4 loopback only. That is the exact configuration that cost 137 seconds and
+four connection-pool timeouts during local verification, because
+`getaddrinfo("localhost")` returns `::1` first and an IPv4-only publish makes
+that first attempt time out rather than be refused.
 
-Deployment is the one place Compose may reconcile:
+So on this host, one of the following is required, and the second is preferred:
+
+```text
+DATABASE_URL uses 127.0.0.1, never localhost
+or
+the server override publishes both loopback families:
+  ports: !override
+    - "127.0.0.1:55432:5432"
+    - "[::1]:55432:5432"
+```
+
+Verify whichever is chosen with a direct probe of both families before trusting
+it, rather than inferring it from the file.
+
+**Two reconciliations are outstanding on the host.** The running container still
+carries the old public binding (`0.0.0.0` / `[::]`), so the override has never
+been applied to it, and the effective Postgres configuration currently has no
+`restart:` policy. Both are fixed by the same reconciling deployment step, and
+neither is fixed by a restart:
 
 ```bash
 docker compose up -d --wait postgres
 ```
 
-That is deliberate, and it is why the backup below comes first. `compose up`
-recreates a service whose configuration changed, which is exactly what applies
-the loopback port binding and the restart policy. `compose restart` would not
-apply them, because it restarts containers without re-reading the file.
+`compose up` recreates a service whose configuration changed, which is exactly
+what applies the loopback binding and `restart: unless-stopped`.
+`compose restart` restarts containers without re-reading the file and would
+leave both problems in place. This is why the database backup below comes first.
+
+After reconciling, confirm the effective state rather than assuming it:
+
+```bash
+docker compose -f docker-compose.yml -f /etc/trellis/compose.server.yml config
+docker inspect --format '{{json .HostConfig.PortBindings}}' "$(docker compose ps -q postgres)"
+docker version --format '{{.Server.Version}}'
+```
+
+Require exactly one `55432` mapping per address family, no `0.0.0.0` and no
+`:::`, `RestartPolicy` of `unless-stopped`, and a healthy container. Docker
+server versions before 28.0.0 carry a localhost-publishing caveat involving
+hosts on the same L2 segment; record the version during preflight.
+
+**Uvicorn already binds privately to `127.0.0.1:8000`, and ngrok is already
+installed and running as a systemd service forwarding to that port.** The
+remaining work there is configuration, not installation: add `--no-access-log`
+to the Uvicorn invocation so the callback query string stays out of the journal,
+and set `inspect: false` on the ngrok tunnel with cloud Full Capture left off.
 
 ### Deploy an exact commit, not a branch head
 
