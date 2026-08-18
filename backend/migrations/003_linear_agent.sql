@@ -65,18 +65,19 @@ CREATE TABLE linear_oauth_states (
 --
 -- Two independent identities, and D-69 requires both.
 --
--- delivery_id is Linear's provider delivery identity. Whether it stays stable
--- across a provider retry is NOT established: Linear documents the retry
--- schedule but not which identifiers survive it, and this comment previously
--- overstated the case by calling it retry idempotency. That property is live
--- evidence to be measured during the ingress preflight, not something the
--- schema can assert.
+-- delivery_id is Linear's provider delivery identity and the observed logical
+-- retry identity. T00W live preflight proved that Linear keeps Linear-Delivery
+-- and webhookId stable across an automatic retry while regenerating the signed
+-- webhookTimestamp. The exact signed body, body_sha256, and HMAC therefore
+-- legitimately change on that retry.
 --
--- body_sha256 is the exact authenticated raw-body replay identity. The HMAC
--- authenticates the body and not the headers, so an identical signed body
--- replayed under a fresh delivery id would otherwise buy a second unit of work.
+-- body_sha256 remains the exact authenticated raw-body replay identity. The
+-- HMAC authenticates the body and not the delivery header, so an identical
+-- signed body replayed under a fresh delivery id still cannot buy a second unit
+-- of work.
 --
--- Both are UNIQUE and either one rejecting is a duplicate.
+-- Both remain UNIQUE: delivery_id supplies retry idempotency and body_sha256 is
+-- the independent authenticated-body replay defense.
 --
 -- claimed_until is a lease, not a processing boolean. A worker that dies
 -- holding a boolean strands its row forever; a lease expires and the work

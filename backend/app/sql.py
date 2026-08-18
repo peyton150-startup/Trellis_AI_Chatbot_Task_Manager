@@ -656,3 +656,46 @@ SELECT * FROM linear_agent_inbox WHERE delivery_id = %(delivery_id)s;
 SELECT_LINEAR_INBOX_BY_BODY = """
 SELECT * FROM linear_agent_inbox WHERE body_sha256 = %(body_sha256)s;
 """
+
+
+# T00W worker dequeue.
+#
+# Correctness is in the predicate, not merely ORDER BY:
+#
+# * a row must itself be pending, due, and unleased/lease-expired;
+# * any earlier pending row for the same organization + AgentSession blocks it,
+#   even when that earlier row is leased or backing off via not_before;
+# * therefore prompt N+1 cannot overtake prompt N;
+# * another AgentSession remains independently claimable;
+# * FOR UPDATE SKIP LOCKED lets concurrent workers avoid waiting on the same
+#   candidate without weakening the per-session ordering predicate.
+#
+# The lease and attempt increment happen in the same statement that chooses the
+# row. There is no SELECT-then-UPDATE claim race.
+CLAIM_LINEAR_INBOX = """
+WITH candidate AS (
+    SELECT i.id
+      FROM linear_agent_inbox AS i
+     WHERE i.status = 'pending'
+       AND i.not_before <= now()
+       AND (i.claimed_until IS NULL OR i.claimed_until <= now())
+       AND NOT EXISTS (
+           SELECT 1
+             FROM linear_agent_inbox AS earlier
+            WHERE earlier.organization_id = i.organization_id
+              AND earlier.agent_session_id = i.agent_session_id
+              AND earlier.status = 'pending'
+              AND (earlier.received_at, earlier.id)
+                  < (i.received_at, i.id)
+       )
+     ORDER BY i.received_at, i.id
+     FOR UPDATE SKIP LOCKED
+     LIMIT 1
+)
+UPDATE linear_agent_inbox AS inbox
+   SET claimed_until = now() + (%(lease_seconds)s * interval '1 second'),
+       attempt_count = inbox.attempt_count + 1
+  FROM candidate
+ WHERE inbox.id = candidate.id
+RETURNING inbox.*;
+"""

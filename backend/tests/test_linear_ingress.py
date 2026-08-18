@@ -847,3 +847,35 @@ def test_second_active_installation_is_refused_and_revoked(client, monkeypatch):
     assert "already exists" in response.text
     assert ("rt-new", "refresh_token") in revoked
     assert installation_status() == ["active"]
+
+
+
+def test_same_delivery_with_regenerated_signed_body_is_normal_retry(client):
+    """Live preflight: retry keeps delivery id but regenerates signed timestamp."""
+    install_active()
+
+    delivery = str(uuid4())
+    webhook_id = str(uuid4())
+
+    first = session_payload(webhookId=webhook_id)
+    response = post(client, first, delivery=delivery)
+
+    assert response.status_code == 200
+    assert len(inbox_rows()) == 1
+
+    second = session_payload(
+        webhookId=webhook_id,
+        webhookTimestamp=first["webhookTimestamp"] + 1,
+    )
+    response = post(client, second, delivery=delivery)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "disposition": "duplicate",
+        "duplicate": True,
+        "conflict": None,
+    }
+
+    rows = inbox_rows()
+    assert len(rows) == 1
+    assert rows[0]["delivery_id"] == delivery

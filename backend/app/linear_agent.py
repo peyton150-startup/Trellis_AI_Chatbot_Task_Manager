@@ -393,7 +393,7 @@ def accept_agent_session_event(
         ).fetchone()
 
         if row is None:
-            outcome = _classify_conflict(conn, delivery_id, body_sha256)
+            outcome = _classify_conflict(conn, delivery_id, body_sha256, payload)
         else:
             outcome = {"disposition": status, "refusal_reason": reason, "duplicate": False}
 
@@ -405,27 +405,69 @@ def accept_agent_session_event(
     return outcome
 
 
-def _classify_conflict(conn, delivery_id: str, body_sha256: str) -> dict:
-    """Why the insert conflicted, read from both unique identities.
+def _linear_event_identity(payload: dict) -> tuple[Any, ...]:
+    """Stable provider-owned identity used to distinguish retry from collision.
 
-    Four cases, and the two identities are read separately because the
-    interesting ones are where they disagree:
+    Live preflight proved that webhookTimestamp and therefore the signed body can
+    change across a legitimate retry. Those volatile values are deliberately not
+    part of this identity.
+
+    The fields below name the logical event/session/activity rather than its
+    particular signed delivery attempt.
+    """
+    session = payload.get("agentSession")
+    activity = payload.get("agentActivity")
+
+    session_id = session.get("id") if isinstance(session, dict) else None
+    activity_id = activity.get("id") if isinstance(activity, dict) else None
+
+    return (
+        payload.get("type"),
+        payload.get("action"),
+        payload.get("organizationId"),
+        payload.get("oauthClientId"),
+        payload.get("appUserId"),
+        payload.get("webhookId"),
+        session_id,
+        activity_id,
+    )
+
+
+def _classify_conflict(
+    conn,
+    delivery_id: str,
+    body_sha256: str,
+    payload: dict,
+) -> dict:
+    """Classify which durable identity rejected the insert.
+
+    Live T00W preflight established the provider retry behavior that the schema
+    deliberately left open until it could be measured:
+
+    * Linear-Delivery stays stable across the automatic retry.
+    * webhookId stays stable.
+    * webhookTimestamp is regenerated.
+    * the signed raw body therefore changes.
+    * the HMAC signature therefore changes.
+
+    That makes Linear-Delivery the observed primary retry identity. A changed
+    body under the same delivery id may therefore be an ordinary provider retry,
+    but only when the stable logical event identity also agrees.
+
+    The body digest remains an independent replay defense. An identical signed
+    body arriving under a new delivery id still cannot create a second unit of
+    work.
+
+    The cases are:
 
     ```text
-    same delivery, same body      ordinary duplicate
-    new delivery, same body       identical signed body, changed unsigned header
-    same delivery, new body       provider identity conflict
+    same delivery, same body      exact duplicate
+    same delivery, new body       retry iff stable event identity matches
+    new delivery, same body       authenticated body replay
     delivery hits A, body hits B  provider identity conflict
     ```
 
-    None of the four is called an attack. A duplicate is ordinary provider retry
-    traffic, and the conflicting cases are surprising rather than proven
-    hostile: the honest report is that two identities disagreed. No payload is
-    logged in any of them.
-
-    Every case produces no second unit of work, which is the property that
-    matters, and every case answers 200, because asking Linear to retry a
-    delivery already recorded would produce this same answer an hour later.
+    Every recognized duplicate produces no second unit of work and answers 200.
     """
     by_delivery = conn.execute(
         sql.SELECT_LINEAR_INBOX_BY_DELIVERY, {"delivery_id": delivery_id}
@@ -434,17 +476,85 @@ def _classify_conflict(conn, delivery_id: str, body_sha256: str) -> dict:
         sql.SELECT_LINEAR_INBOX_BY_BODY, {"body_sha256": body_sha256}
     ).fetchone()
 
-    if by_delivery is not None and by_body is not None and by_delivery["id"] == by_body["id"]:
-        return {"disposition": "duplicate", "duplicate": True, "conflict": None}
+    if (
+        by_delivery is not None
+        and by_body is not None
+        and by_delivery["id"] == by_body["id"]
+    ):
+        return {
+            "disposition": "duplicate",
+            "duplicate": True,
+            "conflict": None,
+        }
+
+    if by_delivery is not None and by_body is None:
+        # Observed Linear automatic retries keep the delivery id while
+        # regenerating the signed timestamp/body/signature. Treat that as a
+        # normal retry only when the durable logical event identity still
+        # agrees. Reuse of a delivery id for a different session/activity is an
+        # identity conflict, not a retry.
+        if _linear_event_identity(by_delivery["payload"]) == _linear_event_identity(
+            payload
+        ):
+            return {
+                "disposition": "duplicate",
+                "duplicate": True,
+                "conflict": None,
+            }
+
+        return {
+            "disposition": "duplicate",
+            "duplicate": True,
+            "conflict": "provider_identity_conflict",
+        }
+
     if by_delivery is None and by_body is not None:
-        # Same signed body under a different delivery header. The defense
-        # in depth case D-69 added the body digest for.
-        return {"disposition": "duplicate", "duplicate": True, "conflict": "body_replay"}
-    return {
-        "disposition": "duplicate",
-        "duplicate": True,
-        "conflict": "provider_identity_conflict",
-    }
+        # Identical authenticated bytes under a fresh delivery header. Keep the
+        # body digest as the independent defense-in-depth replay identity.
+        return {
+            "disposition": "duplicate",
+            "duplicate": True,
+            "conflict": "body_replay",
+        }
+
+    if by_delivery is not None and by_body is not None:
+        # Each identity resolved, but to a different durable row.
+        return {
+            "disposition": "duplicate",
+            "duplicate": True,
+            "conflict": "provider_identity_conflict",
+        }
+
+    # INSERT ... ON CONFLICT returned no row, yet neither unique identity can be
+    # read back. Treat that as a local invariant failure rather than lying to
+    # Linear with a durable 200 acknowledgement.
+    raise RuntimeError("linear inbox conflict could not be classified")
+
+
+
+def claim_next_linear_inbox(*, lease_seconds: int) -> dict | None:
+    """Atomically lease the next eligible Linear inbox row.
+
+    Eligibility and per-AgentSession serialization live in SQL because two
+    workers must not be able to defeat the rule by racing in Python.
+
+    A transient worker failure leaves status='pending' and can move not_before
+    forward. Until that earlier row completes or becomes terminal, later pending
+    rows for the same AgentSession remain blocked.
+    """
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+        raise TypeError("lease_seconds must be an integer")
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.CLAIM_LINEAR_INBOX,
+            {"lease_seconds": lease_seconds},
+        ).fetchone()
+        conn.commit()
+
+    return dict(row) if row is not None else None
 
 
 def apply_oauth_revocation(event: OAuthRevocationEvent) -> dict:
