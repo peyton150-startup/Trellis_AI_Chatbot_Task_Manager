@@ -302,6 +302,17 @@ Six tools. Explicit enums, required fields, no free-form filters. Narrow schemas
 | `delete_tasks` | always | |
 | `propose_plan` | n/a | returns a plan for display, mutates nothing |
 
+### D-71 current capability amendment
+
+Part 5 above remains the historical Day 1 six-tool architecture. D-71 adds one read-only capability without rewriting that original contract.
+
+Current profiles:
+
+- Browser / AG-UI: `list_tasks`, `get_task_history`, `create_task`, `update_task`, `bulk_update_tasks`, `delete_tasks`, `propose_plan`
+- Linear AgentSession: `list_tasks`, `get_task_history`, `create_task`, `update_task`, `propose_plan`
+
+`get_task_history` is read-only. It reads the existing actor-scoped durable task history projection, requires no approval, writes no task events, and never sets `mutation_committed`. Deleted-history lookup requires the authoritative task id.
+
 ---
 
 ## Part 6: Seed fixture

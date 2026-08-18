@@ -138,8 +138,9 @@ def replay_completed(
     only ever tells a caller about a call id inside a run they own.
 
     Returns None for a row that is pending or failed, and for no row at all,
-    which hands the call to `policy.check` and then to `acquire` unchanged. None
-    is usable as the sentinel because every tool stores a list.
+    which hands the call to `policy.check` and then to `acquire` unchanged.
+    None is usable as the sentinel because no tool stores top-level null as its
+    result.
     """
     # Ownership first, and terminally. A run that does not exist and a run
     # belonging to someone else both raise OutOfScopeError here, identically,

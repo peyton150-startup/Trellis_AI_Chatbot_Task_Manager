@@ -22,6 +22,7 @@ from app.models import (
     CreateRunRequest,
     CreateTaskArgs,
     DeleteTasksArgs,
+    GetTaskHistoryArgs,
     LeaseAction,
     LeaseOutcome,
     ListTasksArgs,
@@ -156,6 +157,7 @@ def test_approval_request_rejects_pending_decision() -> None:
     ("model", "payload"),
     [
         (ListTasksArgs, {}),
+        (GetTaskHistoryArgs, {"task_id": str(TASK_ID)}),
         (CreateTaskArgs, {"title": "Task A"}),
         (
             UpdateTaskArgs,
@@ -173,8 +175,41 @@ def test_each_tool_argument_model_rejects_extra_keys(
         model.model_validate({**payload, "free_form": {"anything": True}})
 
 
-def test_list_tasks_enforces_limit_ceiling() -> None:
+def test_get_task_history_arguments_match_history_contract() -> None:
+    default = GetTaskHistoryArgs(task_id=TASK_ID)
+
+    assert default.limit == 20
+    assert default.before_event_id is None
+
+    assert GetTaskHistoryArgs(task_id=TASK_ID, limit=1).limit == 1
+    assert GetTaskHistoryArgs(task_id=TASK_ID, limit=50).limit == 50
+    assert (
+        GetTaskHistoryArgs(
+            task_id=TASK_ID,
+            before_event_id=1,
+        ).before_event_id
+        == 1
+    )
+
+    with pytest.raises(ValidationError):
+        GetTaskHistoryArgs(task_id=TASK_ID, limit=0)
+
+    with pytest.raises(ValidationError):
+        GetTaskHistoryArgs(task_id=TASK_ID, limit=51)
+
+    with pytest.raises(ValidationError):
+        GetTaskHistoryArgs(task_id=TASK_ID, before_event_id=0)
+
+
+def test_list_tasks_enforces_limit_bounds() -> None:
+    assert ListTasksArgs(limit=1).limit == 1
     assert ListTasksArgs(limit=50).limit == 50
+
+    with pytest.raises(ValidationError):
+        ListTasksArgs(limit=0)
+
+    with pytest.raises(ValidationError):
+        ListTasksArgs(limit=51)
 
     with pytest.raises(ValidationError):
         ListTasksArgs(limit=51)
@@ -353,7 +388,7 @@ def test_default_agent_requires_nvidia_key_without_openai_fallback() -> None:
     assert "NVIDIA_API_KEY" in result.stderr
 
 
-def test_injected_agent_needs_no_provider_key_and_keeps_six_tools() -> None:
+def test_injected_agent_needs_no_provider_key_and_keeps_seven_tools() -> None:
     env = _provider_env()
     env["NVIDIA_API_KEY"] = ""
 
@@ -371,6 +406,7 @@ def test_injected_agent_needs_no_provider_key_and_keeps_six_tools() -> None:
         assert built.model is injected
         assert set(built.toolsets[0].tools) == {
             "list_tasks",
+            "get_task_history",
             "create_task",
             "update_task",
             "bulk_update_tasks",

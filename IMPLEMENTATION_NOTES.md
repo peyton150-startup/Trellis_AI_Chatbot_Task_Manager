@@ -2239,3 +2239,47 @@ be copied from the real `trellis-backend.service` rather than trusted from the
 example. Nothing in CI can prove the unit is installed on the Ubuntu host; that
 belongs to the live deployment gate, which remains open. T00W must not be
 reported as complete until that gate passes.
+
+## D-71 / PR #54: read-only task-history agent capability
+
+**Local role:** PR #54 exposes the existing actor-scoped durable task-history projection as the read-only `get_task_history` agent tool. The browser / AG-UI capability profile has seven tools and the Linear AgentSession safe profile has five. The tool accepts one authoritative task UUID plus bounded keyset pagination, reuses `domain.read_task_history()` as the sole history authority, requires no approval, writes no task event, and never marks `RunEffects.mutation_committed`.
+
+The final PR #54 prompt layer also treats canonical server-owned conversation history as a navigation aid rather than a second authority. If an earlier Trellis tool result already contains the authoritative UUID for the task the user means, the agent may reuse that UUID directly. It must not call `list_tasks` merely to rediscover an ID it already has. For complete history it requests `limit=50`, follows `next_before_event_id` until null, combines every page, and presents the result oldest to newest unless the user asks for another ordering. A task absent from one bounded `list_tasks` result is not declared nonexistent; unresolved references remain unresolved rather than guessed.
+
+**Whole-system role:** Trellis has two distinct memory layers that must cooperate without changing the trust boundary. Canonical `agent_runs.message_history` preserves successful conversation context and can carry previously returned task UUIDs across turns. PostgreSQL task state and append-only `task_events` remain the durable domain authority. PR #54 connects the model to the existing history projection so conversation memory can make lookup faster while durable task memory remains independently authoritative once a UUID is known.
+
+**Inputs and dependencies:** D-71; the task-history projection shipped before PR #54; `task_events.before` and `task_events.after`; `domain.read_task_history()`; actor-bound run ownership; existing idempotency replay and lease behavior; `ToolName`, `ALL_TOOLS`, and `LINEAR_TOOLS`; completed-run conversation continuity; and the existing browser approval boundary. No migration, new SQL statement, new endpoint, frontend history path, provider call, or historical-title search is introduced by this PR.
+
+**Outputs and consumers:** `GetTaskHistoryArgs`; the `get_task_history` tool wrapper and deterministic tool body; seven-tool browser / AG-UI and five-tool Linear profiles; prompt rules for authoritative-ID reuse and complete-history pagination; focused deterministic tests; current-facing documentation; and a stable D-71 CI proof. Browser and Linear agent turns consume the same PostgreSQL-backed projection already consumed by the HTTP history endpoint.
+
+### PR #54 completion plan
+
+In scope before merge:
+
+1. Keep the existing `get_task_history` execution kernel and its two-read authorization/idempotency ordering unchanged unless a concrete defect is found.
+2. Reuse authoritative task UUIDs already present in canonical Trellis tool history, including known deleted-task IDs.
+3. Use `list_tasks` only as a bounded current-task lookup when no authoritative ID is already available. Absence from one bounded result is not proof of nonexistence.
+4. For complete or all history, request `limit=50`, follow every `next_before_event_id`, combine all pages, and present oldest to newest by default.
+5. Preserve the existing global ambiguity rule: zero matches or multiple plausible tasks require clarification rather than arbitrary selection. Do not duplicate a second conflicting title-resolution policy inside the history rules.
+6. Keep the current/no-events behavior exact: report no recorded audit events and never fabricate a v1 snapshot.
+7. Tighten `ListTasksArgs.limit` to the closed range 1 through 50 so an empty or invalid lookup page cannot be requested accidentally.
+8. Keep browser/full at seven tools and Linear at five, with `delete_tasks` and `bulk_update_tasks` still withheld from Linear.
+9. Add a D-71-specific deterministic CI gate and record final local and GitHub verification evidence before merge.
+
+Explicitly out of scope for PR #54: a task-reference resolver, historical-title SQL, schema or migration changes, boundary snapshots in the history response, browser continuity persistence, conversation compaction, embeddings, RAG, or a second memory store.
+
+### Follow-up memory plan, not authorized by D-71
+
+The following stages are recorded as follow-up ownership only. They are not part of PR #54 and require their own decision/scope before implementation.
+
+**Stage 2 - history boundary snapshots.** `task_events` already stores complete `after` state for creation and complete `before` state for deletion, but the current history projection returns field diffs only when both snapshots exist. A follow-up can expose a compact creation/deletion boundary snapshot from the data PostgreSQL already stores, without changing event persistence. Normal updates should remain diff-only to avoid inflating tool results and conversation context.
+
+**Stage 3 - `resolve_task_reference`.** `list_tasks` is bounded to 50 current tasks and has no title query or cursor, so it is not a complete entity resolver. A separate actor-scoped read-only resolver can search current titles and historical titles already present in `task_events`, return a small candidate set, keep foreign and nonexistent references indistinguishable, and require clarification for ambiguity. It should be available to both browser and Linear profiles and should not participate in approvals.
+
+**Stage 4 - browser continuity hardening.** The browser currently carries only an in-memory continuity run locator. A later frontend change can persist only the server-run locator in `sessionStorage`, never message history, and still require the server to verify actor ownership and completed status before inheriting canonical history. The same change should serialize completion promotion so a rapid next submission cannot race the server-confirmed continuity pointer.
+
+**Stage 5 - conversation compaction, later.** Only after durable domain facts are independently rediscoverable should Trellis consider compacting older canonical conversational context. Any future summary may assist navigation but must never become the sole authority for task state or audit history.
+
+**Verification:** Before PR #54 merges, run `cd backend && python -m ruff check .`, the focused task-history tests, the model/profile tests, the deterministic non-network suite, and the D-71-specific CI job. Record the final observed counts in this entry or the PR description after the last code change. The pre-amendment local evidence was Ruff clean, 8 focused task-history tests passed, and 246 deterministic tests passed with 13 network tests deselected.
+
+**Limitations and review status:** PR #54 still cannot discover an unknown deleted task from title alone and cannot guarantee that a named current task beyond the bounded `list_tasks` result is resolvable. Those are discovery limitations, not failures of history persistence. The planned resolver owns that follow-up. Creation/deletion boundary snapshots, browser reload continuity, and conversation compaction are also deliberately deferred. D-71 does not authorize those changes. A final neutral review should evaluate the PR against this narrowed scope and the recorded verification evidence.

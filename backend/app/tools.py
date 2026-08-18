@@ -1,4 +1,4 @@
-"""The six typed tools the model operates through.
+"""The typed tools the model operates through.
 
 D-49 split T10 authoring: `create_task` is the corrected reference and the five
 other tools transcribe its body without redesign. Every tool therefore follows
@@ -62,6 +62,7 @@ from .models import (
     BulkUpdateTasksArgs,
     CreateTaskArgs,
     DeleteTasksArgs,
+    GetTaskHistoryArgs,
     LeaseAction,
     ListTasksArgs,
     MutableTaskFields,
@@ -187,11 +188,138 @@ def list_tasks(
     return result
 
 
+def get_task_history(
+    ctx: ToolContext,
+    arguments: GetTaskHistoryArgs,
+) -> dict:
+    """Return one actor-scoped page of durable task history.
+
+    History authorization intentionally differs from ordinary live-task scope.
+    A deleted task has no current task row, but actor-owned task_events remain
+    valid ownership evidence.
+
+    Keep target_ids empty. domain.read_task_history is the resource-specific
+    authority for both current and deleted task history.
+
+    The first history read is an authorization probe only and is discarded.
+    A foreign or missing task therefore fails before lease acquisition.
+
+    After acquire grants EXECUTE, history is read again. Only that post-lease
+    value may become the invocation's stored replay result.
+    """
+    tool_name = ToolName.GET_TASK_HISTORY.value
+
+    # SECURITY INVARIANT:
+    # Do not add arguments.task_id here. Ordinary policy scope intentionally
+    # understands live task rows only; history ownership survives deletion.
+    target_ids: list[UUID] = []
+    blast_radius_count = 0
+    payload = _payload(arguments)
+
+    # 1.
+    args_hash = policy.arguments_hash(payload)
+
+    # 1a. Completed replay comes before fresh authorization/domain work.
+    replayed = idempotency.replay_completed(
+        ctx.run_id,
+        ctx.tool_call_id,
+        tool_name,
+        args_hash,
+        actor_id=ctx.actor_id,
+    )
+    if replayed is not None:
+        return replayed
+
+    # 0. This is read-only, but still uses the normal classification pipeline.
+    requirement = policy.classify(tool_name, payload, blast_radius_count)
+    if requirement.required and not ctx.tool_call_approved:
+        raise ApprovalRequired(metadata={"reason": requirement.reason})
+
+    # 2. Standard policy still runs with intentionally empty live-task targets.
+    approval_row = runs.load_approval(ctx.run_id, ctx.tool_call_id)
+    try:
+        policy.check(
+            ctx.actor_id,
+            tool_name,
+            payload,
+            target_ids,
+            approval_row,
+            run_id=ctx.run_id,
+            tool_call_id=ctx.tool_call_id,
+            blast_radius_count=blast_radius_count,
+        )
+    except OutOfScopeError:
+        replayed = idempotency.replay_completed(
+            ctx.run_id,
+            ctx.tool_call_id,
+            tool_name,
+            args_hash,
+            actor_id=ctx.actor_id,
+        )
+        if replayed is not None:
+            return replayed
+        raise
+
+    # History-specific authorization probe.
+    #
+    # Discard this value. acquire has not granted execution authority yet, so
+    # this preflight page must never become the stored invocation result.
+    with _pool().connection() as conn:
+        domain.read_task_history(
+            ctx.actor_id,
+            arguments.task_id,
+            limit=arguments.limit,
+            before_event_id=arguments.before_event_id,
+            conn=conn,
+        )
+
+    # 3.
+    outcome = idempotency.acquire(
+        ctx.run_id,
+        ctx.tool_call_id,
+        tool_name,
+        args_hash,
+    )
+    if outcome.action is LeaseAction.REPLAY:
+        return outcome.result
+
+    # 4. Produce the authoritative result after owning EXECUTE.
+    committed = False
+    try:
+        with _pool().connection() as conn:
+            history = domain.read_task_history(
+                ctx.actor_id,
+                arguments.task_id,
+                limit=arguments.limit,
+                before_event_id=arguments.before_event_id,
+                conn=conn,
+            )
+            domain.write_events(ctx.run_id, ctx.actor_id, (), conn=conn)
+            result = history.model_dump(mode="json")
+            idempotency.complete(
+                ctx.run_id,
+                ctx.tool_call_id,
+                result,
+                conn=conn,
+            )
+            conn.commit()
+            committed = True
+    except Exception as exc:
+        if not committed:
+            idempotency.fail(ctx.run_id, ctx.tool_call_id, str(exc))
+        raise
+
+    # 5.
+    return result
+
+
 def create_task(
     ctx: ToolContext,
     arguments: CreateTaskArgs,
 ) -> list[domain.TaskSnapshot]:
-    """Create one task for the acting owner. The reference body for all six.
+    """Create one task for the acting owner.
+
+    The reference body for the original T10 six.
 
     Returns the created rows as JSON-safe snapshots, which is the same value
     stored on the lease. That equality is deliberate and is the reason the

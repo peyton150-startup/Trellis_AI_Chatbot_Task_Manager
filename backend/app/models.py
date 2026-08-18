@@ -65,6 +65,7 @@ class ApprovalReason(str, Enum):
 
 class ToolName(str, Enum):
     LIST_TASKS = "list_tasks"
+    GET_TASK_HISTORY = "get_task_history"
     CREATE_TASK = "create_task"
     UPDATE_TASK = "update_task"
     BULK_UPDATE_TASKS = "bulk_update_tasks"
@@ -299,7 +300,13 @@ class ListTasksArgs(TrellisModel):
     due_before: date | None = None
     due_after: date | None = None
     priority: TaskPriority | None = None
-    limit: int = Field(default=50, le=50)
+    limit: int = Field(default=50, ge=1, le=50)
+
+
+class GetTaskHistoryArgs(TrellisModel):
+    task_id: UUID
+    limit: int = Field(default=20, ge=1, le=50)
+    before_event_id: int | None = Field(default=None, ge=1)
 
 
 class CreateTaskArgs(TrellisModel):

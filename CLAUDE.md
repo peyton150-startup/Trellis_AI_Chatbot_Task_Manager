@@ -2,7 +2,7 @@
 
 ## Project overview
 
-Trellis is a technical interview artifact: an LLM operates a todo application through six typed tools while deterministic application code owns state, authorization, approvals, idempotency, audit history, and undo. The implementation uses FastAPI, Pydantic AI, PostgreSQL, Next.js, assistant-ui, and AG-UI. The model is measured; the trust boundary is proven.
+Trellis is a technical interview artifact: an LLM operates a todo application through typed tools selected by explicit capability profiles while deterministic application code owns state, authorization, approvals, idempotency, audit history, and undo. The implementation uses FastAPI, Pydantic AI, PostgreSQL, Next.js, assistant-ui, and AG-UI. The model is measured; the trust boundary is proven.
 
 ## Sources of truth
 
@@ -47,7 +47,8 @@ The required checks are named `T00 API probe`, `T00A spike build`, `T00R probe h
 - Every task PR must add or update a stable task-specific CI job that directly runs that task's verification. An earlier task's checks are regressions, not a substitute for the new task's gate.
 - CI gates are cumulative. Every pull request runs every established task check from T00 through the current task, regardless of which files changed, so later work cannot silently break earlier proofs.
 - Do not add path filters, changed-file shortcuts, conditional skips, or workflow splits that prevent an established gate from running on every pull request unless the user explicitly approves the exception.
-- Name each new check `T## <short verification name>` and keep that name stable after it is referenced by branch protection.
+- Name each planned-task check `T## <short verification name>` and keep that name stable after it is referenced by branch protection.
+- For an explicitly user-authorized post-roadmap decision exception, use a stable `D## <short verification name>` check name matching the governing decision, record the exception in `docs/DECISIONS.md` and `IMPLEMENTATION_NOTES.md`, and keep the name stable after branch protection references it.
 - Treat `.github/workflows/ci.yml` and `IMPLEMENTATION_NOTES.md` as required companion files for each task, even when the task table lists only implementation files. Do not use this exception for unrelated changes.
 - Open the PR as a draft. Run the verification locally, push the branch, and wait until the new task check and all existing required checks pass.
 - After the new check has reported successfully at least once, add its exact name to the `master` branch's required status checks. Preserve strict up-to-date checks, admin enforcement, conversation resolution, and all existing required contexts.

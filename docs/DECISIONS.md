@@ -3126,3 +3126,74 @@ credentials, and must not be described as though it does.** It handles caught
 failures, not process death. Closing the remaining window would require token
 staging state, which is a fourth table for a demo-scale risk, and D-70 declines
 to add one.
+
+### D-71: expose durable task history as one read-only agent capability
+
+D-68 freezes post-T00L implementation unless the user explicitly authorizes a
+demo-blocking exception. D-69 authorized T00W specifically. The user now
+authorizes one further narrow exception: expose the already-shipped
+task-history projection to the agent as `get_task_history`.
+
+This is not another history system. `task_events`, the existing history SQL,
+and `domain.read_task_history()` remain authoritative. The existing HTTP
+history endpoint and the new agent tool are two consumers of the same domain
+projection.
+
+This decision authorizes no migration, new SQL, new endpoint, history
+persistence change, frontend history implementation, approval bridge change,
+Linear provider call, or historical title-search subsystem.
+
+The full/browser capability profile becomes seven tools. The Linear-safe
+profile becomes five by adding the same read-only history tool while continuing
+to omit `bulk_update_tasks` and `delete_tasks`.
+
+History never sets `mutation_committed` and never participates in
+`_APPROVAL_ARGS_MODELS`.
+
+History ownership deliberately does not use the ordinary live-task policy
+target list. `get_task_history` passes `target_ids=[]` and
+`blast_radius_count=0` to the standard policy pipeline.
+
+Do not later add `arguments.task_id` to that target list.
+`policy.resolve_scope()` intentionally understands current task rows, while
+actor-owned `task_events` remain valid ownership evidence after deletion.
+`domain.read_task_history()` therefore remains the resource-specific authority,
+preserving identical `OUT_OF_SCOPE` behavior for foreign and nonexistent task
+ids.
+
+A fresh refused call must still acquire no invocation lease, while a successful
+tracked invocation must commit a result produced after it owns execution
+authority.
+
+The history tool therefore uses one explicit two-read exception:
+
+    canonical payload
+    -> arguments hash
+    -> actor-bound completed replay preflight
+    -> ordinary read-only classification and policy.check([])
+    -> domain.read_task_history(...) authorization probe; discard its value
+       -> foreign/missing: OUT_OF_SCOPE with no lease
+    -> idempotency.acquire(...)
+       -> REPLAY: return the stored result
+       -> EXECUTE:
+          -> read domain.read_task_history(...) again
+          -> write zero task events
+          -> serialize the post-lease page
+          -> complete the invocation in the same transaction
+          -> commit
+
+The duplicated bounded read is deliberate. The pre-lease value is authorization
+evidence only; it must not become the committed tool result. Factoring the
+history scope check into a separate helper is declined for this patch because it
+would widen the change into a domain/SQL refactor.
+
+History pages remain newest first at the domain/tool boundary. For a user's
+request for complete history, the prompt must follow `next_before_event_id`
+until null and then narrate the collected events oldest to newest unless the
+user requests another ordering.
+
+A current seeded task with zero recorded events is reported as having no
+recorded audit events; the agent must not invent an original v1 snapshot.
+
+Deleted-task history is supported when the authoritative task id is known.
+Resolving an unknown deleted task from title alone remains out of scope.
