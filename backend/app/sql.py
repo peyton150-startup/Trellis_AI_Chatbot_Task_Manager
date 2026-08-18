@@ -699,3 +699,127 @@ UPDATE linear_agent_inbox AS inbox
  WHERE inbox.id = candidate.id
 RETURNING inbox.*;
 """
+
+
+# ---------------------------------------------------------------------------
+# T00W worker. Session continuity, turn finalization, and token rotation.
+# ---------------------------------------------------------------------------
+
+# The per-AgentSession continuity cursor, created on demand.
+#
+# `ON CONFLICT ... DO UPDATE` rather than `DO NOTHING`, because `DO NOTHING`
+# returns no row on the second call and the caller needs the current cursor, not
+# an absence it would have to re-read in a second statement that could race.
+UPSERT_LINEAR_AGENT_SESSION = """
+INSERT INTO linear_agent_sessions (organization_id, agent_session_id)
+VALUES (%(organization_id)s, %(agent_session_id)s)
+ON CONFLICT (organization_id, agent_session_id)
+DO UPDATE SET updated_at = now()
+RETURNING *;
+"""
+
+SELECT_LINEAR_AGENT_SESSION = """
+SELECT *
+  FROM linear_agent_sessions
+ WHERE organization_id = %(organization_id)s
+   AND agent_session_id = %(agent_session_id)s;
+"""
+
+# The run this inbox row executed, recorded before the model is invoked.
+#
+# Written first so that a crash mid-turn leaves the link durable. The worker
+# treats a claimed row that already carries a run_id as a turn whose outcome it
+# cannot re-derive, and refuses to execute it a second time. That is the whole
+# duplicate-mutation defense, and it only works if this write precedes execution.
+SET_LINEAR_INBOX_RUN = """
+UPDATE linear_agent_inbox
+   SET run_id = %(run_id)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+# Terminal success for one turn. Half of an atomic pair; see the worker.
+COMPLETE_LINEAR_INBOX = """
+UPDATE linear_agent_inbox
+   SET status = 'completed',
+       claimed_until = NULL,
+       completed_at = now(),
+       run_id = %(run_id)s,
+       last_error = %(last_error)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+# The other half. Advances the continuity cursor to the run just completed.
+#
+# This statement and COMPLETE_LINEAR_INBOX run in one transaction and commit
+# together. A cursor advanced without the completion would replay the turn on a
+# successor it already influenced; a completion without the advance would drop
+# the conversation's history. Neither is acceptable, so neither is separable.
+ADVANCE_LINEAR_AGENT_SESSION = """
+INSERT INTO linear_agent_sessions (
+  organization_id, agent_session_id, last_completed_run_id
+) VALUES (
+  %(organization_id)s, %(agent_session_id)s, %(run_id)s
+)
+ON CONFLICT (organization_id, agent_session_id)
+DO UPDATE SET last_completed_run_id = EXCLUDED.last_completed_run_id,
+              updated_at = now()
+RETURNING *;
+"""
+
+# Transient release. The row stays pending, the lease is dropped, and not_before
+# moves forward so a hot loop cannot spin on a failing row.
+#
+# `run_id` is set back to NULL deliberately. The caller reaches this path only
+# after establishing that no mutation committed, which is what makes a second
+# execution safe; leaving the id set would make the duplicate-execution guard
+# refuse the retry this path exists to permit.
+RELEASE_LINEAR_INBOX = """
+UPDATE linear_agent_inbox
+   SET claimed_until = NULL,
+       run_id = NULL,
+       not_before = now() + make_interval(secs => %(backoff_seconds)s),
+       last_error = %(last_error)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+# Terminal local failure. Distinct from 'refused': refused is a permanent answer
+# reached at ingress about authorization, and failed is a turn that was accepted
+# and could not be completed. The CHECK constraint keeps refusal_reason NULL here.
+FAIL_LINEAR_INBOX = """
+UPDATE linear_agent_inbox
+   SET status = 'failed',
+       claimed_until = NULL,
+       completed_at = now(),
+       run_id = %(run_id)s,
+       last_error = %(last_error)s
+ WHERE id = %(id)s
+RETURNING *;
+"""
+
+# The refresh lock. `FOR UPDATE` rather than a bare SELECT, because the decision
+# "is this token expired" and the act of replacing it must not be separable: two
+# workers that both read an expired token would both refresh, and Linear rotates
+# refresh tokens, so the loser would persist a value the provider has already
+# superseded.
+LOCK_ACTIVE_LINEAR_INSTALLATION = """
+SELECT *
+  FROM linear_installations
+ WHERE status = 'active'
+   FOR UPDATE;
+"""
+
+# Rotation persistence. Linear issues a new refresh token on every refresh, so
+# the returned value replaces the stored one. COALESCE keeps the existing token
+# when a response carries none rather than nulling a credential that still works.
+UPDATE_LINEAR_INSTALLATION_TOKENS = """
+UPDATE linear_installations
+   SET access_token = %(access_token)s,
+       refresh_token = COALESCE(%(refresh_token)s, refresh_token),
+       access_token_expires_at = now() + make_interval(secs => %(expires_in)s),
+       updated_at = now()
+ WHERE id = %(id)s
+RETURNING *;
+"""

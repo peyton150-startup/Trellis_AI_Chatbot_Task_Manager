@@ -5097,6 +5097,24 @@ jobs:
           DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
         run: python -m pytest tests/test_linear_ingress.py -q
 
+      # The worker, which is the half of T00W no ingress test can reach. Runs
+      # with the same empty Linear environment as the provider step above, and
+      # with no model credential either: every model invocation is a
+      # FunctionModel and every provider call is a fake, so a path that silently
+      # required NVIDIA, OpenAI, or a Linear credential fails here rather than
+      # skipping.
+      - name: Verify the deterministic AgentSession worker
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+          LINEAR_CLIENT_ID: ""
+          LINEAR_CLIENT_SECRET: ""
+          LINEAR_WEBHOOK_SECRET: ""
+          LINEAR_ALLOWED_USER_ID: ""
+          TRELLIS_PUBLIC_ORIGIN: ""
+          NVIDIA_API_KEY: ""
+        run: python -m pytest tests/test_linear_worker.py -q
+
       # The whole cumulative suite, because T00W touches main.py, sql.py, and
       # config.py, and a route or statement change can break a gate that never
       # mentions Linear.

@@ -2026,3 +2026,83 @@ proves. T00W ships in more than one commit, a narrow deviation from one task, on
 commit that D-69 records and that applies to T00W alone. The live deployment gate
 is untouched and open. Neither this commit nor the implementation that follows
 may be reported as `T00W COMPLETE`.
+
+## T00W: AgentSession worker
+
+**Local role:** `backend/app/linear_agent_worker.py` turns one claimed
+`linear_agent_inbox` row into one Trellis application run and one Linear Agent
+Activity. It owns prompt extraction from the stored authenticated payload,
+credential freshness, continuity resolution, direct invocation of the existing
+`agent.get_agent()` toolset, terminal persistence of history, usage, and run
+status, outbound delivery, and the finalization of the inbox row.
+
+**Whole-system role:** It is the second half of the D-69 conversation plane.
+Ingress proves a webhook is authentic and authorized and stops there, because
+Linear allows five seconds and a model turn does not fit inside it. This module
+is where a Linear message becomes real Trellis work while every existing trust
+boundary stays where it was: `runs.create_turn` still issues the run id,
+`runs.load_history` is still the only source of history, `policy.check` still
+governs every mutation, and the approval bridge still decides destructive work in
+Trellis rather than on the model's word. No transport-neutral execution core was
+introduced; the worker calls `Agent.run` directly, which is what proves the
+existing seam was already transport-independent.
+
+**Inputs and dependencies:** `linear_agent.claim_next_linear_inbox` for the
+per-AgentSession serialized lease; `linear_agent_api` for every remote call, via
+a `provider()` indirection so no second HTTP client exists; `linear_installations`
+for the authoritative ACTIVE installation and its rotating credential;
+`linear_agent_sessions.last_completed_run_id` for server-owned continuity;
+`agent.build_agent`'s six tools, `RunEffects`, and `_open_approval`.
+
+**Outputs and consumers:** `agent_runs` rows indistinguishable from AG-UI turns,
+so the browser sees Linear-originated work in the same history; an advanced
+session cursor; a completed, failed, or released inbox row carrying a durable
+machine-readable `last_error`; and one Agent Activity per turn.
+
+**Failure semantics, which are the point of the module:**
+
+```text
+before execution      terminal (_Terminal) or released with backoff (_Transient)
+mutation committed    terminal; never retried, run truth preserved
+no mutation           released, run link cleared, cursor untouched
+delivery failed       run stays completed, cursor advances, error recorded
+approval required     run awaiting_approval, cursor NOT advanced, row completed
+already has run_id    finalized from the run, never executed a second time
+```
+
+Trellis mutation success and Linear delivery success are separate facts and are
+recorded separately. A committed mutation followed by a failed
+`agentActivityCreate` is a completed run and a failed delivery, in that order.
+`inbox.run_id` is written before the model is invoked, which is what makes the
+duplicate-execution guard state rather than care.
+
+**Verification:**
+
+```powershell
+cd backend; ruff check .
+cd backend; python -m pytest tests/test_linear_worker.py -q
+cd backend; python -m pytest -m "not network" -q
+```
+
+Observed: ruff clean; `tests/test_linear_worker.py` 33 passed; the four Linear
+files together 153 passed; the cumulative deterministic suite 213 passed, 13
+deselected, against 180 selected before this change. `FunctionModel` drives every
+model invocation and a fake provider stands in for `linear_agent_api`, so the new
+CI step runs with `NVIDIA_API_KEY` and every Linear value empty. The gate is a new
+step inside the existing `T00W Linear webhook bridge` check, whose name is
+unchanged because branch protection already references it.
+
+**Limitations and review status:** Three facts remain unresolved against the live
+provider. First, prompt location: Linear's documentation names
+`agentActivity.body` for a prompted event while the observed payload nests it
+under `agentActivity.content`; `extract_prompt` accepts both, content first, and
+is pure so a live payload corrects it without touching execution. Second, the
+`created` action's prompt is taken from `promptContext` and falls back to the
+originating comment, which is documented but not yet observed on a live payload.
+Third, resubmitting an AgentActivity UUID was measured live to return a GraphQL
+"conflict on insert" error, so no retry was added anywhere around delivery and
+the caller-owned id is treated as a duplicate detector rather than a replay
+token. Native approval continuation from inside Linear is deliberately out of
+scope: an approval-required turn writes the authoritative pending row through the
+existing bridge and elicits the human to decide in Trellis. The live deployment
+gate remains open, and T00W must not be reported as complete.
