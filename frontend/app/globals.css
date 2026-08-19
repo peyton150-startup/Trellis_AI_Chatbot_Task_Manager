@@ -272,6 +272,21 @@ main {
   line-height: 1.4;
   margin: 0 0 1rem;
   min-height: 2.8em;
+
+  /*
+   * Notes are stored with real newline characters, and the card was collapsing
+   * them into spaces. `pre-wrap` makes a requested line break visible and keeps
+   * an intentional blank line intact, while ordinary one-line notes are
+   * unaffected and long text still wraps.
+   *
+   * `anywhere` is not optional alongside it: preserving whitespace would
+   * otherwise let one long unbroken token push past the edge of the card.
+   *
+   * This is presentation only. TaskCard still renders `task.notes` as escaped
+   * React text, so nothing here turns task data into markup.
+   */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .muted {
@@ -363,6 +378,18 @@ main {
   align-items: center;
   display: flex;
   gap: 0.65rem;
+}
+
+.board__summary-copy {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0;
+}
+
+.board__summary-title {
+  font-weight: 700;
 }
 
 .board__filter-toggle {
