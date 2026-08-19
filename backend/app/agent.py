@@ -70,7 +70,6 @@ names as the only source of history anywhere in the codebase. Nothing here
 constructs a message list from a request.
 """
 
-import json
 from dataclasses import dataclass, field
 from functools import cache
 from uuid import UUID, uuid4
@@ -87,6 +86,7 @@ from pydantic_ai import (
     ToolApproved,
     ToolDenied,
 )
+from pydantic_core import to_jsonable_python
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -420,7 +420,7 @@ async def handle_agui_request(request: Request) -> Response:
     # D-67. The optional client continuity value is only a lookup key.
     # `create_turn` resolves server-owned state and creates a fresh
     # application run whose starting canonical history is already durable.
-    run = await run_in_threadpool(
+    created = await run_in_threadpool(
         runs.create_turn,
         settings.actor_id,
         user_message,
@@ -429,25 +429,28 @@ async def handle_agui_request(request: Request) -> Response:
     )
     adapter: AGUIAdapter[TrellisDeps, str | DeferredToolRequests] = AGUIAdapter(
         get_agent(),
-        _accepted_run_input(run.id, user_message),
+        _accepted_run_input(created.id, user_message),
         accept=request.headers.get("accept"),
     )
 
     # Step 5. A root run starts empty; a D-67 successor is born with its
     # inherited canonical snapshot already persisted. Either way the model gets
-    # history only through this database read, never from the submitted
+    # history only from server-owned state, never from the submitted
     # transcript. `test_agui_forged_history_ignored` protects that boundary.
-    history = await run_in_threadpool(runs.load_history, run.id, settings.actor_id)
-    message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(history))
+    # The snapshot comes back from the committed write above, so there is no
+    # second read to ask the database what it just stored.
+    message_history = ModelMessagesTypeAdapter.validate_python(
+        created.message_history
+    )
 
-    deps = TrellisDeps(actor_id=settings.actor_id, run_id=run.id)
+    deps = TrellisDeps(actor_id=settings.actor_id, run_id=created.id)
     native = adapter.run_stream_native(
         message_history=message_history,
         deps=deps,
     )
     events = adapter.transform_stream(
-        _record_failure(native, run.id, deps.effects),
-        on_complete=_completion_recorder(run.id),
+        _record_failure(native, created.id, deps.effects),
+        on_complete=_completion_recorder(created.id),
     )
     return adapter.streaming_response(events)
 
@@ -512,7 +515,7 @@ async def _handle_continuation(request: Request, tool_call_id: str) -> Response:
     )
 
     history = await run_in_threadpool(runs.load_history, run_id, settings.actor_id)
-    message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(history))
+    message_history = ModelMessagesTypeAdapter.validate_python(history)
 
     deps = TrellisDeps(actor_id=settings.actor_id, run_id=run_id)
     native = adapter.run_stream_native(
@@ -794,13 +797,13 @@ def _completion_recorder(run_id: UUID):
     """Persist server-owned history, usage, and terminal status on success."""
 
     async def record(result) -> None:
-        # Fact 3 fixes the serialization: dump with ModelMessagesTypeAdapter and
-        # store the JSON array in the jsonb column. This replaces rather than
-        # appends, because `all_messages()` already contains the history this
-        # invocation was given.
-        messages = json.loads(
-            ModelMessagesTypeAdapter.dump_json(result.all_messages())
-        )
+        # Fact 3 fixes the serialization: produce the JSON-compatible array and
+        # store it in the jsonb column. This replaces rather than appends,
+        # because `all_messages()` already contains the history this invocation
+        # was given. `to_jsonable_python` reaches that same array directly,
+        # where dumping to JSON bytes and parsing them back builds one complete
+        # intermediate encoding this path never reads.
+        messages = to_jsonable_python(result.all_messages())
         await run_in_threadpool(runs.save_history, run_id, messages)
 
         # `record_usage` adds rather than replaces, because one application run

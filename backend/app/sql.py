@@ -526,15 +526,18 @@ RETURNING *;
 
 # D-67. A successor ordinary turn is born with the predecessor's
 # server-owned canonical history already persisted.
-INSERT_RUN_WITH_HISTORY = """
+INSERT_RUN_INHERITING_HISTORY = """
 INSERT INTO agent_runs (actor_id, prompt, model, message_history)
-VALUES (
+SELECT
     %(actor_id)s,
     %(prompt)s,
     %(model)s,
-    %(message_history)s
-)
-RETURNING *;
+    predecessor.message_history
+  FROM agent_runs AS predecessor
+ WHERE predecessor.id = %(continuity_run_id)s
+   AND predecessor.actor_id = %(actor_id)s
+   AND predecessor.status = 'completed'
+RETURNING id, message_history;
 """
 
 UPDATE_RUN_STATUS = """
@@ -553,8 +556,7 @@ RETURNING *;
 UPDATE_RUN_HISTORY = """
 UPDATE agent_runs
    SET message_history = %(message_history)s
- WHERE id = %(run_id)s
-RETURNING *;
+ WHERE id = %(run_id)s;
 """
 
 UPDATE_RUN_USAGE = """
@@ -566,6 +568,20 @@ UPDATE agent_runs
        cost_cents = cost_cents + %(cost_cents)s
  WHERE id = %(run_id)s
 RETURNING *;
+"""
+
+SELECT_RUN_OWNERSHIP = """
+SELECT 1 AS owned
+  FROM agent_runs
+ WHERE id = %(run_id)s
+   AND actor_id = %(actor_id)s;
+"""
+
+SELECT_RUN_HISTORY = """
+SELECT message_history
+  FROM agent_runs
+ WHERE id = %(run_id)s
+   AND actor_id = %(actor_id)s;
 """
 
 SELECT_RUN = """

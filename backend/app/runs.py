@@ -26,6 +26,7 @@ section 10 is amended to name it. See D-42.
 """
 
 from datetime import timedelta
+from dataclasses import dataclass
 from uuid import UUID
 
 from psycopg.types.json import Json
@@ -60,6 +61,18 @@ UNDOABLE_STATUSES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class CreatedTurn:
+    """What creating a turn commits: the new run id and its starting history.
+
+    Deliberately not an `AgentRun`. A partially populated run model would
+    invite callers to read fields the write never returned.
+    """
+
+    id: UUID
+    message_history: list
+
+
 def _load_owned_run(conn, run_id: UUID, actor_id: UUID) -> AgentRun:
     """Resolve one actor-owned run through an existing connection.
 
@@ -72,18 +85,6 @@ def _load_owned_run(conn, run_id: UUID, actor_id: UUID) -> AgentRun:
     if row is None:
         raise OutOfScopeError()
     return AgentRun.model_validate(row)
-
-
-def _load_completed_owned_run(
-    conn,
-    run_id: UUID,
-    actor_id: UUID,
-) -> AgentRun:
-    """Resolve one D-67 continuity predecessor or refuse."""
-    run = _load_owned_run(conn, run_id, actor_id)
-    if run.status is not RunStatus.COMPLETED:
-        raise OutOfScopeError()
-    return run
 
 
 def create(actor_id: UUID, prompt: str, model: str) -> AgentRun:
@@ -102,15 +103,27 @@ def create_turn(
     prompt: str,
     model: str,
     continuity_run_id: UUID | None,
-) -> AgentRun:
+) -> CreatedTurn:
     """Create one ordinary AG-UI turn under D-67.
 
     Without a continuity locator this creates a root run.
 
     With a locator, predecessor ownership, completed-state eligibility,
-    canonical-history selection, and successor creation share one database
-    transaction. The successor is committed with inherited history already
-    present before model execution can begin.
+    canonical-history selection, and successor creation are one statement.
+    PostgreSQL reads the predecessor's history and writes the successor row
+    without that history making a round trip through this process: the
+    predicate list is the authority, and a predecessor that is missing, owned
+    by another actor, or not completed simply matches no row, so nothing is
+    inserted and the refusal is identical for all three.
+
+    The successor is committed with inherited history already present before
+    model execution can begin, exactly as before.
+
+    Returns the committed creation result rather than a full run. Callers need
+    the new id and the canonical history the model starts from, and both come
+    back from the write itself, so neither has to be read again. This is
+    PostgreSQL's committed creation result, not a second history authority:
+    `load_history` remains the way to read an already-existing run.
     """
     with pool.connection() as conn:
         if continuity_run_id is None:
@@ -123,26 +136,27 @@ def create_turn(
                 },
             ).fetchone()
         else:
-            predecessor = _load_completed_owned_run(
-                conn,
-                continuity_run_id,
-                actor_id,
-            )
             row = conn.execute(
-                sql.INSERT_RUN_WITH_HISTORY,
+                sql.INSERT_RUN_INHERITING_HISTORY,
                 {
                     "actor_id": actor_id,
                     "prompt": prompt,
                     "model": model,
-                    "message_history": Json(
-                        list(predecessor.message_history)
-                    ),
+                    "continuity_run_id": continuity_run_id,
                 },
             ).fetchone()
+            if row is None:
+                # No row matched the predicates. Missing, foreign, and
+                # not-completed are one refusal, as they were when this was a
+                # separate SELECT.
+                raise OutOfScopeError()
 
         conn.commit()
 
-    return AgentRun.model_validate(row)
+    return CreatedTurn(
+        id=row["id"],
+        message_history=list(row["message_history"]),
+    )
 
 
 def load(run_id: UUID, actor_id: UUID) -> AgentRun:
@@ -155,6 +169,26 @@ def load(run_id: UUID, actor_id: UUID) -> AgentRun:
         run = _load_owned_run(conn, run_id, actor_id)
         conn.commit()
     return run
+
+
+def assert_owned(run_id: UUID, actor_id: UUID) -> None:
+    """Prove this actor owns this run, and read nothing else.
+
+    Callers that only need the ownership answer used to reach it through
+    `load`, which materializes the whole run including its entire message
+    history. The refusal is identical: the predicate is the same one
+    `SELECT_RUN` carries, so a missing run and another actor's run both return
+    no row and both raise `OutOfScopeError`. Only the amount of state read to
+    reach that answer changes.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.SELECT_RUN_OWNERSHIP,
+            {"run_id": run_id, "actor_id": actor_id},
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise OutOfScopeError()
 
 
 def load_history(run_id: UUID, actor_id: UUID) -> list:
@@ -170,8 +204,22 @@ def load_history(run_id: UUID, actor_id: UUID) -> list:
 
     Nothing else in the codebase constructs a message list, and no request model
     carries one.
+
+    The read selects the history column alone rather than the whole run. The
+    ownership predicate is unchanged and still carried by the statement, so a
+    missing run and another actor's run remain the same refusal: both return no
+    row, and both raise `OutOfScopeError` here. Selecting one column narrows
+    what crosses the wire, not who may read it.
     """
-    return list(load(run_id, actor_id).message_history)
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.SELECT_RUN_HISTORY,
+            {"run_id": run_id, "actor_id": actor_id},
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise OutOfScopeError()
+    return list(row["message_history"])
 
 
 def save_history(run_id: UUID, message_history: list) -> None:

@@ -156,7 +156,12 @@ def replay_completed(
     # scope, and this module is deliberately importable without a database.
     from . import runs
 
-    runs.load(run_id, actor_id)
+    # Ownership only. `assert_owned` carries the same predicate `SELECT_RUN`
+    # does and raises the same OutOfScopeError for a missing run and a foreign
+    # one, without materializing the run's whole message history to answer a
+    # question about who owns it. The check keeps its position: still first,
+    # still terminal, still ahead of the lease read below.
+    runs.assert_owned(run_id, actor_id)
 
     with _pool().connection() as conn:
         row = _select_lease(conn, run_id, tool_call_id)
