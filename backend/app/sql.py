@@ -10,6 +10,72 @@ SELECT *
  LIMIT %(limit)s;
 """
 
+# D-73 single-task discovery. One owner-scoped read that spans current titles and
+# the titles recorded in that actor's own audit rows, so a renamed or deleted
+# task is still reachable by the name the user remembers.
+#
+# `task_events.actor_id` is valid ownership evidence: `owner_id` appears in three
+# INSERTs and no SET clause anywhere in this file, so ownership never transfers,
+# and every event is written with the acting actor. The same two predicates the
+# UNION draws from are the two SELECT_TASK_HISTORY_SCOPE accepts, which is what
+# makes a resolved id always readable by `read_task_history`.
+#
+# `match_rank` is 0 for a case-insensitive exact title and 1 for a substring hit.
+# It is returned for domain to read and is deliberately absent from the wire
+# model, so exactness has one definition in the system rather than a SQL rule and
+# a Python rule that can drift apart.
+#
+# Ordering matters for correctness, not presentation. Exact rows sort ahead of
+# substring rows before LIMIT applies, so with the argument floor of two, a
+# second exact task can never be truncated away behind a substring match. That
+# is what lets a unique exact title resolve on a bounded query without a short
+# window ever manufacturing uniqueness.
+SELECT_TASK_REFERENCE_CANDIDATES = """
+WITH candidates AS (
+  SELECT t.id AS task_id, t.title AS matched_title,
+         t.title AS current_title, t.version AS current_version,
+         TRUE AS exists_now,
+         CASE WHEN lower(t.title) = lower(%(reference)s) THEN 0 ELSE 1 END AS match_rank,
+         0 AS source_rank, t.updated_at AS observed_at
+    FROM tasks t
+   WHERE t.owner_id = %(owner_id)s
+     AND position(lower(%(reference)s) in lower(t.title)) > 0
+
+  UNION ALL
+
+  SELECT e.task_id, titles.title AS matched_title,
+         current.title AS current_title,
+         current.version AS current_version,
+         current.id IS NOT NULL AS exists_now,
+         CASE WHEN lower(titles.title) = lower(%(reference)s) THEN 0 ELSE 1 END,
+         1, e.created_at
+    FROM task_events e
+    CROSS JOIN LATERAL (
+      VALUES (e.before->>'title'), (e.after->>'title')
+    ) AS titles(title)
+    LEFT JOIN tasks current
+      ON current.id = e.task_id AND current.owner_id = %(owner_id)s
+   WHERE e.actor_id = %(owner_id)s
+     AND titles.title IS NOT NULL
+     AND position(lower(%(reference)s) in lower(titles.title)) > 0
+),
+ranked AS (
+  SELECT *,
+         row_number() OVER (
+           PARTITION BY task_id
+           ORDER BY match_rank, source_rank, observed_at DESC
+         ) AS rn
+    FROM candidates
+)
+SELECT task_id, matched_title, current_title, current_version, exists_now,
+       match_rank
+  FROM ranked
+ WHERE rn = 1
+ ORDER BY match_rank, source_rank,
+          lower(COALESCE(current_title, matched_title)), task_id
+ LIMIT %(limit)s;
+"""
+
 # The scope load for BUILD_SPEC section 6 step 1, added at T04 under D-17.
 # Section 5 lists no statement that loads owners by a set of task ids, and
 # SELECT_TASKS_FOR_OWNER cannot serve because it filters by owner_id, has no id

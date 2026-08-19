@@ -107,6 +107,7 @@ from .models import (
     GetTaskHistoryArgs,
     ListTasksArgs,
     ProposePlanArgs,
+    ResolveTaskReferenceArgs,
     RunStatus,
     Task,
     ToolName,
@@ -140,7 +141,7 @@ _APPROVAL_ARGS_MODELS = {
 ALL_TOOLS = frozenset(name.value for name in ToolName)
 
 # T00W. The profile a Linear AgentSession runs under, and it is deliberately
-# five tools rather than the full browser profile.
+# narrower than the full browser profile.
 #
 # The two omitted tools are exactly the two that can require approval, and that
 # is the whole argument. Trellis decides destructive work through a human
@@ -163,6 +164,7 @@ LINEAR_TOOLS = frozenset(
     {
         ToolName.LIST_TASKS.value,
         ToolName.GET_TASK_HISTORY.value,
+        ToolName.RESOLVE_TASK_REFERENCE.value,
         ToolName.CREATE_TASK.value,
         ToolName.UPDATE_TASK.value,
         ToolName.PROPOSE_PLAN.value,
@@ -295,6 +297,14 @@ def build_agent(
     ) -> dict:
         """Read one authoritative page of durable history for a task."""
         return tools.get_task_history(_tool_context(ctx), arguments)
+
+    @_tool(ToolName.RESOLVE_TASK_REFERENCE.value)
+    def resolve_task_reference(
+        ctx: RunContext[TrellisDeps],
+        arguments: ResolveTaskReferenceArgs,
+    ) -> dict:
+        """Resolve a current or historical task reference without mutation."""
+        return tools.resolve_task_reference(_tool_context(ctx), arguments)
 
     @_tool(ToolName.CREATE_TASK.value)
     def create_task(

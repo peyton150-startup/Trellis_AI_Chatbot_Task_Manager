@@ -320,15 +320,17 @@ approvals = whether a human-authorized consequence may proceed
 The model cannot run arbitrary application code. Trellis exposes narrow,
 typed tools through an explicit capability profile.
 
-The browser / AG-UI profile exposes seven tools. The Linear AgentSession
-profile exposes five: it includes the read-only history capability but
-continues to omit `bulk_update_tasks` and `delete_tasks`, whose execution can
-depend on the browser approval-continuation path.
+The browser / AG-UI profile exposes the full tool set. The Linear
+AgentSession profile is a reduced safe profile: it includes the read-only
+history and discovery capabilities but continues to omit
+`bulk_update_tasks` and `delete_tasks`, whose execution can depend on the
+browser approval-continuation path.
 
 | Tool | Purpose | Browser / AG-UI | Linear | Approval |
 |---|---|---|---|---|
 | `list_tasks` | Read current tasks through typed filters | Yes | Yes | No |
 | `get_task_history` | Read recorded durable history for one task | Yes | Yes | No |
+| `resolve_task_reference` | Resolve one current or historical task title to an authoritative task | Yes | Yes | No |
 | `create_task` | Create one task | Yes | Yes | No |
 | `update_task` | Update one versioned task | Yes | Yes | No |
 | `bulk_update_tasks` | Update a bounded set of tasks | Yes | No | Required above the blast-radius threshold |
@@ -340,6 +342,14 @@ projection used by the HTTP history endpoint. It does not create a second
 history store. It supports current tasks, deleted tasks when their
 authoritative id is known, pagination, and current seeded tasks that have no
 recorded audit events.
+
+`resolve_task_reference` supplies the authoritative id when the caller does
+not already have one, which is what makes deleted-task history reachable
+from the title a user remembers. It searches the actor's current titles and
+the titles recorded in that actor's own audit rows, and deterministic domain
+code, not the model, decides which task a reference means. It is read-only,
+requires no approval, and is not a second task store: PostgreSQL remains the
+authority for both current state and history.
 
 Schemas use explicit fields and enums. There is no arbitrary SQL tool and no
 free-form task filter field.

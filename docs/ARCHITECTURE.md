@@ -302,16 +302,18 @@ Six tools. Explicit enums, required fields, no free-form filters. Narrow schemas
 | `delete_tasks` | always | |
 | `propose_plan` | n/a | returns a plan for display, mutates nothing |
 
-### D-71 current capability amendment
+### D-71 and D-73 current capability amendment
 
-Part 5 above remains the historical Day 1 six-tool architecture. D-71 adds one read-only capability without rewriting that original contract.
+Part 5 above remains the historical Day 1 six-tool architecture. D-71 and D-73 each add one read-only capability without rewriting that original contract.
 
 Current profiles:
 
-- Browser / AG-UI: `list_tasks`, `get_task_history`, `create_task`, `update_task`, `bulk_update_tasks`, `delete_tasks`, `propose_plan`
-- Linear AgentSession: `list_tasks`, `get_task_history`, `create_task`, `update_task`, `propose_plan`
+- Browser / AG-UI: `list_tasks`, `get_task_history`, `resolve_task_reference`, `create_task`, `update_task`, `bulk_update_tasks`, `delete_tasks`, `propose_plan`
+- Linear AgentSession: `list_tasks`, `get_task_history`, `resolve_task_reference`, `create_task`, `update_task`, `propose_plan`
 
-`get_task_history` is read-only. It reads the existing actor-scoped durable task history projection, requires no approval, writes no task events, and never sets `mutation_committed`. Deleted-history lookup requires the authoritative task id.
+`get_task_history` is read-only. It reads the existing actor-scoped durable task history projection, requires no approval, writes no task events, and never sets `mutation_committed`.
+
+`resolve_task_reference` is read-only on the same terms and supplies that authoritative task id when the caller lacks one. It searches actor-owned current titles and the titles in that actor's own `task_events` rows, deduplicates per task, and returns a bounded candidate list plus the one task deterministic domain code resolved, if any. It adds no table, no migration, and no second history store.
 
 ---
 
