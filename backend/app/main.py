@@ -58,7 +58,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from app import agent, domain, linear_agent, linear_install, runs, seed
+from app import agent, domain, limits, linear_agent, linear_install, runs, seed
 from app.config import settings
 from app.db import pool
 from app.errors import (
@@ -83,6 +83,12 @@ from app.models import (
 
 
 app = FastAPI(title="Trellis", version="0.1.0")
+
+# D-74. Transport admission, outside every route and every body parser. A byte
+# ceiling and a field ceiling protect different resources, and only this one
+# bounds what may be buffered before a declared model is ever constructed. See
+# `limits.BodySizeLimitMiddleware` for why it admits rather than interrupts.
+app.add_middleware(limits.BodySizeLimitMiddleware)
 
 
 async def _require_no_body(request: Request) -> None:
@@ -344,12 +350,21 @@ async def post_linear_webhook(request: Request) -> Response:
     post an activity, not to revoke. A provider round trip inside a five second
     budget buys nothing the worker cannot do afterwards.
 
-    The status codes are chosen for what they tell Linear to do next. A 401 or
-    400 says this delivery will never be acceptable, so a retry would spend six
-    hours reaching the same answer. A 200 says it is handled, including when the
-    answer was a permanent refusal that is now durably recorded. A 5xx is
+    The status codes are chosen for what they say about this delivery, not for
+    what they can make Linear do. Linear retries any non-200 response, up to
+    three times with backoff, so a 400 or 401 does not suppress a retry and was
+    never able to. What it does say is that the delivery is unacceptable, and a
+    retry of an unacceptable delivery is refused again for the same reason
+    rather than being quietly absorbed. A 200 says it is handled, including when
+    the answer was a permanent refusal that is now durably recorded. A 5xx is
     reserved for our own failure before a durable decision exists, which is the
     one case where retrying can genuinely succeed.
+
+    D-74 adds one more refusal in front of all of this, and it is not raised
+    here: a body past `limits.LINEAR_WEBHOOK_MAX_BODY_BYTES` is answered by the
+    admission boundary before this route is entered at all. That is deliberately
+    not a 200. Returning success to stop the retries would claim the delivery
+    was handled when it was never authenticated, parsed, or stored.
     """
     raw_body = await request.body()
 

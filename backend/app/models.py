@@ -6,6 +6,16 @@ from uuid import UUID
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue
 
+from app.limits import (
+    BROWSER_USER_MESSAGE_MAX_CHARS,
+    BULK_TASK_IDS_MAX,
+    DELETE_TASK_IDS_MAX,
+    PLAN_STEP_MAX_CHARS,
+    PLAN_STEPS_MAX,
+    PLAN_SUMMARY_MAX_CHARS,
+    TASK_NOTES_MAX_CHARS,
+)
+
 
 class TrellisModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -100,6 +110,14 @@ class UndoReason(str, Enum):
 
 TaskTitle = Annotated[str, Field(min_length=1, max_length=500)]
 
+# D-74. Every free text field an actor or a model can grow without bound
+# carries an explicit ceiling. The values live in `limits.py` because they are
+# safety invariants rather than tunables; see that module for the argument.
+TaskNotes = Annotated[str, Field(max_length=TASK_NOTES_MAX_CHARS)]
+UserMessageText = Annotated[str, Field(max_length=BROWSER_USER_MESSAGE_MAX_CHARS)]
+PlanSummary = Annotated[str, Field(max_length=PLAN_SUMMARY_MAX_CHARS)]
+PlanStep = Annotated[str, Field(max_length=PLAN_STEP_MAX_CHARS)]
+
 
 class Task(TrellisModel):
     id: UUID
@@ -177,7 +195,7 @@ class Approval(TrellisModel):
 
 
 class CreateRunRequest(TrellisModel):
-    user_message: str
+    user_message: UserMessageText
 
 
 RunRequest = CreateRunRequest
@@ -373,7 +391,7 @@ class ResolveTaskReferenceResponse(TrellisModel):
 
 class CreateTaskArgs(TrellisModel):
     title: TaskTitle
-    notes: str = ""
+    notes: TaskNotes = ""
     due_date: date | None = None
     priority: TaskPriority = TaskPriority.MEDIUM
     blocked_by: UUID | None = None
@@ -381,7 +399,7 @@ class CreateTaskArgs(TrellisModel):
 
 class MutableTaskFields(TrellisModel):
     title: TaskTitle | None = None
-    notes: str | None = None
+    notes: TaskNotes | None = None
     due_date: date | None = None
     priority: TaskPriority | None = None
     status: TaskStatus | None = None
@@ -394,13 +412,15 @@ class UpdateTaskArgs(MutableTaskFields):
 
 
 class BulkUpdateTasksArgs(MutableTaskFields):
-    task_ids: list[UUID]
+    # One accepted call may not name more than this many targets. It does not
+    # bound how many such calls a run may make; that is a separate dimension.
+    task_ids: list[UUID] = Field(max_length=BULK_TASK_IDS_MAX)
 
 
 class DeleteTasksArgs(TrellisModel):
-    task_ids: list[UUID]
+    task_ids: list[UUID] = Field(max_length=DELETE_TASK_IDS_MAX)
 
 
 class ProposePlanArgs(TrellisModel):
-    summary: str
-    steps: list[str]
+    summary: PlanSummary
+    steps: list[PlanStep] = Field(max_length=PLAN_STEPS_MAX)

@@ -2393,3 +2393,94 @@ adding an index is deferred until evidence requires it. Live-host and live-Linea
 behavior is unverified from the authoring session. This entry records author-run
 verification only; the neutral Sonnet review under `CLAUDE.md`, executing in a
 fresh Vercel Sandbox at the pinned final SHA, is still outstanding.
+
+
+## D-74: deterministic bounds on accepted request and input size
+
+**Local role:** `backend/app/limits.py` owns every absolute resource ceiling in
+the build and the ASGI admission boundary that enforces the byte ones. It is the
+only place a limit is written down, and it reads nothing from the environment.
+`BodySizeLimitMiddleware` consumes each request stream up to the applicable
+ceiling plus one byte, answers the section 6 `VALIDATION_ERROR` envelope itself
+when the body is larger, and otherwise replays the exact received bytes to the
+application. `models.py` carries the typed ceilings for accepted text, notes,
+plans, and bulk target lists; `agent.py` bounds the accepted newest AG-UI
+message; `linear_agent_worker.py` bounds the extracted Linear prompt at the
+action-aware seam it already had.
+
+**Whole-system role:** Trellis proves that deterministic application code, not
+the model, owns the trust boundary. Until now that claim covered authorization,
+approvals, idempotency, audit, and undo, but not consumption: an accepted
+workload could ask for an arbitrarily large amount of memory before any of those
+controls ran, and the honest answer to "how much can one request cost" was that
+nobody had bounded it. This is the first of the resource layers and it closes
+the input dimension. It also protects the demo directly. The Linear webhook is a
+public HTTPS endpoint, and an unbounded body on a public endpoint is the cheapest
+possible way to take the service down in front of an audience.
+
+**Inputs and dependencies:** the section 9 wire contract and the closed error
+vocabulary in `errors.py` (D-55); the exact-raw-bytes HMAC boundary from T00W
+and D-69; the action-aware prompt extraction the Linear worker already owned;
+the D-48 bodyless `POST /api/demo/reset` contract; FastAPI 0.141.1 and Starlette
+behavior as measured, not as assumed.
+
+**Outputs and consumers:** `limits.py` becomes the single import site for any
+later resource work. Task budgets, tool-call ceilings, token limits, mutation
+budgets, and rate limiting all belong beside these constants rather than
+scattered across the modules they constrain. `BODY_TOO_LARGE_MESSAGE` is the
+string a client distinguishes a transport refusal by.
+
+**Verification:** `python -m pytest tests/test_request_limits.py -q` gives 28
+passing cases: admission at exactly 256 KiB and at 256 KiB + 1, at exactly 1 MiB
+and 1 MiB + 1 on the Linear route, a dishonest `Content-Length: 5` in front of an
+oversized body, a chunked body with no declared length at all, the closed error
+envelope preserved on a declared Pydantic body where the naive design produced
+FastAPI's own `400 {"detail": ...}`, byte-for-byte digest equality at the Linear
+signature-verification boundary, absence of any inbox row or application run
+behind a refusal, and every typed ceiling at limit and limit + 1. The full
+cumulative suite is 320 passing, up from 292 at `feb250c`, with no test changed.
+
+A four-case mutation pass backs the boundary rather than the assertions. Each
+mutation was applied to `limits.py` alone, run, and reverted: accepting one byte
+past the ceiling, enforcing on `Content-Length` alone instead of the streamed
+count, applying the 256 KiB default to the Linear route, and corrupting one byte
+of an accepted body before replay. All four were caught. The fourth is the one
+worth naming, because it is the failure a passing signature test would otherwise
+hide: if replay were not byte-exact, every Linear webhook would fail HMAC
+verification in production and nothing in the earlier suite would have said so.
+
+**Review disposition:** the neutral blind Sonnet review of this SHA executed in
+a fresh Vercel Sandbox and reproduced the gate independently: ruff clean, 320
+tests, and both CI guard steps passing. No BLOCK and no MAJOR findings. It
+enumerated the body-bearing routes from source rather than trusting this entry
+and arrived at the same five.
+
+One MINOR, now fixed. This entry claimed admission covers every body-bearing
+route, and it does, but nothing pinned the fifth one: `POST
+/api/runs/{run_id}/approvals/{tool_call_id}`, the second route with a declared
+Pydantic body, had no admission test. The reviewer probed it in the sandbox and
+found it behaviorally correct, so the gap was between what was claimed and what
+was proved rather than in the boundary itself. That is the more dangerous of the
+two, because coverage by construction is a claim about the shape of the code and
+a later change making admission route-aware would break it silently everywhere
+this suite does not look. `test_the_approval_decision_route_is_admitted_like_every_other`
+now pins it, and a mutation exempting that path from admission fails it and
+nothing else, which confirms the other twenty-eight would not have noticed.
+
+**Limitations and review status:** this bounds one accepted workload, not a
+collection of them. Nothing here limits model requests, tool calls, tokens,
+cumulative mutations, delete fan-out, repeated no-progress tool loops, inherited
+conversation context, or request rate, and fifty bulk targets per call does not
+bound how many such calls a run may make. The Linear ceiling of 1 MiB is chosen
+against observed fixtures, the largest of which is 3,695 bytes, and against
+Linear's published description of `promptContext`; Linear publishes no maximum
+AgentSession payload size, so the number is a judgment rather than a measured
+provider bound. Route matching is on the exact ASGI `path`, which is correct for
+this deployment and would need revisiting behind a path-rewriting proxy. Live-host
+and live-Linear behavior is unverified from the authoring session. This entry
+records author-run verification plus the neutral Sonnet review recorded above,
+which ran in a fresh Vercel Sandbox. That review could not verify live-Linear
+webhook behavior against a real delivery, because the sandbox is deliberately
+denied the credential, and it did not re-derive the claim that the interrupting
+middleware design degrades to FastAPI's own `400 {"detail": ...}` envelope,
+because reproducing it would have required modifying repository source.
