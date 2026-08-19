@@ -2544,6 +2544,27 @@ on every notes element on the board. Card title, status, and all 22 fact terms
 render unchanged, the native `<details>` still opens and closes on its summary,
 and the filter panel still mounts and unmounts on its toggle. No console errors.
 
+**Review disposition:** the neutral blind Sonnet review of `e732235` executed in
+a fresh Vercel Sandbox and reproduced every deterministic gate independently:
+ruff clean, 330 backend tests, 4 notes tests, 2 ingress tests, and a clean
+frontend build. No BLOCK and no MAJOR findings. Two were raised and both are
+fixed here rather than accepted.
+
+The MINOR: the polish block re-declared `.board__filter-toggle` padding, leaving
+the earlier declaration alive in the file but fully shadowed. Both carried
+`!important` at equal specificity, so the later one won and the rendering was
+correct, but a future editor changing the first one would have seen nothing
+happen. There is now one declaration, carrying the intended value.
+
+The NIT, which turned out to be worth more than its label: the base
+`.board button:hover` invert was never gated, and the polish block only
+overrode it for `(hover: hover) and (pointer: fine)`. A touchscreen reports a
+hover on tap and never reports leaving it, so on touch a tapped button would
+have stayed inverted with nothing to clear it, in a change whose stated goal
+included touch handling. The base rule is now gated too. Measured after the
+fix: one live toggle padding rule computing to `8px 12px` at 40px height, zero
+ungated hover rules, two gated ones.
+
 **Limitations and review status:** no screenshot was captured; the Browser pane
 was not displayed in the authoring session, so the page was not compositing
 frames. Every visual claim above rests on computed styles and measured geometry
@@ -2553,5 +2574,8 @@ unreviewed. The prompt half pins the contract, not the model: no deterministic
 test proves a real generation emits a newline, and that belongs behind the
 `eval` marker. Live-host and live-Linear behavior is unverified. This entry
 records author-run verification only; the neutral Sonnet review under
-`CLAUDE.md`, executing in a fresh Vercel Sandbox at the pinned final SHA, is
-still outstanding.
+`CLAUDE.md` executed in a fresh Vercel Sandbox and is recorded above. It could
+not reproduce the rendered-geometry claims, because no browser was available to
+it either; it verified the CSS cascade outcome by specificity and source order
+instead and said plainly that this supports rather than proves the visual
+result.

@@ -120,10 +120,17 @@ body {
   padding: 0.58rem 0.8rem;
 }
 
-.board button:hover:not(:disabled),
-.board-state button:hover:not(:disabled) {
-  background: var(--ink);
-  color: var(--surface);
+/*
+ * Gated so a tap on a touch device does not leave a button stuck in a
+ * hovered state it has no way to leave. A touchscreen reports a hover on
+ * tap and never reports leaving it.
+ */
+@media (hover: hover) and (pointer: fine) {
+  .board button:hover:not(:disabled),
+  .board-state button:hover:not(:disabled) {
+    background: var(--ink);
+    color: var(--surface);
+  }
 }
 
 .board button:disabled,
@@ -393,7 +400,8 @@ main {
 }
 
 .board__filter-toggle {
-  padding: 0.35rem 0.6rem !important;
+  /* Sized for a 40px target alongside the other board controls. */
+  padding: 0.5rem 0.75rem !important;
 }
 
 .board__filters {
@@ -598,9 +606,6 @@ main {
   }
 }
 
-.board__filter-toggle {
-  padding: 0.5rem 0.75rem !important;
-}
 
 .board__filters {
   border-radius: var(--trellis-panel-radius);
