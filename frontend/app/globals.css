@@ -470,3 +470,203 @@ main {
     flex-direction: column;
   }
 }
+
+
+/* ----------------------------------------------------------------------------
+   Interaction polish. Presentation only.
+
+   No API behavior, no task semantics, no approval semantics, no AG-UI
+   behavior, and no new JavaScript. Every control below keeps the mechanism it
+   already had: the filter panel is still mounted and unmounted by Board.tsx,
+   Refresh still calls the board's existing refetch path, and the task record
+   is still a native <details>/<summary> that the browser opens. What changes
+   is the size of the target, the feedback on press, and the softness of the
+   surfaces.
+
+   Nothing here moves a control under the pointer. There is no translate() or
+   scale() on any :hover or :active state, because a button that shifts on
+   press is a button that can be missed on the way down.
+
+   Focus rings are deliberately absent: globals.css already gives every button,
+   summary and select a `:focus-visible` outline, and restating it here would be
+   two places to keep in step.
+   -------------------------------------------------------------------------- */
+
+:root {
+  --trellis-card-radius: 16px;
+  --trellis-panel-radius: 16px;
+  --trellis-chat-radius: 20px;
+  --trellis-control-radius: 12px;
+  --trellis-inner-radius: 10px;
+
+  --trellis-shadow:
+    0 4px 16px -8px rgba(0, 0, 0, 0.08),
+    0 1px 2px rgba(0, 0, 0, 0.04);
+
+  --trellis-shadow-raised:
+    0 8px 24px -12px rgba(0, 0, 0, 0.14),
+    0 2px 4px rgba(0, 0, 0, 0.05);
+
+  --trellis-fast: 120ms;
+  --trellis-normal: 180ms;
+  --trellis-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.task-card {
+  border-radius: var(--trellis-card-radius);
+  box-shadow: var(--trellis-shadow);
+  transition:
+    border-color var(--trellis-normal) var(--trellis-ease),
+    box-shadow var(--trellis-normal) var(--trellis-ease);
+}
+
+/* Elevation on hover only where a real pointer exists, so a touchscreen does
+   not leave a card stuck in its hovered state after a tap. */
+@media (hover: hover) and (pointer: fine) {
+  .task-card:hover {
+    box-shadow: var(--trellis-shadow-raised);
+  }
+}
+
+.task-card__record summary {
+  border-radius: var(--trellis-inner-radius);
+  min-height: 40px;
+  padding: 0.5rem 0.4rem;
+  touch-action: manipulation;
+  user-select: none;
+  transition:
+    background-color var(--trellis-fast) var(--trellis-ease),
+    color var(--trellis-fast) var(--trellis-ease);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .task-card__record summary:hover {
+    background: var(--canvas);
+    color: var(--ink);
+  }
+}
+
+.task-card__record summary:active {
+  background: var(--canvas);
+}
+
+/* The browser still decides when the disclosure is open. This only fades the
+   revealed content in afterwards, so no script participates in opening it. */
+.task-card__record[open] > :not(summary) {
+  animation: trellis-disclosure-enter var(--trellis-fast) var(--trellis-ease) both;
+}
+
+@keyframes trellis-disclosure-enter {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.board button,
+.board-state button {
+  border-radius: var(--trellis-control-radius);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+  min-height: 40px;
+  touch-action: manipulation;
+  user-select: none;
+  transition:
+    background-color var(--trellis-fast) var(--trellis-ease),
+    border-color var(--trellis-fast) var(--trellis-ease),
+    box-shadow var(--trellis-fast) var(--trellis-ease),
+    color var(--trellis-fast) var(--trellis-ease);
+}
+
+.board button:active:not(:disabled),
+.board-state button:active:not(:disabled) {
+  background: var(--canvas);
+  box-shadow: inset 0 0 0 1px rgba(20, 95, 117, 0.12);
+}
+
+/* Softer than the inverted fill this replaces. The inverse read as a pressed
+   state on hover, which left nothing distinct for the actual press. */
+@media (hover: hover) and (pointer: fine) {
+  .board button:hover:not(:disabled),
+  .board-state button:hover:not(:disabled) {
+    background: var(--canvas);
+    border-color: var(--muted);
+    box-shadow: var(--trellis-shadow);
+    color: var(--ink);
+  }
+}
+
+.board__filter-toggle {
+  padding: 0.5rem 0.75rem !important;
+}
+
+.board__filters {
+  border-radius: var(--trellis-panel-radius);
+  box-shadow: var(--trellis-shadow);
+  /* Board.tsx already controls mounting. No timer and no second React state. */
+  animation: trellis-panel-enter 140ms var(--trellis-ease) both;
+}
+
+@keyframes trellis-panel-enter {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.board__filters select {
+  border-radius: var(--trellis-control-radius);
+  cursor: pointer;
+  min-height: 40px;
+  touch-action: manipulation;
+  transition:
+    background-color var(--trellis-fast) var(--trellis-ease),
+    border-color var(--trellis-fast) var(--trellis-ease),
+    box-shadow var(--trellis-fast) var(--trellis-ease);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .board__filters select:hover {
+    border-color: var(--muted);
+  }
+}
+
+.board-state,
+.board__filter-empty,
+.board__stale {
+  border-radius: var(--trellis-panel-radius);
+}
+
+.board-state,
+.board__stale {
+  box-shadow: var(--trellis-shadow);
+}
+
+/* The composer's geometry, without reaching into assistant-ui or AG-UI. */
+section[aria-label="Assistant chat"] {
+  border-radius: var(--trellis-chat-radius);
+  box-shadow: var(--trellis-shadow);
+}
+
+/* The stylesheet already honors reduced motion for scrolling. Everything this
+   block introduces has to honor it too, or the preference would only be half
+   respected. */
+@media (prefers-reduced-motion: reduce) {
+  .board button,
+  .board-state button,
+  .board__filters select,
+  .task-card,
+  .task-card__record summary {
+    transition: none !important;
+  }
+
+  .board__filters,
+  .task-card__record[open] > :not(summary) {
+    animation: none !important;
+  }
+}

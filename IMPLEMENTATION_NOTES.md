@@ -2484,3 +2484,74 @@ webhook behavior against a real delivery, because the sandbox is deliberately
 denied the credential, and it did not re-derive the claim that the interrupting
 middleware design degrades to FastAPI's own `400 {"detail": ...}` envelope,
 because reproducing it would have required modifying repository source.
+
+
+## D74C: notes line-break fidelity
+
+**Local role:** two independent halves of one visible defect. `prompts.py` rule
+9 gains the line-break clause, so a request phrased "each on its own line"
+produces actual newline characters rather than joined text. `globals.css` gives
+`.task-card__notes` `white-space: pre-wrap` and `overflow-wrap: anywhere`, so a
+newline that was already stored becomes a visible line break instead of a
+space. The board summary is reworded to "Authoritative Work", and the interaction
+polish beside it rounds surfaces, raises control hit targets to 40px, and adds
+press and hover feedback that never moves a control under the pointer.
+
+**Whole-system role:** the storage layer was never wrong. `Friday
+buy bananas`
+was in PostgreSQL, was in `task_events`, and was returned intact by the API; the
+card collapsed it on the way to the screen. That distinction is the whole point
+of the demo, so it matters that the fix was made in the renderer and not by
+rewriting stored data to compensate. Nothing here changes what Trellis considers
+true, and nothing here touches the trust boundary. The prompt half is the other
+side of the same property: authoritative code decides what is stored, and the
+prompt decides only what the model asks to store.
+
+**Inputs and dependencies:** the untrusted-data boundary, which requires that
+notes reach the DOM as escaped React text; the existing `node:test` frontend
+convention, which is why this adds no component-test framework; the existing
+`prefers-reduced-motion` handling, which the new transitions extend.
+
+**Outputs and consumers:** `.board__summary-copy` and `.board__summary-title`
+are the summary's styling seam. The `--trellis-*` tokens are the shared radius,
+shadow, and easing vocabulary any later surface should reuse rather than
+restate.
+
+**Verification:** `pytest tests/test_notes_linebreak_contract.py` gives 10
+passing cases, including negative assertions against nine phrasings a future
+"tidy up rule 9" edit would plausibly introduce. `npm run test:notes` gives 4,
+pinning the two declarations and the absence of `dangerouslySetInnerHTML`, a
+hand-rolled `<br>`, or a `.split()` on notes. `npm run build` and
+`npm run test:ingress` both pass.
+
+Browser verification ran against the real application, and measured line boxes
+rather than element height, because `min-height: 2.8em` already reserves two
+lines and would have made a one-line and a two-line note indistinguishable by
+height alone. Counting the range client rects: `"Friday
+buy bananas"` renders
+as 2 visual lines, `"buy bananas
+buy apples
+buy pears"` as 3, `"one
+
+two"`
+as 3 boxes with even 22-23px gaps so the requested blank line survives, a single
+line note as exactly 1, and a 240 character unbroken token wraps across 5 lines
+with `scrollWidth` equal to `clientWidth`, so preserved whitespace does not
+overflow the card. `<script>alert(1)</script>` in a note has `innerHTML` of
+`&lt;script&gt;alert(1)&lt;/script&gt;`, one `#text` child node, and zero script
+elements. Computed `white-space` is `pre-wrap` and `overflow-wrap` is `anywhere`
+on every notes element on the board. Card title, status, and all 22 fact terms
+render unchanged, the native `<details>` still opens and closes on its summary,
+and the filter panel still mounts and unmounts on its toggle. No console errors.
+
+**Limitations and review status:** no screenshot was captured; the Browser pane
+was not displayed in the authoring session, so the page was not compositing
+frames. Every visual claim above rests on computed styles and measured geometry
+instead, which is more precise for these particular properties but is not the
+same as a human looking at it, and the aesthetic result of the polish is
+unreviewed. The prompt half pins the contract, not the model: no deterministic
+test proves a real generation emits a newline, and that belongs behind the
+`eval` marker. Live-host and live-Linear behavior is unverified. This entry
+records author-run verification only; the neutral Sonnet review under
+`CLAUDE.md`, executing in a fresh Vercel Sandbox at the pinned final SHA, is
+still outstanding.
