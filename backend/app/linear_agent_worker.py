@@ -92,7 +92,7 @@ from pydantic_ai import DeferredToolRequests
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 from . import agent as agent_module
-from . import linear_agent, runs, sql
+from . import limits, linear_agent, runs, sql
 from .config import settings
 from .db import pool
 from .linear_agent_api import LinearApiError
@@ -113,6 +113,7 @@ ERROR_INSTALLATION_MISMATCH = "installation_does_not_match_event"
 ERROR_UNUSABLE_PAYLOAD = "unusable_stored_payload"
 ERROR_NO_PROMPT = "no_extractable_prompt"
 ERROR_SIGNAL_NOT_PROMPT = "activity_carried_a_signal_not_a_prompt"
+ERROR_PROMPT_TOO_LARGE = "prompt_exceeds_accepted_size"
 ERROR_ATTEMPTS_EXHAUSTED = "attempt_budget_exhausted"
 ERROR_AMBIGUOUS_TURN = "turn_already_executed_outcome_ambiguous"
 ERROR_UNSUPPORTED_CAPABILITY = "model_requested_a_tool_outside_the_linear_profile"
@@ -175,11 +176,33 @@ class _Transient(Exception):
 # ------------------------------------------------------------ prompt parsing
 
 
+class PromptTooLarge(Exception):
+    """D-74. An extractable prompt past the ceiling for its action.
+
+    Distinct from returning None, which means no prompt could be found at
+    all. Conflating them would record "no_extractable_prompt" for a row that
+    carried a perfectly extractable prompt, and would send a Linear user
+    looking for a message they can see they sent.
+    """
+
+
 def _text(value: Any) -> str | None:
     """A non-empty string, or None. Whitespace alone is not a prompt."""
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _bounded(value: str | None, ceiling: int) -> str | None:
+    """The prompt, or a refusal. Never a truncation.
+
+    Truncating would hand the model an instruction whose second half is
+    missing, and it would do so silently. The ceiling is applied after
+    `_text` has stripped, so surrounding whitespace never decides the answer.
+    """
+    if value is not None and len(value) > ceiling:
+        raise PromptTooLarge(len(value))
+    return value
 
 
 def activity_signal(payload: dict) -> str | None:
@@ -239,12 +262,15 @@ def extract_prompt(payload: dict) -> str | None:
                 return None
             body = _text(content.get("body"))
             if body is not None:
-                return body
+                return _bounded(body, limits.LINEAR_PROMPTED_MESSAGE_MAX_CHARS)
 
         # Compatibility only. Linear's prose documents the prompted message at
         # `agentActivity.body`, so this is kept for the case where a payload
         # matches the prose rather than the schema.
-        return _text(activity.get("body"))
+        return _bounded(
+            _text(activity.get("body")),
+            limits.LINEAR_PROMPTED_MESSAGE_MAX_CHARS,
+        )
 
     if action == linear_agent.ACTION_CREATED:
         # `promptContext` is the formatted string Linear assembles from the
@@ -253,7 +279,7 @@ def extract_prompt(payload: dict) -> str | None:
         # the whole request rather than one fragment of it.
         context = _text(payload.get("promptContext"))
         if context is not None:
-            return context
+            return _bounded(context, limits.LINEAR_CREATED_CONTEXT_MAX_CHARS)
 
         session = payload.get("agentSession")
         if isinstance(session, dict):
@@ -261,12 +287,16 @@ def extract_prompt(payload: dict) -> str | None:
             if isinstance(comment, dict):
                 body = _text(comment.get("body"))
                 if body is not None:
-                    return body
+                    return _bounded(
+                        body, limits.LINEAR_CREATED_CONTEXT_MAX_CHARS
+                    )
             issue = session.get("issue")
             if isinstance(issue, dict):
                 title = _text(issue.get("title"))
                 if title is not None:
-                    return title
+                    return _bounded(
+                        title, limits.LINEAR_CREATED_CONTEXT_MAX_CHARS
+                    )
         return None
 
     return None
@@ -610,7 +640,12 @@ def _execute(row: dict, *, agent=None) -> dict:
     if signal is not None:
         return _handle_signal(row, installation, signal)
 
-    prompt = extract_prompt(payload)
+    # D-74. Over the ceiling is permanent for this row: the stored payload
+    # will not shrink, so a retry reaches the same answer.
+    try:
+        prompt = extract_prompt(payload)
+    except PromptTooLarge:
+        raise _Terminal(ERROR_PROMPT_TOO_LARGE) from None
     if prompt is None:
         raise _Terminal(ERROR_NO_PROMPT)
 

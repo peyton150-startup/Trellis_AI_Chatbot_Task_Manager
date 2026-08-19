@@ -5806,3 +5806,115 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  d74-request-input-bounds:
+    name: D74 request and input bounds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migrations
+        run: docker compose up -d --wait
+
+      # Transport admission at and past each ceiling, dishonest and absent
+      # Content-Length, the closed error envelope on a declared Pydantic body,
+      # byte-for-byte replay into Linear signature verification, the absence of
+      # durable work behind a refusal, and every typed field and list bound.
+      - name: Verify D-74 transport admission and typed input bounds
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check             app/limits.py             app/main.py             app/models.py             app/agent.py             app/linear_agent_worker.py             tests/test_request_limits.py
+
+          python -m pytest tests/test_request_limits.py -q
+
+      # The ceilings are code-owned on purpose. A limit an operator can widen
+      # from a deployment variable is not a ceiling, so the absence of any
+      # environment read in this module is part of the contract rather than an
+      # accident of how it happened to be written. See D-74.
+      - name: Verify the ceilings cannot be widened from the environment
+        working-directory: backend
+        run: |
+          python - <<'PY'
+          import ast
+          import pathlib
+
+          # Parsed rather than grepped. The module docstring argues at length
+          # about `config.Settings` and about environment variables, so a text
+          # search for those words matches the explanation of the property and
+          # not a violation of it. The AST sees only code.
+          tree = ast.parse(pathlib.Path("app/limits.py").read_text(encoding="utf-8"))
+          banned_roots = {"os", "dotenv"}
+          findings = []
+
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  for alias in node.names:
+                      root = alias.name.split(".")[0]
+                      if root in banned_roots or alias.name.endswith("config"):
+                          findings.append(f"line {node.lineno}: imports {alias.name}")
+              elif isinstance(node, ast.ImportFrom):
+                  module = node.module or ""
+                  if module.split(".")[0] in banned_roots or module.endswith("config"):
+                      findings.append(f"line {node.lineno}: imports from {module}")
+              elif isinstance(node, ast.Attribute) and node.attr in {"getenv", "environ"}:
+                  findings.append(f"line {node.lineno}: reads {node.attr}")
+              elif isinstance(node, ast.Name) and node.id in {"getenv", "environ", "settings"}:
+                  findings.append(f"line {node.lineno}: references {node.id}")
+
+          if findings:
+              print("FAIL D74: limits.py must not read configuration")
+              for item in findings:
+                  print("- " + item)
+              raise SystemExit(1)
+
+          print("PASS D-74 ceilings are code-owned")
+          PY
+
+      # Admission has to be registered to be a boundary. This fails if the
+      # middleware is ever removed from the application, which no unit test
+      # covering the middleware class in isolation would notice.
+      - name: Verify admission is wired into the application
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python - <<'PY'
+          from app import limits
+          from app.main import app
+
+          installed = [m.cls for m in app.user_middleware]
+          if limits.BodySizeLimitMiddleware not in installed:
+              raise SystemExit(
+                  "FAIL D74: BodySizeLimitMiddleware is not installed on the app"
+              )
+          print("PASS D-74 admission middleware is installed")
+          PY
+
+      - name: Report D-74 deterministic boundary
+        run: |
+          echo "PASS D74: every body-bearing route is admitted through one byte"
+          echo "PASS D74: ceiling, enforced on streamed bytes rather than on a"
+          echo "PASS D74: declared Content-Length, with the Linear webhook given"
+          echo "PASS D74: its own larger named ceiling for provider-assembled"
+          echo "PASS D74: context, accepted bytes replayed unchanged so HMAC"
+          echo "PASS D74: verification still covers what the client sent, and"
+          echo "PASS D74: every accepted message, note, plan and bulk target"
+          echo "PASS D74: list bounded by a code-owned constant"
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v

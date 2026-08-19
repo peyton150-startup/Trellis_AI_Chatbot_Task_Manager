@@ -94,7 +94,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.ui.ag_ui import AGUIAdapter
 from starlette.concurrency import run_in_threadpool
 
-from . import domain, policy, prompts, runs, tools
+from . import domain, limits, policy, prompts, runs, tools
 from .config import settings
 from .errors import OutOfScopeError, ValidationFailedError
 from .models import (
@@ -607,6 +607,14 @@ def _accepted_user_message(run_input: RunAgentInput) -> str:
             continue
         text = _message_text(message.content)
         if text:
+            # D-74. The byte ceiling in `limits.py` bounds the request; this
+            # bounds the one value out of it that becomes prompt text and
+            # `agent_runs.prompt`. Refused rather than truncated: a model
+            # acting on half an instruction is worse than a visible refusal.
+            if len(text) > limits.BROWSER_USER_MESSAGE_MAX_CHARS:
+                raise ValidationFailedError(
+                    "AG-UI user message exceeds the accepted size"
+                )
             return text
     raise ValidationFailedError("AG-UI payload carries no user message")
 

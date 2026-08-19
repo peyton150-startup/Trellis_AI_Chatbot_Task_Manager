@@ -3337,3 +3337,85 @@ This decision authorizes no migration, table, column, endpoint, index, RAG,
 embedding, vector database, browser-owned task memory, resolver cache treated as
 authority, second task-history store, approval change, browser-continuity
 change, frontend change, or Linear issue projection change.
+
+
+### D-74: deterministic bounds on accepted request and input size
+
+D-68 froze planned implementation after T00L unless the user explicitly
+authorizes an exception. The user authorizes this one.
+
+Every ceiling in this build so far bounds what a *validated* value may contain.
+None of them bounds what may be *buffered* on the way to validation. Those are
+different resources, and a field limit is not a substitute for a byte limit:
+`CreateRunRequest.user_message` could be capped at eight thousand characters and
+a client could still hand the server a two gigabyte body, because the framework
+buffers the whole thing before Pydantic is ever asked whether the field fits.
+
+1. **One admission boundary, in front of every body-bearing route.** A pure ASGI
+   middleware consumes the request stream up to the applicable ceiling plus one
+   byte and answers the section 6 `VALIDATION_ERROR` envelope itself when the
+   body is larger. The application is not called at all in that case, so no
+   route, body parser, signature check, database transaction, or model call
+   observes an oversized request.
+
+2. **Admission finishes before the application runs, rather than interrupting
+   it.** The obvious implementation wraps `receive` and raises on overflow. It
+   was built and measured, and it is wrong: FastAPI catches whatever is raised
+   while it is parsing a declared body and answers `400 {"detail": ...}`, which
+   is outside the closed error vocabulary. The rejection would then depend on
+   whether the route happened to declare a Pydantic body. Pre-buffering makes
+   the answer identical on all five body-bearing routes.
+
+3. **Streamed bytes are the authority; `Content-Length` is only an early exit.**
+   A client that understates the header, or omits it by chunking, is bounded by
+   the same running count of what actually arrived.
+
+4. **Accepted bytes are replayed byte for byte.** Linear signs the raw request
+   body, so a boundary that parsed and re-serialized would invalidate every
+   signature. Nothing in the admission path decodes, parses, strips, or
+   normalizes, and a regression pins the digest at the verification boundary.
+
+5. **The Linear webhook carries its own, larger, separately named ceiling.**
+   256 KiB for Trellis ingress, 1 MiB for `POST /api/linear/webhook`. Trellis
+   controls the shape of its own browser requests; it does not control what
+   Linear assembles into `promptContext` from an issue, its comment thread, and
+   the provider's own guidance. Naming that asymmetry is honest; quietly raising
+   every route to the larger number would not be.
+
+6. **An oversized delivery is refused, not acknowledged.** Linear retries any
+   non-200 response up to three times with backoff, so a refusal here will be
+   retried and will be refused again. Returning 200 to suppress those retries
+   was considered and rejected: it would claim the delivery was handled when it
+   was never authenticated, parsed, or stored. The prior claim in `main.py` that
+   a 400 or 401 tells Linear never to retry was wrong and is corrected.
+
+7. **Linear's two AgentSession actions get different accepted-text ceilings.**
+   `prompted` carries one human message and sits at the browser ceiling of 8,000
+   characters. `created` carries provider-assembled `promptContext` and sits at
+   64,000. Collapsing them into one number would be wrong in both directions,
+   and the worker's prompt extraction is already action-aware, so the ceilings
+   are applied at that existing seam rather than at a new one.
+
+8. **Over the ceiling is a refusal, never a truncation.** A truncated prompt
+   hands the model an instruction whose second half is missing, and does it
+   silently. A visible refusal is the weaker failure.
+
+9. **The ceilings are code-owned, in `backend/app/limits.py`, and read nothing
+   from the environment.** The values in `Settings` are policy an operator may
+   reasonably tune. These are safety invariants, and a ceiling an operator can
+   raise from 256 KiB to 10 GiB by exporting a variable is not a ceiling. If a
+   deployment ever needs to be stricter than the code, the safe shape is a
+   configured value that may only lower a code-owned cap; nothing needs that
+   yet, so it is not built yet. A CI step fails if `limits.py` ever learns to
+   read configuration.
+
+10. **A bounded list is one accepted call, not a run budget.** Fifty bulk or
+    delete targets means one call may not name more than fifty. It does not
+    bound how many such calls a run may make. That second dimension is real and
+    is deliberately out of scope here.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+new error code, new dependency, model or tool-call budget, token budget,
+concurrency limiter, semantic loop detection, history compaction, rate limiting,
+or authentication. It changes no domain, SQL, policy, idempotency, undo, or
+approval semantics, and it does not touch D-73 reference resolution.
