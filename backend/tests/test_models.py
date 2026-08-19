@@ -29,6 +29,7 @@ from app.models import (
     PolicyDecision,
     Priority,
     ProposePlanArgs,
+    ResolveTaskReferenceArgs,
     RunCreatedResponse,
     RunDetail,
     RunStatus,
@@ -158,6 +159,7 @@ def test_approval_request_rejects_pending_decision() -> None:
     [
         (ListTasksArgs, {}),
         (GetTaskHistoryArgs, {"task_id": str(TASK_ID)}),
+        (ResolveTaskReferenceArgs, {"reference": "Repair fence"}),
         (CreateTaskArgs, {"title": "Task A"}),
         (
             UpdateTaskArgs,
@@ -388,7 +390,7 @@ def test_default_agent_requires_nvidia_key_without_openai_fallback() -> None:
     assert "NVIDIA_API_KEY" in result.stderr
 
 
-def test_injected_agent_needs_no_provider_key_and_keeps_seven_tools() -> None:
+def test_injected_agent_needs_no_provider_key_and_keeps_full_tool_profile() -> None:
     env = _provider_env()
     env["NVIDIA_API_KEY"] = ""
 
@@ -407,6 +409,7 @@ def test_injected_agent_needs_no_provider_key_and_keeps_seven_tools() -> None:
         assert set(built.toolsets[0].tools) == {
             "list_tasks",
             "get_task_history",
+            "resolve_task_reference",
             "create_task",
             "update_task",
             "bulk_update_tasks",

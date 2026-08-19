@@ -67,6 +67,7 @@ from .models import (
     ListTasksArgs,
     MutableTaskFields,
     ProposePlanArgs,
+    ResolveTaskReferenceArgs,
     ToolName,
     UpdateTaskArgs,
 )
@@ -310,6 +311,84 @@ def get_task_history(
         raise
 
     # 5.
+    return result
+
+
+
+def resolve_task_reference(
+    ctx: ToolContext,
+    arguments: ResolveTaskReferenceArgs,
+) -> dict:
+    """Resolve an actor-owned current or historical task title."""
+    tool_name = ToolName.RESOLVE_TASK_REFERENCE.value
+    target_ids: list[UUID] = []
+    blast_radius_count = 0
+    payload = _payload(arguments)
+
+    args_hash = policy.arguments_hash(payload)
+
+    replayed = idempotency.replay_completed(
+        ctx.run_id,
+        ctx.tool_call_id,
+        tool_name,
+        args_hash,
+        actor_id=ctx.actor_id,
+    )
+    if replayed is not None:
+        return replayed
+
+    requirement = policy.classify(
+        tool_name,
+        payload,
+        blast_radius_count,
+    )
+    if requirement.required and not ctx.tool_call_approved:
+        raise ApprovalRequired(metadata={"reason": requirement.reason})
+
+    approval_row = runs.load_approval(ctx.run_id, ctx.tool_call_id)
+    policy.check(
+        ctx.actor_id,
+        tool_name,
+        payload,
+        target_ids,
+        approval_row,
+        run_id=ctx.run_id,
+        tool_call_id=ctx.tool_call_id,
+        blast_radius_count=blast_radius_count,
+    )
+
+    outcome = idempotency.acquire(
+        ctx.run_id,
+        ctx.tool_call_id,
+        tool_name,
+        args_hash,
+    )
+    if outcome.action is LeaseAction.REPLAY:
+        return outcome.result
+
+    committed = False
+    try:
+        with _pool().connection() as conn:
+            response = domain.resolve_task_reference(
+                ctx.actor_id,
+                arguments,
+                conn=conn,
+            )
+            domain.write_events(ctx.run_id, ctx.actor_id, (), conn=conn)
+            result = response.model_dump(mode="json")
+            idempotency.complete(
+                ctx.run_id,
+                ctx.tool_call_id,
+                result,
+                conn=conn,
+            )
+            conn.commit()
+            committed = True
+    except Exception as exc:
+        if not committed:
+            idempotency.fail(ctx.run_id, ctx.tool_call_id, str(exc))
+        raise
+
     return result
 
 

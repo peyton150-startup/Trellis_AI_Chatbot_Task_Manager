@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue
 
 
 class TrellisModel(BaseModel):
@@ -66,6 +66,7 @@ class ApprovalReason(str, Enum):
 class ToolName(str, Enum):
     LIST_TASKS = "list_tasks"
     GET_TASK_HISTORY = "get_task_history"
+    RESOLVE_TASK_REFERENCE = "resolve_task_reference"
     CREATE_TASK = "create_task"
     UPDATE_TASK = "update_task"
     BULK_UPDATE_TASKS = "bulk_update_tasks"
@@ -317,6 +318,57 @@ class GetTaskHistoryArgs(TrellisModel):
     task_id: UUID
     limit: int = Field(default=20, ge=1, le=50)
     before_event_id: int | None = Field(default=None, ge=1)
+
+
+def _normalized_reference(value: str) -> str:
+    """Strip a task reference before it becomes an idempotency identity.
+
+    Tool arguments are hashed after this model validates and before the tool
+    body runs, so normalizing here is what makes `" Fence "` and `"Fence"` the
+    same call rather than two hashes running the same search. Stripping inside
+    domain would be too late.
+
+    Case is deliberately preserved. The search is case-insensitive, but folding
+    the stored reference would also merge two spellings into one idempotency
+    identity, which is a wider claim than D-73 needs.
+    """
+    return value.strip() if isinstance(value, str) else value
+
+
+# The length bound is measured after stripping, so padding cannot smuggle a
+# reference past the limit and a whitespace-only reference fails `min_length`
+# rather than reaching domain as an empty search.
+TaskReference = Annotated[
+    str,
+    BeforeValidator(_normalized_reference),
+    Field(min_length=1, max_length=500),
+]
+
+
+class ResolveTaskReferenceArgs(TrellisModel):
+    reference: TaskReference
+    # The floor of two is a correctness bound, not a preference. Exact matches
+    # sort first, so a window of at least two always leaves a competing
+    # candidate visible and truncation cannot look like uniqueness.
+    limit: int = Field(default=10, ge=2, le=20)
+
+
+class TaskReferenceCandidate(TrellisModel):
+    task_id: UUID
+    matched_title: TaskTitle
+    current_title: TaskTitle | None = None
+    current_version: int | None = None
+    exists_now: bool
+
+
+class ResolveTaskReferenceResponse(TrellisModel):
+    reference: str
+    # The deterministic decision, carried as the whole candidate rather than a
+    # bare id. The consumer needs `exists_now` and `current_version` to act on
+    # the result, and returning the id alone would make the model join it back
+    # into `candidates` to find them.
+    resolved: TaskReferenceCandidate | None = None
+    candidates: list[TaskReferenceCandidate]
 
 
 class CreateTaskArgs(TrellisModel):

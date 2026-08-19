@@ -3362,6 +3362,7 @@ jobs:
           tool_names = (
               "list_tasks",
               "get_task_history",
+              "resolve_task_reference",
               "create_task",
               "update_task",
               "bulk_update_tasks",
@@ -3411,7 +3412,8 @@ jobs:
               raise SystemExit("safe and unsafe renderings are indistinguishable")
 
           print(
-              "PASS T11: the system prompt names all six tools and clarification, "
+              "PASS T11: the system prompt names every declared Trellis tool "
+              "and clarification, "
               "safe mode delimits the injection fixture as data, and unsafe demo "
               "mode emits the raw title and notes"
           )
@@ -3783,7 +3785,7 @@ jobs:
 
       # Deterministic on purpose. CI holds no provider secret and BUILD_SPEC
       # excludes network tests from the default gate, so this drives the
-      # identical agent, prompt boundary, six tools, and transport against a
+      # identical agent, prompt boundary, full tool profile, and transport against a
       # FunctionModel. What it proves is the approval bridge and the trust
       # boundary, not model behaviour, which the eval suite owns.
       - name: Prove the seven T12B requirements and the preview scope guard
@@ -3797,7 +3799,7 @@ jobs:
           python - <<'PY'
           """T12B gate: the seven proofs, the preview guard, and the forgery refusals.
 
-          Deterministic. Drives the identical agent, prompt boundary, six tools, and
+          Deterministic. Drives the identical agent, prompt boundary, full tool profile, and
           transport against a FunctionModel, so what it proves is the approval bridge and
           the trust boundary rather than model behaviour, which the eval suite owns.
           """
@@ -5587,9 +5589,13 @@ jobs:
             tests/test_models.py::test_list_tasks_enforces_limit_bounds \
             -q
 
+          # D-71 owns "history is registered on both profiles, and Linear still
+          # withholds the destructive tools". It deliberately does not assert the
+          # exact current profile sets, because that set belongs to whichever
+          # decision last changed it. D-73 owns the exact sets.
           python -m pytest \
-            tests/test_linear_worker.py::test_the_linear_profile_is_exactly_five_tools \
-            tests/test_linear_worker.py::test_the_browser_profile_carries_all_seven_tools \
+            tests/test_linear_worker.py::test_history_is_registered_on_both_profiles \
+            tests/test_linear_worker.py::test_the_linear_profile_withholds_destructive_tools \
             -q
 
       - name: Verify D-71 model-facing history navigation contract
@@ -5636,7 +5642,8 @@ jobs:
       - name: Report D-71 deterministic boundary
         run: |
           echo "PASS D71: task history mechanics, argument bounds,"
-          echo "PASS D71: browser/Linear capability profiles,"
+          echo "PASS D71: history registered on both profiles with Linear still"
+          echo "PASS D71: withholding destructive tools,"
           echo "PASS D71: and model-facing navigation instructions are pinned"
 
       - name: Remove CI database resources
@@ -5670,6 +5677,131 @@ jobs:
         run: |
           python -m ruff check app/models.py app/domain.py tests/test_task_history_tool.py tests/test_task_history.py
           python -m pytest tests/test_task_history_tool.py tests/test_task_history.py -q
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  d73-task-reference-resolver:
+    name: D73 task reference resolver
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migrations
+        run: docker compose up -d --wait
+
+      # Argument validation and normalization, exact-vs-substring semantics, the
+      # truncation property, actor isolation, closure with D-71 history and D-72
+      # boundary snapshots, idempotent replay, changed-argument conflict, and the
+      # proof that a stale replayed result cannot bypass optimistic concurrency.
+      - name: Verify D-73 resolver semantics and cross-decision closure
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check \
+            app/models.py \
+            app/sql.py \
+            app/domain.py \
+            app/tools.py \
+            app/agent.py \
+            app/prompts.py \
+            tests/test_task_reference_resolver.py \
+            tests/test_task_reference_prompt.py \
+            tests/test_linear_worker.py
+
+          python -m pytest tests/test_task_reference_resolver.py -q
+
+          python -m pytest \
+            tests/test_models.py::test_injected_agent_needs_no_provider_key_and_keeps_full_tool_profile \
+            -q
+
+      # D-73 owns the exact current capability sets. The test names carry no
+      # count, so a later decision that adds a tool edits one expected set here
+      # rather than renaming a test and every gate that invokes it by name.
+      - name: Verify the exact browser and Linear capability profiles
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m pytest \
+            tests/test_linear_worker.py::test_linear_profile_matches_safe_tool_contract \
+            tests/test_linear_worker.py::test_browser_profile_matches_full_tool_contract \
+            tests/test_linear_worker.py::test_an_unknown_tool_name_in_a_profile_is_refused \
+            -q
+
+      - name: Verify the D-73 model-facing resolution contract
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: python -m pytest tests/test_task_reference_prompt.py -q
+
+      # The prompt must carry exactly one way to decide which task a reference
+      # means. A second mechanism phrased as a candidate count would contradict
+      # domain semantics, because a unique exact title resolves even when weaker
+      # substring matches are returned alongside it.
+      - name: Verify the resolver is the single identity mechanism
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from app.prompts import SYSTEM_PROMPT
+
+          prompt = " ".join(SYSTEM_PROMPT.split()).lower()
+
+          required = (
+              "trellis decides which task the reference means",
+              "read the resolved field",
+              "do not re-derive that decision by counting candidates",
+              "never take the first candidate as a shortcut",
+              "resolved.current_version as expected_version",
+              "never be a mutation target",
+              "use list_tasks for browsing or filtering task sets",
+          )
+
+          forbidden = (
+              "do not invent a historical title-search capability",
+              "require exactly one current candidate",
+              "exact version returned by list_tasks",
+          )
+
+          missing = [fragment for fragment in required if fragment not in prompt]
+          stale = [fragment for fragment in forbidden if fragment in prompt]
+
+          if missing or stale:
+              raise SystemExit(
+                  "D-73 identity contract is broken:"
+                  + "".join("\n- missing: " + item for item in missing)
+                  + "".join("\n- stale: " + item for item in stale)
+              )
+
+          print("PASS D-73 single deterministic identity mechanism")
+          PY
+
+      - name: Report D-73 deterministic boundary
+        run: |
+          echo "PASS D73: resolver argument validation and normalization,"
+          echo "PASS D73: exact-vs-substring resolution with truncation bounded,"
+          echo "PASS D73: actor isolation and closure with durable task history,"
+          echo "PASS D73: read-only tracked invocation with idempotent replay,"
+          echo "PASS D73: stale replay refused by optimistic concurrency,"
+          echo "PASS D73: exact browser and Linear capability profiles, and one"
+          echo "PASS D73: model-facing identity mechanism are pinned"
 
       - name: Remove CI database resources
         if: always()

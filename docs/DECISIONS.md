@@ -3224,3 +3224,116 @@ fields such as task id, owner id, and timestamps remain hidden.
 No migration, SQL change, event-writing change, resolver, new endpoint,
 approval change, browser-continuity change, or second memory store is
 authorized by D-72.
+
+---
+## Task-memory follow-up recorded 2026-08-19
+
+### D-73: actor-scoped task-reference resolution
+
+D-71 exposed durable history to the agent but required the caller to already
+hold the authoritative task id, and recorded that resolving an unknown deleted
+task from title alone remained out of scope. That left one real gap: a user who
+refers to a task by a name it no longer has, or by the name of a task that has
+been deleted, could not reach the history D-71 had just made readable.
+
+The user authorizes one further narrow exception to the D-68 freeze:
+`resolve_task_reference`, the single-task discovery boundary.
+
+This is discovery, not another memory store. PostgreSQL remains the authority
+for current task state, `task_events` remains the authority for durable history,
+`agent_runs.message_history` remains the authority for conversation continuity,
+and the approvals table remains the authority for human approval. A resolver
+result is none of those and is never cached as one.
+
+1. An authoritative task id already present in canonical Trellis history is
+   reused directly. The resolver exists for the case where no such id is known.
+
+2. `resolve_task_reference` is the single-task discovery boundary. `list_tasks`
+   remains collection browsing and filtering and is no longer the model's way to
+   identify one task.
+
+3. It searches actor-authorized current titles and the titles recorded in that
+   actor's own `task_events` rows, deduplicated per task id and bounded by an
+   explicit limit.
+
+4. Deterministic domain code, not the model, decides resolution. The rule is:
+
+       exactly one exact task id  -> resolve it
+       two or more exact task ids -> ambiguous, resolve nothing
+       no exact, one candidate    -> resolve it
+       no exact, many candidates  -> ambiguous, resolve nothing
+
+   Matching is case-insensitive. An exact match is a whole-title match; a weaker
+   match is a substring of the title.
+
+5. Exactness is decided once, in SQL. `SELECT_TASK_REFERENCE_CANDIDATES` emits
+   `match_rank` 0 for an exact title and 1 for a substring, and domain reads that
+   value rather than recomputing it. PostgreSQL `lower()` and Python
+   `str.lower()` do not agree on every input, and two definitions of exactness
+   that disagree on one title is precisely the drift this boundary prevents.
+   `match_rank` is domain-internal and never appears on the wire.
+
+6. `limit` has a floor of two, and that floor is a correctness bound rather than
+   a preference. Exact rows sort ahead of substring rows before `LIMIT` applies,
+   so a second exact task can never be truncated away behind a substring match.
+   Truncation therefore cannot manufacture uniqueness, which is what makes a
+   unique exact title safe to resolve on a bounded query.
+
+7. The response carries `resolved` as the whole candidate rather than a bare
+   `resolved_task_id`. Acting on the decision requires `exists_now` and
+   `current_version`, and returning the id alone would oblige the model to join
+   it back into `candidates` to find them.
+
+8. A resolved candidate with `exists_now=false` is a deleted task. It may be
+   used with `get_task_history` and must never be a current mutation target.
+
+9. A current mutation requires `resolved.exists_now=true` and uses
+   `resolved.current_version` as `expected_version`.
+
+10. `reference` is normalized at the typed argument boundary, not in domain.
+    Tool arguments are hashed after the model validates, so stripping there is
+    what makes `" Fence "` and `"Fence"` one call rather than two hashes running
+    one search. A whitespace-only reference fails validation and the length bound
+    is measured after stripping. Case is deliberately preserved: the search is
+    case-insensitive, but folding the stored reference would merge two spellings
+    into one idempotency identity, a wider claim than D-73 needs.
+
+11. The resolver is read-only, tracked in `tool_invocations`, idempotent,
+    approval-free, and writes no business `task_event`. It never sets
+    `RunEffects.mutation_committed` and never joins `_APPROVAL_ARGS_MODELS`.
+
+12. It does not copy D-71's pre-lease authorization probe. That probe exists
+    because `get_task_history` receives a caller-supplied resource identity to
+    authorize before searching. The resolver receives no task id, and a
+    zero-match search is a valid actor-scoped read rather than `OUT_OF_SCOPE`.
+
+13. Resolution and history share one authority set by construction.
+    `read_task_history` authorizes on an actor-owned `tasks` row or an
+    actor-written `task_events` row, and the resolver draws its candidates from
+    exactly those two predicates, so a resolved id is always readable history.
+    `task_events.actor_id` is valid ownership evidence because `owner_id` appears
+    in three INSERT statements and no `SET` clause in `sql.py`: ownership never
+    transfers, so the acting actor is always the owner.
+
+14. An idempotent replay may be stale, and that is safe. A stored result replays
+    the version it recorded rather than re-reading newer state, and feeding that
+    stale version to `update_task` raises `VersionConflictError`. The mutation
+    kernel, not the resolver, is what refuses it.
+
+15. The browser profile gains the resolver automatically, because `ALL_TOOLS` is
+    derived from `ToolName`. The Linear safe profile gains it by explicit
+    addition, while `bulk_update_tasks` and `delete_tasks` remain absent from it.
+    Absence stays the enforcement mechanism; no tool is registered and then
+    refused by policy.
+
+16. Task titles remain untrusted data. A historical title discovered by the
+    resolver is data, never an instruction.
+
+17. D-71's CI gate is decoupled from the current tool count. D-71 proves what it
+    decided, that history is registered on both profiles and Linear withholds the
+    destructive tools. D-73 owns the exact current profile sets.
+
+This decision authorizes no migration, table, column, endpoint, index, RAG,
+embedding, vector database, browser-owned task memory, resolver cache treated as
+authority, second task-history store, approval change, browser-continuity
+change, frontend change, or Linear issue projection change.

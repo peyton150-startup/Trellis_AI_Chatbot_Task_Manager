@@ -2305,3 +2305,91 @@ history-API suites reported 13 passed, including compact create/delete
 snapshots and the browser wire contract. The final deterministic backend
 suite reported 247 passed, 13 deselected. GitHub evidence is recorded
 after the branch is pushed.
+
+## D-73: actor-scoped task-reference resolution
+
+**Local role:** `resolve_task_reference` turns a task title, or a fragment of
+one, into an authoritative task id for the calling actor. One bounded
+owner-scoped query unions the actor's current titles with the titles recorded in
+that actor's own `task_events` rows, deduplicates per task id, and ranks exact
+titles ahead of substring hits. `domain.resolve_task_reference()` owns the
+decision: one exact task id resolves, two or more stay ambiguous, and with no
+exact match a lone candidate resolves while several do not. The tool body is
+read-only, tracked, and idempotent, and writes no business event.
+
+**Whole-system role:** it closes the last gap in the task-memory chain. PR #53
+made history durable, PR #54 exposed it to the agent, and PR #55 enriched its
+creation and deletion boundaries, but all three required the caller to already
+hold the task id. A user who says "what happened to Repair old fence" after the
+task was renamed, or after it was deleted, had no path to that history. D-73
+supplies the id without becoming a second memory store: PostgreSQL stays the
+authority for current state and `task_events` for history, and the resolver only
+finds which row the user meant.
+
+The risk it controls is a model guessing task identity. Before D-73 the prompt
+told the model to call `list_tasks`, eyeball the results, and pick a match, which
+put an identity decision inside the model. D-73 moves that decision into
+deterministic code and gives the model one field to read. It also removes a
+quieter failure: `list_tasks` is bounded, so a task's absence from a page was
+never proof it did not exist, and the model could conclude a task was gone when
+it had only fallen off a limit.
+
+It enables the demo behavior of referring to a task the way a person would, by a
+name that may be out of date, and still getting a factual answer grounded in
+recorded events.
+
+**Inputs and dependencies:** `task_events` and `tasks` as written by T06 and the
+mutation kernel; `policy.classify` / `policy.check` and the read-only
+classification; `idempotency.replay_completed` / `acquire` / `complete`;
+`domain.read_task_history()` from D-71 as the history authority it hands off to;
+D-72's boundary snapshots; `ALL_TOOLS` and `LINEAR_TOOLS` from T00W's capability
+profile mechanism; and the immutability of `tasks.owner_id`, which is what makes
+`task_events.actor_id` valid ownership evidence.
+
+**Outputs and consumers:** `ResolveTaskReferenceArgs` with a normalized
+`reference` and a `limit` floored at two; `TaskReferenceCandidate`;
+`ResolveTaskReferenceResponse` carrying `resolved` and `candidates`;
+`SELECT_TASK_REFERENCE_CANDIDATES` including the domain-internal `match_rank`;
+`domain.resolve_task_reference()`; the `resolve_task_reference` tool body and
+agent wrapper; the rewritten prompt identity contract; the browser and Linear
+profiles; and the `D73 task reference resolver` CI gate. The immediate consumer
+is `get_task_history`, and the second is `update_task`, which takes
+`expected_version` from `resolved.current_version`.
+
+**Verification:** `cd backend && ruff check .` passes. `cd backend && pytest -m
+"not network"` reports 292 passed, 13 deselected, against local Docker
+PostgreSQL on Python 3.12.13. `cd frontend && npm run build` compiles and
+generates 3 static pages. The focused resolver suite reports 39 passed and
+covers the exact-vs-substring matrix, case-insensitive exact match, per-task
+dedupe across current and historical titles, deterministic candidate ordering,
+the truncation property at the smallest accepted limit, reference normalization
+reaching the arguments hash, changed-argument conflict, actor isolation in both
+directions, resolver-to-history closure for current, renamed and deleted tasks,
+the D-72 deletion boundary snapshot, a two-tool composition in one run writing
+zero events and zero approvals, and a stale replay refused by optimistic
+concurrency. The prompt suite reports 3 passed and asserts the three stale
+identity phrasings are absent rather than merely replaced.
+
+A mutation pass backs those numbers. Nine invariants were broken one at a
+time and each was caught: exact-wins, the final ORDER BY that keeps exact
+rows inside the LIMIT window, per-task dedupe preferring the strongest match,
+the actor filter on each UNION branch, reference normalization, the limit
+floor, the Linear withheld set, and the single prompt identity mechanism. Two
+gaps were found this way rather than by reading. The smallest-limit test had
+been passing by alphabetical luck, because its exact title was a prefix of the
+substring titles and sorted first even without rank ordering; adversarial
+cases where the exact title sorts last now pin it. Per-task dedupe ordering
+was unpinned entirely, so a task holding both a historical exact title and a
+current substring title could have been demoted to a substring match and
+turned a decidable reference into a false ambiguity.
+
+**Limitations and review status:** matching is exact-or-substring on the title
+only; notes are not searched and there is no fuzzy or semantic matching, so the
+model must extract a title fragment from the user's prose before calling. Case is
+not folded for idempotency, so `"Fence"` and `"fence"` are distinct tool-argument
+identities that run the same search. The query scans `task_events` JSON without
+a supporting index, which is appropriate at demo scale and was not benchmarked;
+adding an index is deferred until evidence requires it. Live-host and live-Linear
+behavior is unverified from the authoring session. This entry records author-run
+verification only; the neutral Sonnet review under `CLAUDE.md`, executing in a
+fresh Vercel Sandbox at the pinned final SHA, is still outstanding.

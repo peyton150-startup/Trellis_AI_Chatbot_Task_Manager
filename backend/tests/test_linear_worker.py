@@ -310,7 +310,7 @@ def _deleting_function_model(task_id: UUID) -> FunctionModel:
 
 
 def deleting_agent(task_id: UUID):
-    """The full six-tool agent proposing the declaratively gated tool.
+    """The full browser agent proposing the declaratively gated tool.
 
     Deliberately not the Linear profile. It exists to manufacture a deferred
     request so the worker's fail-closed branch can be tested at all.
@@ -759,12 +759,51 @@ def test_a_failed_turn_does_not_advance_the_session_cursor(fake_provider):
 # ------------------------------------------------------------------ approvals
 
 
-def test_the_linear_profile_is_exactly_five_tools():
+def test_history_is_registered_on_both_profiles():
+    """D-71's own invariant, stated without reference to any tool count.
+
+    D-71 owns one claim about registration: the read-only history capability is
+    present on the browser profile and on the Linear safe profile. Pinning that
+    separately from the exact profile sets means a later decision adding a tool
+    does not rewrite D-71's gate to say something D-71 never decided.
+    """
+    full = agent_module.build_agent(FunctionModel(_silent, model_name="t00w-profile"))
+    linear = agent_module.build_agent(
+        FunctionModel(_silent, model_name="t00w-profile"),
+        toolset=agent_module.LINEAR_TOOLS,
+    )
+
+    assert "get_task_history" in _registered(full)
+    assert "get_task_history" in _registered(linear)
+
+
+def test_the_linear_profile_withholds_destructive_tools():
+    """The boundary D-71 must never relax, also stated count-neutrally.
+
+    Absence is the enforcement. These two tools are the only ones that can
+    require approval, and Linear has no channel that can decide one, so the
+    model must not see them in its schema at all.
+    """
+    linear = agent_module.build_agent(
+        FunctionModel(_silent, model_name="t00w-profile"),
+        toolset=agent_module.LINEAR_TOOLS,
+    )
+    registered = _registered(linear)
+
+    assert "bulk_update_tasks" not in registered
+    assert "delete_tasks" not in registered
+
+
+def test_linear_profile_matches_safe_tool_contract():
     """The capability boundary, asserted on the built agent rather than a list.
 
     `LINEAR_TOOLS` is a constant and a constant proves nothing about what was
     registered. This reads the toolset off a constructed agent, so renaming a
     tool or forgetting a guard fails here.
+
+    The assertion is an exact set rather than a count, and the name carries no
+    count, so adding a capability updates one list here instead of also renaming
+    the test and every gate that invokes it by name.
     """
     linear = agent_module.build_agent(
         FunctionModel(_silent, model_name="t00w-profile"),
@@ -773,18 +812,25 @@ def test_the_linear_profile_is_exactly_five_tools():
     assert _registered(linear) == {
         "list_tasks",
         "get_task_history",
+        "resolve_task_reference",
         "create_task",
         "update_task",
         "propose_plan",
     }
 
 
-def test_the_browser_profile_carries_all_seven_tools():
-    """History is additive; every existing browser capability remains present."""
+def test_browser_profile_matches_full_tool_contract():
+    """Every browser capability is present, and nothing extra is.
+
+    `ALL_TOOLS` is derived from `ToolName`, so a new enum member widens this
+    profile automatically. That is convenient and is exactly why the exact set
+    is pinned here: the profile grows without anyone deciding it should.
+    """
     full = agent_module.build_agent(FunctionModel(_silent, model_name="t00w-profile"))
     assert _registered(full) == {
         "list_tasks",
         "get_task_history",
+        "resolve_task_reference",
         "create_task",
         "update_task",
         "bulk_update_tasks",
@@ -841,7 +887,7 @@ def test_a_linear_session_cannot_reach_delete_tasks_at_all(fake_provider):
 def test_a_deferred_request_fails_closed_without_writing_an_approval(fake_provider):
     """Unreachable through the Linear profile, and fail-closed if it ever is.
 
-    Driven with the full six-tool agent so a deferred request can actually be
+    Driven with the full browser agent so a deferred request can actually be
     produced. The point is what the worker does with one: no approval row, no
     auto-approval, no completed row, and an error activity.
     """

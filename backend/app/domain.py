@@ -51,6 +51,9 @@ from .models import (
     EventOperation,
     ListTasksArgs,
     MutableTaskFields,
+    ResolveTaskReferenceArgs,
+    ResolveTaskReferenceResponse,
+    TaskReferenceCandidate,
     Task,
     TaskEvent,
     TaskHistoryChange,
@@ -107,6 +110,78 @@ def list_tasks(
         },
     ).fetchall()
     return [_task(row) for row in rows]
+
+
+# `SELECT_TASK_REFERENCE_CANDIDATES` emits 0 for a case-insensitive exact title
+# and 1 for a substring hit. Named here so the comparison below reads as a rule
+# rather than as a magic number.
+_EXACT_TITLE_MATCH = 0
+
+
+def resolve_task_reference(
+    owner_id: UUID,
+    arguments: ResolveTaskReferenceArgs,
+    *,
+    conn: Connection,
+) -> ResolveTaskReferenceResponse:
+    """Resolve a bounded current-or-historical title reference for one owner.
+
+    Deterministic code owns this decision, not the model. The rule is that one
+    exact title outranks any number of weaker substring matches, while two exact
+    task ids stay ambiguous:
+
+        exactly one exact task id   -> resolve it
+        two or more exact task ids  -> ambiguous
+        no exact, one candidate     -> resolve it
+        no exact, many candidates   -> ambiguous
+
+    Exactness is read from the query's `match_rank` rather than recomputed here.
+    PostgreSQL's `lower(...)` and Python's `str.lower()` do not agree on every
+    input, and two definitions of "exact" that disagree on one title is exactly
+    the kind of drift this boundary exists to prevent.
+
+    `match_rank` stays internal. Candidates are built from the public columns
+    only, so the wire model never carries a ranking the caller could mistake for
+    a decision it should make itself.
+    """
+    rows = conn.execute(
+        sql.SELECT_TASK_REFERENCE_CANDIDATES,
+        {
+            "owner_id": owner_id,
+            "reference": arguments.reference,
+            "limit": arguments.limit,
+        },
+    ).fetchall()
+
+    candidates: list[TaskReferenceCandidate] = []
+    exact_task_ids: set[UUID] = set()
+    for row in rows:
+        candidate = TaskReferenceCandidate(
+            task_id=row["task_id"],
+            matched_title=row["matched_title"],
+            current_title=row["current_title"],
+            current_version=row["current_version"],
+            exists_now=row["exists_now"],
+        )
+        candidates.append(candidate)
+        if row["match_rank"] == _EXACT_TITLE_MATCH:
+            exact_task_ids.add(candidate.task_id)
+
+    # Rows are already deduplicated per task id, so each id appears at most
+    # once and these counts are counts of tasks rather than of matched strings.
+    resolved: TaskReferenceCandidate | None = None
+    if len(exact_task_ids) == 1:
+        resolved = next(
+            item for item in candidates if item.task_id in exact_task_ids
+        )
+    elif not exact_task_ids and len(candidates) == 1:
+        resolved = candidates[0]
+
+    return ResolveTaskReferenceResponse(
+        reference=arguments.reference,
+        resolved=resolved,
+        candidates=candidates,
+    )
 
 
 def create_task(
