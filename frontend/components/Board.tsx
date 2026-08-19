@@ -120,7 +120,7 @@ export function Board({ state }: BoardProps) {
   const [sortBy, setSortBy] = useState<SortMode>("default");
 
   if (isLoading && tasks.length === 0) {
-    return <p className="board-state">Loading committed tasks...</p>;
+    return <p className="board-state">Loading authoritative work...</p>;
   }
 
   if (error !== null && tasks.length === 0) {
@@ -138,7 +138,7 @@ export function Board({ state }: BoardProps) {
   if (tasks.length === 0) {
     return (
       <section className="board-state">
-        <p>No committed tasks are on the board.</p>
+        <p>No authoritative work is on the board.</p>
 
         <button type="button" onClick={() => void refetch()}>
           Refresh board
@@ -256,8 +256,10 @@ export function Board({ state }: BoardProps) {
             {sortBy !== "default" ? " - Sorted" : ""}
           </button>
 
-          <p>
-            <strong>{tasks.length}</strong> committed tasks
+          <p className="board__summary-copy">
+            <strong className="board__summary-title">Authoritative Work</strong>
+            <span aria-hidden="true"> · </span>
+            <span>{tasks.length} tasks</span>
             <span aria-hidden="true"> / </span>
             <span>{openCount} open</span>
           </p>
