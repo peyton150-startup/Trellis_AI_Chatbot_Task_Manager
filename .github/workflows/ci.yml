@@ -6160,7 +6160,9 @@ jobs:
 
           # Continuity promotion must stay completed-only. If this ever moves,
           # a failed run becomes a history predecessor and D-67 is weakened.
-          grep -Fq 'detail.status === "completed"' frontend/components/Chat.tsx \
+          # The rule moved to lib/continuity.ts when the reconciler was bound
+          # to each invocation's own run; the property asserted is unchanged.
+          grep -Fq 'detail.status === "completed"' frontend/lib/continuity.ts \
             || { echo "FAIL continuity promotion is no longer completed-only"; exit 1; }
 
           grep -Fq 'FOR UPDATE;' backend/app/sql.py \
@@ -6253,6 +6255,24 @@ jobs:
           # Only the server-issued value may ever be looked up or promoted.
           if "input.threadId" in src:
               sys.exit("FAIL a client-supplied threadId is treated as a run identity")
+
+          # The correlation key is only sound while Trellis leaves the AG-UI
+          # invocation id alone. The protocol permits a caller to supply an
+          # explicit runId, so this asserts the transport does not start doing
+          # so: run() must pass the input through and replace forwardedProps
+          # alone. Minting or reusing a runId here would collapse two
+          # invocations onto one binding, which is the defect this fixed.
+          transport = pathlib.Path("frontend/lib/TrellisHttpAgent.ts").read_text(encoding="utf-8")
+          body = re.search(r"override run\(input: RunAgentInput\).*?\n  \}", transport, re.S)
+          if body is None:
+              sys.exit("FAIL the transport run override is gone or was restructured")
+          body = body.group(0)
+
+          if "...input," not in body:
+              sys.exit("FAIL the transport no longer passes the AG-UI input through")
+
+          if re.search(r"\brunId\s*:", body):
+              sys.exit("FAIL the transport supplies or overrides the AG-UI invocation id")
 
           print("PASS continuity reconciliation binds each invocation to its own run")
           PY

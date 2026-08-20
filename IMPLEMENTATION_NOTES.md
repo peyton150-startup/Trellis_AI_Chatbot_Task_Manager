@@ -2909,6 +2909,16 @@ passing at the reviewed SHA.
   across every run in a session. `prepareRunAgentInput` was read to confirm
   both: `runId: e?.runId || uuidv4()` and `threadId: this.threadId`.
 
+  That `runId` expression is stated precisely rather than as a guarantee. The
+  protocol lets a caller supply an explicit `runId`, so "always freshly
+  generated" would be stronger than AG-UI promises. What Trellis relies on is
+  narrower and is enforced: `runId` is a local correlation key only, and
+  `TrellisHttpAgent.run()` spreads the input and replaces `forwardedProps`
+  alone, never supplying or overriding `runId`. A gate asserts that, so a future
+  edit that starts minting run ids in the transport fails CI rather than
+  silently collapsing two invocations onto one binding. `RunBindings.bind` also
+  defines rebinding as overwrite rather than treating collision as impossible.
+
   Eight behavioral tests now run in CI as `npm run test:continuity`. The central
   one is the interleaving the regular expression was blind to: bind B, bind C,
   reconcile a delayed failure for B, and assert C is never even queried, not

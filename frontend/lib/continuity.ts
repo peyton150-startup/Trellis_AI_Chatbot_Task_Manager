@@ -15,9 +15,14 @@
  * The fix is a per-invocation binding rather than a shared cursor. Two distinct
  * identifiers are involved and conflating them is what caused the bug:
  *
- *     input.runId          client-generated, fresh per runAgent() call.
- *                          Correlation only. Never sent to the server as
- *                          authority and never passed to fetchRun().
+ *     input.runId          the AG-UI invocation identifier. In Trellis's
+ *                          current assistant-ui path the AG-UI client
+ *                          generates it per invocation unless a caller
+ *                          explicitly supplies one, which the protocol
+ *                          permits. Used only as a local correlation key,
+ *                          never as application authority, and never passed
+ *                          to fetchRun(). Rebinding is therefore defined
+ *                          behaviour rather than an assumed impossibility.
  *
  *     event.threadId       server-issued Trellis application run id, emitted
  *                          back on RUN_STARTED and RUN_FINISHED. The only
