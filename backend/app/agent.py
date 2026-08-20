@@ -70,11 +70,21 @@ names as the only source of history anywhere in the codebase. Nothing here
 constructs a message list from a request.
 """
 
+import logging
 from dataclasses import dataclass, field
 from functools import cache
 from uuid import UUID, uuid4
 
-from ag_ui.core import RunAgentInput, UserMessage
+from ag_ui.core import (
+    RunAgentInput,
+    RunErrorEvent,
+    RunFinishedEvent,
+    RunStartedEvent,
+    TextMessageContentEvent,
+    TextMessageEndEvent,
+    TextMessageStartEvent,
+    UserMessage,
+)
 from fastapi import Request
 from fastapi.responses import Response
 from openai import AsyncOpenAI
@@ -87,11 +97,17 @@ from pydantic_ai import (
     ToolDenied,
 )
 from pydantic_core import to_jsonable_python
-from pydantic_ai.messages import ModelMessagesTypeAdapter
+from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.ui.ag_ui import AGUIAdapter
+from pydantic_ai.ui.ag_ui import AGUIAdapter, AGUIEventStream
 from starlette.concurrency import run_in_threadpool
 
 from . import domain, limits, policy, prompts, runs, tools
@@ -111,6 +127,7 @@ from .models import (
     RunStatus,
     Task,
     ToolName,
+    UndoReason,
     UpdateTaskArgs,
 )
 
@@ -119,6 +136,8 @@ from .models import (
 # confirmed the framework maps a continuation back to the original call through
 # it. Stripped in exactly one place, `_continuation_interrupt_id`.
 _INTERRUPT_PREFIX = "int-"
+
+log = logging.getLogger("trellis.agent")
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -170,6 +189,126 @@ LINEAR_TOOLS = frozenset(
         ToolName.PROPOSE_PLAN.value,
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# D-76. Run-relative undo, as application control flow rather than a model tool.
+#
+# The browser sends two independent lookup keys, and conflating them is the bug
+# this decision exists to prevent:
+#
+#     trellisContinuityRunId   the newest COMPLETED run, whose canonical history
+#                              may seed the next turn. D-67 owns it.
+#     trellisPreviousRunId     the newest server-issued application run of any
+#                              status, and the only candidate target of an
+#                              "undo that".
+#
+# They diverge exactly when a run committed a mutation and then failed, which is
+# precisely the case a user is most likely to want undone. Continuity does not
+# advance past a failed run, by design, so targeting continuity would silently
+# undo an older successful action instead. See D-76.
+#
+# Both remain untrusted lookup keys. Neither is history, authorization, or proof
+# the run exists, and the server resolves ownership, status, and eligibility for
+# itself.
+_PREVIOUS_RUN_KEY = "trellisPreviousRunId"
+_CONTINUITY_RUN_KEY = "trellisContinuityRunId"
+
+# The complete accepted grammar, matched whole after normalization. Membership in
+# a frozen set rather than a pattern, because the failure modes are not
+# symmetric: a phrase this misses costs the user one rephrase, while a phrase it
+# wrongly claims silently compensates a run they did not name. "restore D75" and
+# "bring back my old farm tasks" both require deciding *what* to restore, which
+# is target interpretation D-76 does not authorize, so neither is here.
+_UNDO_PREVIOUS_COMMANDS = frozenset(
+    {
+        "undo",
+        "undo that",
+        "undo it",
+        "undo what you just did",
+        "undo the last action",
+        "revert that",
+        "reverse that",
+        "recover what you just deleted",
+        "recover everything you just deleted",
+        "restore what you just deleted",
+        "restore everything you just deleted",
+        "bring back what you just deleted",
+        "bring back everything you just deleted",
+        "bring back the tasks you just deleted",
+    }
+)
+
+# Trailing punctuation only. Nothing here rewrites words, drops a leading
+# "please", or strips an interior clause, because each of those widens what
+# counts as the same command and the whole point of the set above is that it
+# is narrow.
+_COMMAND_PUNCTUATION = ".?!"
+
+# What the synthetic control messages carry for a later reader. Observational
+# only: nothing reads it back to make a decision, and it is not authorization,
+# not the target id, and not derived from the browser.
+_CONTROL_METADATA_KEY = "trellis_control"
+_CONTROL_UNDO_PREVIOUS = "undo_previous"
+
+# Missing, malformed, and foreign all produce this one sentence. A user who
+# nominates another actor's run must not be able to tell it apart from a user
+# who nominated nothing, which is the same indistinguishability every other
+# resolver in this build maintains.
+_NO_TARGET_TEXT = (
+    "There is no previous Trellis action in this conversation that I can undo."
+)
+
+_UNDO_INELIGIBLE_TEXT = {
+    runs.UndoIneligibility.STILL_ACTIVE: (
+        "The previous action has not finished yet, so there is nothing settled "
+        "to undo."
+    ),
+    runs.UndoIneligibility.NO_EFFECTS: (
+        "The previous action did not change any tasks, so there is nothing to "
+        "undo."
+    ),
+    runs.UndoIneligibility.ALREADY_COMPENSATED: (
+        "The previous action has already been undone. Undo applies once and "
+        "never redoes."
+    ),
+}
+
+_UNDO_REFUSED_TEXT = {
+    UndoReason.VERSION_CONFLICT: (
+        "I did not undo anything. At least one of those tasks has changed since "
+        "that action, so restoring it would overwrite the newer change."
+    ),
+    UndoReason.ROW_DISAPPEARED: (
+        "I did not undo anything. At least one of those tasks no longer exists, "
+        "so the change cannot be reversed as a whole."
+    ),
+    UndoReason.ROW_RECREATED: (
+        "I did not undo anything. At least one of those tasks has been created "
+        "again since that action, so restoring the original would collide with "
+        "it."
+    ),
+    UndoReason.EXTERNALLY_MODIFIED: (
+        "I did not undo anything. At least one of those tasks was changed "
+        "outside Trellis, so reversing the action here could discard that "
+        "change."
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _ControlOutcome:
+    """What the deterministic control turn decided, before anything is emitted.
+
+    `mutation_committed` mirrors `RunEffects` on the model path and is read for
+    the same reason: if persisting the turn fails after compensation already
+    committed, the stored error has to say so, because the board has moved and
+    the browser must refetch rather than assume nothing happened.
+    """
+
+    text: str
+    applied: int = 0
+    mutation_committed: bool = False
 
 
 @dataclass(slots=True)
@@ -287,7 +426,7 @@ def build_agent(
     def list_tasks(
         ctx: RunContext[TrellisDeps], arguments: ListTasksArgs
     ) -> list[domain.TaskSnapshot]:
-        """Read the user's tasks with typed status, date, priority, and limit filters."""
+        """Read the user's current tasks with typed status, date, priority, and limit filters, optionally only tasks whose title is duplicated."""
         return tools.list_tasks(_tool_context(ctx), arguments)
 
     @_tool(ToolName.GET_TASK_HISTORY.value)
@@ -415,7 +554,19 @@ async def handle_agui_request(request: Request) -> Response:
         return await _handle_continuation(request, interrupt_id)
 
     continuity_run_id = _accepted_continuity_run_id(run_input)
+    previous_run_id = _accepted_previous_run_id(run_input)
     user_message = _accepted_user_message(run_input)
+
+    # D-76. A recognized run-relative control command never reaches the model.
+    # The branch sits after the approval continuation, because a resume payload
+    # is a continuation of a decision and must never be reinterpreted as a new
+    # command, and after message extraction, because the command is the message.
+    #
+    # Everything below this line is the unchanged D-67 model path.
+    if _is_undo_previous_command(user_message):
+        return await _handle_undo_previous(
+            request, user_message, previous_run_id, continuity_run_id
+        )
 
     # D-67. The optional client continuity value is only a lookup key.
     # `create_turn` resolves server-owned state and creates a fresh
@@ -530,6 +681,366 @@ async def _handle_continuation(request: Request, tool_call_id: str) -> Response:
     return adapter.streaming_response(events)
 
 
+def _is_undo_previous_command(user_message: str) -> bool:
+    """Whether this message is an unambiguous "undo the last thing" command.
+
+    Deliberately conservative, and deliberately not a classifier that returns a
+    target. The only two answers are "this names the immediately previous
+    application action" and "this does not", and everything else, including which
+    run that is and which tasks it touched, is resolved from server-owned state
+    afterwards. A message that names a task, a title, a date, or anything else
+    requiring interpretation falls through to the model, where the ordinary
+    tools, policy layer, and approval bridge apply as they always have.
+    """
+    normalized = " ".join(user_message.casefold().split())
+    return normalized.rstrip(_COMMAND_PUNCTUATION).strip() in _UNDO_PREVIOUS_COMMANDS
+
+
+async def _handle_undo_previous(
+    request: Request,
+    user_message: str,
+    previous_run_id: UUID | None,
+    continuity_run_id: UUID | None,
+) -> Response:
+    """D-76. Compensate the previous application run with no model in the loop.
+
+    Zero provider requests, zero framework runs, zero tool calls. `get_agent` is
+    not called and no `Agent` is constructed, which matters beyond cost: building
+    one requires `NVIDIA_API_KEY`, and a deterministic command should not depend
+    on a credential it has no use for.
+
+    What this still produces is an ordinary Trellis turn. A real `agent_runs`
+    row, server-owned canonical history the next model turn will inherit, and a
+    normal AG-UI response. From the browser it is indistinguishable in shape from
+    any other turn, which is the point: continuity, the Run Inspector, and the
+    next conversation turn all keep working without learning about a special
+    case.
+
+    The two locators are resolved for different questions and never substitute
+    for each other. `previous_run_id` names the undo target and nothing else.
+    `continuity_run_id` supplies history and grants no undo authority. When the
+    previous run is itself completed it may serve as both, so the control turn
+    reads as following the action it reversed.
+    """
+    predecessor = await run_in_threadpool(
+        _control_history_predecessor, previous_run_id, continuity_run_id
+    )
+    created = await run_in_threadpool(
+        runs.create_control_turn,
+        settings.actor_id,
+        user_message,
+        predecessor,
+    )
+
+    stream: AGUIEventStream[TrellisDeps, str] = AGUIEventStream(
+        run_input=_control_run_input(created.id),
+        accept=request.headers.get("accept"),
+    )
+    return stream.streaming_response(
+        _control_events(stream.run_input, created, user_message, previous_run_id)
+    )
+
+
+async def _control_events(
+    run_input: RunAgentInput,
+    created: runs.CreatedTurn,
+    user_message: str,
+    previous_run_id: UUID | None,
+):
+    """The AG-UI events of one control turn, in the one order that is truthful.
+
+    `RUN_STARTED` goes first because the browser learns the application run id
+    from it, and both `useRun` and the D-76 previous-run locator read it there.
+
+    `RUN_FINISHED` goes last, after the run is durably `completed`. That is not
+    cosmetic ordering. The browser reacts to run end by fetching
+    `GET /api/runs/{id}` and advances continuity only on `completed`, so a
+    `RUN_FINISHED` emitted while the row still said `running` would lose the
+    turn from the conversation for no reason other than a race this code chose
+    to create.
+
+    Everything between the two is one text message. No tool-call events, because
+    no tool ran, and inventing a `delete_tasks` result the model never requested
+    would put a fabricated call in the transcript the Run Inspector renders.
+
+    **The `except` is not optional, and its absence was a real defect.** The
+    model path reaches AG-UI through `transform_stream`, which converts a raised
+    exception into a protocol error event. This path does not: it hands
+    already-protocol-level events to `streaming_response`, and the pinned 2.27.0
+    `encode_stream` is a bare `async for` that encodes what it is given. An
+    exception escaping here therefore aborts the SSE body mid-stream after
+    `RUN_STARTED`, leaving the browser with a truncated response and no run
+    lifecycle event to react to.
+
+    So the failure is stated in the protocol instead:
+
+    ```text
+    success    RUN_STARTED -> TEXT_MESSAGE_* -> RUN_FINISHED
+    failure    RUN_STARTED -> RUN_ERROR      -> end of stream
+    ```
+
+    `RUN_FINISHED` is never emitted after `RUN_ERROR`. The two are alternative
+    terminal events, and emitting both would tell the browser the run finished
+    normally after telling it the run failed.
+
+    The message is deliberately generic. The exception may carry a database
+    error, and a protocol event is client-facing text; the detail belongs in the
+    run's stored `error` and the server log, both of which are actor scoped.
+    """
+    yield RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id)
+
+    try:
+        outcome = await run_in_threadpool(
+            _run_control_turn, created, user_message, previous_run_id
+        )
+    except Exception:
+        log.exception(
+            "control turn failed", extra={"trellis_run_id": str(created.id)}
+        )
+        yield RunErrorEvent(
+            message=(
+                "The action did not finish normally. Current task state may "
+                "have changed, so the board will refresh from committed state."
+            ),
+            code="TRELLIS_CONTROL_FAILURE",
+        )
+        return
+
+    message_id = str(uuid4())
+    yield TextMessageStartEvent(message_id=message_id, role="assistant")
+    yield TextMessageContentEvent(message_id=message_id, delta=outcome.text)
+    yield TextMessageEndEvent(message_id=message_id)
+    yield RunFinishedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id)
+
+
+def _run_control_turn(
+    created: runs.CreatedTurn,
+    user_message: str,
+    previous_run_id: UUID | None,
+) -> _ControlOutcome:
+    """Perform the undo, persist the turn, and complete the run. In that order.
+
+    The split between the two `try` blocks is the D-76 failure contract, and it
+    mirrors `_record_failure` on the model path rather than inventing a second
+    story about post-commit failure.
+
+    Before compensation, a failure is an ordinary failed run: nothing committed,
+    so nothing has to be explained.
+
+    After compensation, PostgreSQL has already moved and the kernel is not
+    reopened to take it back. Undo is all-or-nothing within its own transaction;
+    it is not part of a larger distributed transaction with this run's history,
+    and pretending otherwise by attempting an automatic redo would be a second
+    uncontrolled mutation on an error path. So the committed fact is recorded in
+    the run's error, the run fails, and the browser refetches the board. A retry
+    of the same command cannot double-apply, because the target now carries a
+    compensation wave and `attempt_run_undo` refuses it.
+    """
+    try:
+        outcome = _undo_previous_outcome(previous_run_id)
+    except Exception as exc:
+        _record_control_failure(created.id, str(exc), exc)
+        raise
+
+    try:
+        runs.complete_control_turn(
+            created.id,
+            to_jsonable_python(
+                _control_history(created.message_history, user_message, outcome.text)
+            ),
+        )
+    except Exception as exc:
+        stored_error = (
+            f"mutation_committed={str(outcome.mutation_committed).lower()}; "
+            f"response_error={exc}"
+        )
+        _record_control_failure(created.id, stored_error, exc)
+        raise
+
+    return outcome
+
+
+def _record_control_failure(run_id: UUID, stored_error: str, cause: Exception) -> None:
+    """Mark the control run failed, without ever masking why it failed.
+
+    Two rules, and the second one is why this is a function rather than three
+    lines at each call site.
+
+    The write is guarded, so cleanup cannot overwrite a run that already reached
+    a terminal status. A zero-row result means something else finished this run
+    first and its outcome stands.
+
+    If the write itself fails, the caller's original exception is the one that
+    propagates. When writes are failing broadly the second exception is a
+    symptom and the first is the reason the turn failed, so raising the symptom
+    would hide the cause. The secondary error is not discarded though: it is
+    logged and attached to the primary exception as a note, so a reader sees
+    both and neither is mistaken for the other.
+
+    The run is then left non-terminal. Nothing can write a status while writes
+    are failing, so that is recorded rather than repaired. It is a pre-existing
+    property of every Trellis run, not something this path introduces, and
+    general cleanup of abandoned non-terminal runs is a separate decision.
+    """
+    try:
+        runs.fail_run_if_running(run_id, stored_error)
+    except Exception as persistence_error:
+        log.exception(
+            "could not persist the terminal failure for control run %s", run_id
+        )
+        cause.add_note(
+            f"secondary failure while persisting FAILED state: {persistence_error!r}"
+        )
+
+
+def _undo_previous_outcome(previous_run_id: UUID | None) -> _ControlOutcome:
+    """Resolve the target and attempt the undo. The model contributes nothing.
+
+    There is no backward search. If the nominated run cannot be undone, that is
+    the answer; this never walks to an older run to find one that can, and it
+    never falls back to the continuity run, because both would undo something
+    the user did not name.
+
+    `OutOfScopeError` and an absent locator produce the same sentence, so a
+    forged id belonging to another actor is indistinguishable from no id at all.
+    """
+    if previous_run_id is None:
+        return _ControlOutcome(text=_NO_TARGET_TEXT)
+
+    try:
+        attempt = runs.attempt_run_undo(previous_run_id, settings.actor_id)
+    except OutOfScopeError:
+        return _ControlOutcome(text=_NO_TARGET_TEXT)
+
+    if attempt.ineligible is not None:
+        return _ControlOutcome(text=_UNDO_INELIGIBLE_TEXT[attempt.ineligible])
+
+    result = attempt.result
+    if result.refused:
+        return _ControlOutcome(text=_UNDO_REFUSED_TEXT[result.reason])
+
+    changes = "change" if result.applied == 1 else "changes"
+    return _ControlOutcome(
+        text=(
+            f"Undone. I reversed {result.applied} task {changes} from the "
+            "previous action, restoring each task under its original id."
+        ),
+        applied=result.applied,
+        mutation_committed=result.applied > 0,
+    )
+
+
+def _control_history(inherited: list, user_message: str, response_text: str) -> list:
+    """The canonical history of a control turn, built by the application itself.
+
+    No `Agent` ran, so there is no `RunResult` and `_completion_recorder` has
+    nothing to record. These two messages are written directly instead, which is
+    sound because Pydantic AI's messages are ordinary dataclasses and its
+    documented persistence boundary is exactly the `to_jsonable_python` ->
+    storage -> `ModelMessagesTypeAdapter` round trip this build already uses.
+
+    What is deliberately absent is as important as what is present:
+
+        no ToolCallPart      no tool was requested
+        no ToolReturnPart    no tool executed
+        no ThinkingPart      nothing reasoned, and prior reasoning does not
+                             belong in a later turn's history in any case
+        no model_name        no provider produced this
+        no provider_name     the same, said in the other field
+        no framework run id  no framework invocation happened
+
+    Every one of those left unset is a claim not made. A synthetic response
+    carrying NVIDIA's model name would make the stored transcript assert a
+    request that was never sent.
+    """
+    history = ModelMessagesTypeAdapter.validate_python(inherited)
+    history.append(
+        ModelRequest(
+            parts=[UserPromptPart(content=user_message)],
+            metadata={_CONTROL_METADATA_KEY: _CONTROL_UNDO_PREVIOUS},
+        )
+    )
+    history.append(
+        ModelResponse(
+            parts=[TextPart(content=response_text)],
+            metadata={_CONTROL_METADATA_KEY: _CONTROL_UNDO_PREVIOUS},
+        )
+    )
+    return history
+
+
+def _control_history_predecessor(
+    previous_run_id: UUID | None, continuity_run_id: UUID | None
+) -> UUID | None:
+    """Which run's canonical history the control turn inherits. Not the target.
+
+    Preferring the previous run reads better in the transcript: the control turn
+    then directly follows the action it is reversing. But D-67 requires a history
+    predecessor to be completed, and that requirement is not negotiable here,
+    because the whole reason `previousRunId` exists is that it may name a failed
+    or interrupted run.
+
+    So the fallback is by status, not by eligibility. A completed previous run is
+    used even when it turns out not to be undoable, because it is still the right
+    conversational predecessor and the refusal belongs in that context. A failed
+    or interrupted one supplies no history and the continuity run does instead.
+    Neither substitution changes the undo target, which was already fixed.
+
+    A previous run this actor does not own contributes nothing here and is not
+    disclosed. The undo attempt refuses it separately, with the same sentence a
+    missing one gets.
+
+    Both candidates are checked rather than only the first, and the continuity
+    one is checked here rather than being handed to `create_control_turn` to
+    refuse. That difference is the whole point. On the ordinary model path a
+    stale or foreign continuity locator is correctly a refusal, because the turn
+    it would seed is the entire request. Here the request is a mutation, and
+    D-76 rules that missing conversation history must never remove valid
+    mutation authority. So an unusable history predecessor degrades to a root
+    control turn instead of refusing an undo the user is entitled to.
+    """
+    for candidate in (previous_run_id, continuity_run_id):
+        if candidate is not None and _is_completed_and_owned(candidate):
+            return candidate
+    return None
+
+
+def _is_completed_and_owned(run_id: UUID) -> bool:
+    """Whether this run can serve as a D-67 history predecessor.
+
+    Answering it here rather than letting the insert refuse is what lets the
+    caller degrade instead of failing. The refusal it would otherwise raise is
+    unchanged and still lives in `create_control_turn`.
+    """
+    try:
+        return runs.load(run_id, settings.actor_id).status is RunStatus.COMPLETED
+    except OutOfScopeError:
+        return False
+
+
+def _control_run_input(run_id: UUID) -> RunAgentInput:
+    """The identifiers the control stream emits, and nothing else.
+
+    `AGUIEventStream` reads `thread_id` and `run_id` off this to stamp
+    `RUN_STARTED` and `RUN_FINISHED`, which is the only reason it exists on a
+    path with no model. Same split as every other route: `thread_id` is the
+    server-issued application run, `run_id` is a fresh transport invocation id
+    and is never application authority.
+
+    The message, tool, state, and context fields are empty because nothing reads
+    them here. No adapter is built, so there is no payload for a model to see.
+    """
+    return RunAgentInput(
+        thread_id=str(run_id),
+        run_id=str(uuid4()),
+        state=None,
+        messages=[],
+        tools=[],
+        context=[],
+        forwarded_props={},
+    )
+
+
 def _deferred_results(approval: Approval) -> DeferredToolResults:
     """The stored decision, as the framework's continuation result.
 
@@ -581,12 +1092,39 @@ def _accepted_continuity_run_id(
     `_accepted_run_input` reconstructs `forwarded_props={}`.
     """
     forwarded = run_input.forwarded_props or {}
-    key = "trellisContinuityRunId"
 
-    if key not in forwarded:
+    if _CONTINUITY_RUN_KEY not in forwarded:
         return None
 
-    value = forwarded[key]
+    value = forwarded[_CONTINUITY_RUN_KEY]
+
+    if not isinstance(value, str):
+        raise OutOfScopeError()
+
+    try:
+        return UUID(value)
+    except ValueError:
+        raise OutOfScopeError() from None
+
+
+def _accepted_previous_run_id(run_input: RunAgentInput) -> UUID | None:
+    """Extract D-76's previous-run lookup key, on the same terms as continuity.
+
+    Separate from `_accepted_continuity_run_id` because the two answer different
+    questions, and reading one for both is the defect D-76 exists to prevent.
+    The refusal shape is identical and deliberately so: absent is None, a
+    non-string is out of scope, and an unparseable UUID is out of scope.
+
+    Extracting it here does not admit it anywhere else. `_accepted_run_input`
+    still rebuilds `forwarded_props={}`, so neither locator reaches the adapter
+    or the model on any path.
+    """
+    forwarded = run_input.forwarded_props or {}
+
+    if _PREVIOUS_RUN_KEY not in forwarded:
+        return None
+
+    value = forwarded[_PREVIOUS_RUN_KEY]
 
     if not isinstance(value, str):
         raise OutOfScopeError()

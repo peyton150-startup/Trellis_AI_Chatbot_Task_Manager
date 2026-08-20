@@ -2726,6 +2726,7 @@ jobs:
                       "due_after": None,
                       "priority": None,
                       "limit": 7,
+                      "duplicates_only": False,
                   }
                   return arguments, payload, []
 
@@ -4984,17 +4985,35 @@ jobs:
           grep -Fq 'override run(input: RunAgentInput)' lib/TrellisHttpAgent.ts \
             || { echo "FAIL TrellisHttpAgent does not intercept final AG-UI input"; exit 1; }
 
-          grep -Fq 'forwardedProps[CONTINUITY_KEY] = this.continuityRunId' lib/TrellisHttpAgent.ts \
+          grep -Fq 'forwardedProps[CONTINUITY_KEY] = continuityRunId' lib/TrellisHttpAgent.ts \
             || { echo "FAIL continuity locator is not top-level forwardedProps"; exit 1; }
+
+          # D-76 moved this assignment out of `run()` into the pure
+          # `trellisForwardedProps` helper, so the value is now a parameter
+          # rather than `this.continuityRunId`. The property this step
+          # asserts is unchanged: the frozen D-67 key is assigned at the top
+          # level of the forwarded properties from Trellis-owned state.
+          grep -Fq 'trellisForwardedProps(' lib/TrellisHttpAgent.ts \
+            || { echo "FAIL the forwarded-property assembly helper is gone"; exit 1; }
 
           grep -Fq 'new TrellisHttpAgent({' components/Chat.tsx \
             || { echo "FAIL Chat bypasses TrellisHttpAgent"; exit 1; }
 
-          grep -Fq 'detail.status === "completed"' components/Chat.tsx \
+          # A second neutral review found that resolving the run to reconcile
+          # from a single mutable ref in Chat.tsx let a delayed failure callback
+          # reconcile a newer run. Fixing that moved the reconciliation rule
+          # into lib/continuity.ts so it could be tested behaviorally instead
+          # of asserted by regular expression. This step therefore follows the
+          # rule to its new home. The property asserted is unchanged: promotion
+          # happens only for a run the server reports `completed`.
+          grep -Fq 'detail.status === "completed"' lib/continuity.ts \
             || { echo "FAIL continuity is not gated by completed server status"; exit 1; }
 
-          grep -Fq 'agent.setContinuityRunId(runId)' components/Chat.tsx \
+          grep -Fq 'promote(runId)' lib/continuity.ts \
             || { echo "FAIL completed run id is not promoted"; exit 1; }
+
+          grep -Fq 'agent.setContinuityRunId(completedRunId)' components/Chat.tsx \
+            || { echo "FAIL Chat does not promote through the Trellis agent"; exit 1; }
 
           if grep -Fq 'new HttpAgent({' components/Chat.tsx; then
             echo "FAIL Chat directly constructs HttpAgent"
@@ -6067,6 +6086,363 @@ jobs:
           echo "PASS D75: history and ownership reads select what they need, with"
           echo "PASS D75: every actor predicate intact and mutation-proven"
 
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  d76-run-relative-undo-bridge:
+    name: D76 run relative undo bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # Targeting, eligibility, atomicity, identity, the ABA regression, the
+      # concurrency race, the AG-UI stream, and the canonical history round
+      # trip. No NVIDIA key is set for this job, deliberately: the control path
+      # must not need one, and the suite makes provider construction itself a
+      # failure.
+      - name: Prove the deterministic undo control path
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check app/agent.py app/runs.py app/undo.py app/sql.py app/prompts.py tests/test_d76_undo_bridge.py
+          pytest tests/test_d76_undo_bridge.py -v
+
+      # The two locators are the whole decision, and the failure mode is a
+      # future tidy-up collapsing them back into one value. Neither a passing
+      # happy path nor a type checker would notice.
+      - name: Prove the two run locators stay separate and server resolved
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq '_PREVIOUS_RUN_KEY = "trellisPreviousRunId"' backend/app/agent.py \
+            || { echo "FAIL the previous-run locator lost its distinct key"; exit 1; }
+
+          grep -Fq '_CONTINUITY_RUN_KEY = "trellisContinuityRunId"' backend/app/agent.py \
+            || { echo "FAIL the continuity locator lost its distinct key"; exit 1; }
+
+          grep -Fq 'PREVIOUS_RUN_KEY = "trellisPreviousRunId"' frontend/lib/TrellisHttpAgent.ts \
+            || { echo "FAIL the browser stopped forwarding a distinct previous-run key"; exit 1; }
+
+          grep -Fq 'forwardedProps[PREVIOUS_RUN_KEY] = previousRunId' frontend/lib/TrellisHttpAgent.ts \
+            || { echo "FAIL the previous-run locator is not assigned at the top level"; exit 1; }
+
+          grep -Fq 'agent.setPreviousRunId(event.threadId)' frontend/components/Chat.tsx \
+            || { echo "FAIL the previous-run cursor no longer advances on RUN_STARTED"; exit 1; }
+
+          # Continuity promotion must stay completed-only. If this ever moves,
+          # a failed run becomes a history predecessor and D-67 is weakened.
+          # The rule moved to lib/continuity.ts when the reconciler was bound
+          # to each invocation's own run; the property asserted is unchanged.
+          grep -Fq 'detail.status === "completed"' frontend/lib/continuity.ts \
+            || { echo "FAIL continuity promotion is no longer completed-only"; exit 1; }
+
+          grep -Fq 'FOR UPDATE;' backend/app/sql.py \
+            || { echo "FAIL the undo serialization lock is gone"; exit 1; }
+
+          grep -Fq 'undo.undo_run_on_conn(run_id, actor_id, conn=conn)' backend/app/runs.py \
+            || { echo "FAIL the authoritative attempt no longer runs the kernel under its own lock"; exit 1; }
+
+          # The control path must not construct an agent, and the undo kernel
+          # must not learn to restore at the old version number.
+          if grep -Fq 'AGUIAdapter(get_agent()' backend/app/agent.py; then
+            if grep -A 40 'async def _handle_undo_previous' backend/app/agent.py | grep -Fq 'get_agent'; then
+              echo "FAIL the control path constructs the model agent"
+              exit 1
+            fi
+          fi
+
+          grep -Fq 'restored_version = _event_version(event.before) + 1' backend/app/undo.py \
+            || { echo "FAIL restoration no longer advances the concurrency version"; exit 1; }
+
+          # The control turn's history and completion are one statement.
+          # Splitting them back into two writes is invisible to every
+          # happy-path test and reintroduces a FAILED run carrying a
+          # fully formed success transcript.
+          grep -Fq 'sql.COMPLETE_CONTROL_TURN,' backend/app/runs.py \
+            || { echo "FAIL the control turn no longer finalizes in one statement"; exit 1; }
+
+          # Terminal status is one way. Both guarded statements must keep
+          # their predicate, or late cleanup can overwrite a committed
+          # completion with a failure, and the run record would then
+          # contradict the work that actually happened.
+          guards=$(grep -c "AND status = .running." backend/app/sql.py || true)
+          if [ "$guards" -lt 2 ]; then
+            echo "FAIL a one-way terminal transition guard was removed (found $guards, need 2)"
+            exit 1
+          fi
+
+          grep -Fq 'FAIL_RUN_IF_RUNNING' backend/app/sql.py \
+            || { echo "FAIL the guarded failure statement is gone"; exit 1; }
+
+          # The control stream bypasses `transform_stream`, so it owns its
+          # own error boundary. Without it an exception truncates the SSE
+          # body after RUN_STARTED with no lifecycle event at all.
+          grep -Fq 'RunErrorEvent(' backend/app/agent.py \
+            || { echo "FAIL the control stream has no protocol error boundary"; exit 1; }
+
+          grep -Fq 'TRELLIS_CONTROL_FAILURE' backend/app/agent.py \
+            || { echo "FAIL the control error event lost its code"; exit 1; }
+
+          # Continuity is reconciled against the server after a transport
+          # failure, and is still only ever promoted on a completed run.
+          #
+          # This gate was previously a regular expression over Chat.tsx,
+          # accepted at the time as a tradeoff because extracting the rule
+          # would move literals an earlier task's check asserted. A blind
+          # review then found a real defect that shape of gate could not
+          # detect: the reconciler resolved its target from one mutable ref,
+          # so a delayed failure callback for run B reconciled run C. A
+          # structural parser cannot see that, because the wiring it asserted
+          # was all present and correct.
+          #
+          # The rule now lives in frontend/lib/continuity.ts and is proven
+          # behaviorally. The regression that matters is the interleaving the
+          # regular expression was blind to: bind B, bind C, then reconcile a
+          # delayed failure for B and assert that C is never even queried.
+          python - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path("frontend/components/Chat.tsx").read_text(encoding="utf-8")
+
+          # The failure hook must resolve its own invocation rather than read a
+          # shared cursor. Binding to input.runId is correlation only; it is
+          # never passed to the server as authority.
+          if not re.search(r"onRunFailed:\s*\(\{\s*input\s*\}\)\s*=>", src):
+              sys.exit("FAIL onRunFailed ignores the invocation that produced it")
+
+          if "bindings.resolve(input.runId)" not in src:
+              sys.exit("FAIL the failure hook does not resolve its own application run")
+
+          if "bindings.bind(input.runId, event.threadId)" not in src:
+              sys.exit("FAIL RUN_STARTED does not bind the invocation to the server-issued run")
+
+          # Continuity identity must come from the lifecycle event that carries
+          # the server-issued id, never from thread.runEnd, which does not.
+          run_end = re.search(r'useAuiEvent\("thread\.runEnd", \(\) => \{(.*?)\n  \}\);', src, re.S)
+          if run_end is None:
+              sys.exit("FAIL the run-end board refresh is gone")
+          if "reconcile" in run_end.group(1):
+              sys.exit("FAIL continuity identity is taken from thread.runEnd again")
+
+          # Only the server-issued value may ever be looked up or promoted.
+          if "input.threadId" in src:
+              sys.exit("FAIL a client-supplied threadId is treated as a run identity")
+
+          # The correlation key is only sound while Trellis leaves the AG-UI
+          # invocation id alone. The protocol permits a caller to supply an
+          # explicit runId, so this asserts the transport does not start doing
+          # so: run() must pass the input through and replace forwardedProps
+          # alone. Minting or reusing a runId here would collapse two
+          # invocations onto one binding, which is the defect this fixed.
+          transport = pathlib.Path("frontend/lib/TrellisHttpAgent.ts").read_text(encoding="utf-8")
+          body = re.search(r"override run\(input: RunAgentInput\).*?\n  \}", transport, re.S)
+          if body is None:
+              sys.exit("FAIL the transport run override is gone or was restructured")
+          body = body.group(0)
+
+          if "...input," not in body:
+              sys.exit("FAIL the transport no longer passes the AG-UI input through")
+
+          if re.search(r"\brunId\s*:", body):
+              sys.exit("FAIL the transport supplies or overrides the AG-UI invocation id")
+
+          print("PASS continuity reconciliation binds each invocation to its own run")
+          PY
+
+          # Deterministic suites must not be able to reach a provider.
+          grep -Fq 'ALLOW_MODEL_REQUESTS' backend/tests/conftest.py \
+            || { echo "FAIL the deterministic suite no longer blocks live model requests"; exit 1; }
+
+          echo "PASS D76 locator, lock, version, finalization, and boundary predicates"
+
+      - name: Prove the browser forwarded-property contract
+        working-directory: frontend
+        run: npm run test:transport
+
+      # Replaces the structural assertion the blind review proved insufficient.
+      # This is the behavioral half: the delayed-failure interleaving, the
+      # completed-only promotion, the unbound invocation, and the release.
+      - name: Prove continuity reconciliation binds each invocation to its run
+        working-directory: frontend
+        run: npm run test:continuity
+
+      - name: Run cumulative non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  d77-current-state-truth:
+    name: D77 current state truth
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # The delete postcondition, replay equivalence, duplicate membership from
+      # current rows only, filter-before-group, membership-before-limit, and the
+      # D-76 x D-77 restore-rejoins-the-group sequence.
+      - name: Prove current-state truth and bounded duplicate reads
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check app/tools.py app/domain.py app/models.py app/sql.py app/prompts.py tests/test_d77_current_state.py
+          pytest tests/test_d77_current_state.py -v
+
+      # Stage order in the duplicate statement is its correctness condition, and
+      # every one of these is invisible to a test that only checks the happy
+      # path with a handful of rows.
+      - name: Prove the duplicate statement keeps its stage order and scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq 'count(*) OVER (PARTITION BY lower(title)) AS duplicate_count' backend/app/sql.py \
+            || { echo "FAIL duplicate membership is no longer whole-title, case-insensitive, and SQL-owned"; exit 1; }
+
+          # LIMIT must come after the duplicate predicate. If grouping ever
+          # moved behind the page bound, an empty result would stop being a
+          # proof.
+          python - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path("backend/app/sql.py").read_text(encoding="utf-8")
+          match = re.search(
+              r'SELECT_DUPLICATE_TASKS_FOR_OWNER = """(.*?)"""', src, re.S
+          )
+          if match is None:
+              sys.exit("FAIL the duplicate statement is gone")
+          body = match.group(1)
+          for needle in ("owner_id = %(owner_id)s", "duplicate_count > 1", "LIMIT %(limit)s"):
+              if needle not in body:
+                  sys.exit(f"FAIL the duplicate statement lost {needle!r}")
+          if not (
+              body.index("owner_id = %(owner_id)s")
+              < body.index("duplicate_count > 1")
+              < body.index("LIMIT %(limit)s")
+          ):
+              sys.exit("FAIL filters, duplicate membership, and LIMIT are out of order")
+          if "marked.*" in body or "SELECT *\n  FROM marked" in body:
+              sys.exit("FAIL the internal duplicate_count can reach Task.model_validate")
+          print("PASS duplicate statement stage order")
+          PY
+
+          # Enrichment must precede lease completion, or an original call and a
+          # replay produce two different canonical histories.
+          python - <<'PY'
+          import sys, pathlib
+          src = pathlib.Path("backend/app/tools.py").read_text(encoding="utf-8")
+          enrich = src.index("result = [_deleted_snapshot(task) for task in mutation.tasks]")
+          complete = src.index("idempotency.complete", enrich)
+          if enrich >= complete:
+              sys.exit("FAIL the delete result is enriched after idempotency.complete")
+          print("PASS delete enrichment precedes lease completion")
+          PY
+
+          # No soft delete crept in.
+          if grep -Eq "TaskStatus\.DELETED|'deleted'::task_status" backend/app/models.py backend/app/sql.py; then
+            echo "FAIL a deleted task status was introduced"
+            exit 1
+          fi
+
+          if ls backend/migrations/*.sql | grep -qv -e 001_init -e 002_linear -e 003_linear_agent; then
+            echo "FAIL D-77 introduced a migration"
+            exit 1
+          fi
+
+          echo "PASS D77 statement, ordering, and no-migration predicates"
+
+      - name: Prove the model-visible tool profile did not grow
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd backend
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from app import agent
+          from app.models import ToolName
+          if len(agent.ALL_TOOLS) != 8:
+              sys.exit(f"FAIL the browser profile is {len(agent.ALL_TOOLS)} tools, not 8")
+          if len(agent.LINEAR_TOOLS) != 6:
+              sys.exit(f"FAIL the Linear profile is {len(agent.LINEAR_TOOLS)} tools, not 6")
+          names = {name.value for name in ToolName}
+          for forbidden in ("undo", "undo_tasks", "recover_tasks", "restore_tasks"):
+              if forbidden in names:
+                  sys.exit(f"FAIL {forbidden} became a model tool")
+          print("PASS eight browser tools, six Linear tools, no undo tool")
+          PY
+
+      - name: Run cumulative non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v

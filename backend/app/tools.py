@@ -68,6 +68,7 @@ from .models import (
     MutableTaskFields,
     ProposePlanArgs,
     ResolveTaskReferenceArgs,
+    Task,
     ToolName,
     UpdateTaskArgs,
 )
@@ -812,7 +813,7 @@ def delete_tasks(
             domain.write_events(
                 ctx.run_id, ctx.actor_id, mutation.events, conn=conn
             )
-            result = [task.model_dump(mode="json") for task in mutation.tasks]
+            result = [_deleted_snapshot(task) for task in mutation.tasks]
             idempotency.complete(ctx.run_id, ctx.tool_call_id, result, conn=conn)
             conn.commit()
             committed = True
@@ -823,6 +824,37 @@ def delete_tasks(
 
     # 5.
     return result
+
+
+def _deleted_snapshot(task: Task) -> domain.TaskSnapshot:
+    """The pre-delete row, plus the postcondition the row alone cannot state.
+
+    D-77. This exists because of a real observed failure. A deleted task carries
+    `"status": "open"` in its final snapshot, because that is what it was the
+    instant before it stopped existing. Pydantic AI then correctly preserves the
+    tool return in canonical history, so a later turn shows the model a task that
+    reads as currently open with nothing anywhere saying it is gone. The model
+    was not hallucinating; it was reading an ambiguous record accurately.
+
+    The two markers resolve that ambiguity at the point the record is written,
+    which is the only place it can be resolved honestly:
+
+        deleted             this invocation deleted this task
+        exists_after_tool   no current row with this id existed once this tool's
+                            transaction committed
+
+    Named `exists_after_tool` and deliberately not `exists_now`. A row persisted
+    in history cannot make a permanent claim about "now": D-76 can restore this
+    exact task under its original id, at which point a stored `exists_now: false`
+    would be a lie in the transcript. Both markers describe a postcondition at a
+    point in the past, and both stay true forever.
+
+    They are not fields on `Task`. `Task` models a row in `tasks`, and a row that
+    exists never needs to say it was deleted. This is a result projection for one
+    tool, which is why it is a plain dict here rather than a model change that
+    would ripple into every read.
+    """
+    return {**task.model_dump(mode="json"), "deleted": True, "exists_after_tool": False}
 
 
 def propose_plan(
