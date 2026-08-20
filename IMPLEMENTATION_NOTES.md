@@ -2752,7 +2752,7 @@ cd frontend && npm run test:transport
 cd frontend && npm run build
 ```
 
-Observed: 34 passed in `test_d76_undo_bridge.py`; 387 passed and 13 deselected in
+Observed: 40 passed in `test_d76_undo_bridge.py`; 393 passed and 13 deselected in
 the cumulative backend suite; 9 passed in the frontend transport test; Next.js
 16.3.1 production build compiled and generated 3 static pages.
 
@@ -2811,14 +2811,86 @@ passing at the reviewed SHA.
   ineligible. Making those atomic is a durable-journal design and is deliberately
   not attempted here.
 
-  That window is injected rather than argued. `save_history` is made to raise
-  after the kernel commits, and the regression asserts the restored row under its
-  original id at a forward version, the FAILED run, `mutation_committed=true` in
-  the error, empty history on the failed turn, and that retrying the same command
+  That window is injected rather than argued. The persistence tail is made to
+  raise after the kernel commits, and the regression asserts the restored row
+  under its original id at a forward version, the FAILED run,
+  `mutation_committed=true` in the error, and that retrying the same command
   refuses and leaves exactly one compensation wave. The pre-commit branch is
   injected separately at `attempt_run_undo` and must not claim a mutation
   committed, because if both branches wrote the same error the marker would stop
   distinguishing anything.
+
+- Neutral review, twice, found failure points inside that tail that earlier
+  versions neither handled nor tested. All are fixed rather than documented
+  around, and each fix is mutation-proven.
+
+  History and completion were two calls on two connections. A history write that
+  committed followed by a failing status write left a FAILED run carrying a
+  fully formed "Undone." transcript, which made the note's unqualified claim of
+  empty history on a failed turn false for that ordering. `complete_control_turn`
+  now writes both in one transaction, so an empty history on a non-completed
+  control run means what it says. Proven by breaking the status statement and
+  asserting neither half landed, and mutation-proven by splitting the
+  transaction back apart.
+
+  A failure in the failure-marking write itself re-raised the symptom and hid
+  the cause. The original error now propagates while the secondary one is logged
+  and attached as a note, so neither is lost and neither is mistaken for the
+  other. The run is still left non-terminal in that case, which is recorded
+  rather than repaired: nothing can write a status while writes are failing. It
+  is a pre-existing property of every Trellis run, and the model path fails the
+  same way. The one new consequence is that the browser's previous-run cursor
+  points at a run that never resolves, so the next "undo that" refuses as still
+  active. That cursor advances on every `RUN_STARTED`, so the effect is bounded
+  to one turn rather than the session lockout it first appears to be, and the
+  regression asserts exactly that bound.
+
+  Terminal status is now one way. `COMPLETE_CONTROL_TURN` and
+  `FAIL_RUN_IF_RUNNING` both carry `AND status = 'running'`, so cleanup cannot
+  overwrite a committed completion with a failure. A zero-row result means
+  something else finished the run first, which `fail_run_if_running` reports as
+  None and `complete_control_turn` reports as `RunAlreadyTerminalError`.
+
+  The failed-history invariant was also wrong as first written. "Empty history
+  on the failed turn" is only true of a root turn; an inherited turn is born
+  carrying its predecessor's history. The invariant is that a failed turn keeps
+  exactly the history it was created with, and both shapes are tested.
+
+  The AG-UI control stream had no error boundary. The model path gets one from
+  `transform_stream`; this path hands protocol events straight to
+  `streaming_response`, whose pinned 2.27.0 `encode_stream` is a bare
+  `async for`. An escaping exception truncated the SSE body after RUN_STARTED
+  with no lifecycle event at all. It now emits `RUN_ERROR` and stops, never
+  `RUN_FINISHED` afterwards, and a transport-level test asserts the event
+  sequence with both persistence writes failing.
+
+  Continuity was not reconciled after a transport failure. A control turn could
+  commit `completed` and lose the connection before RUN_FINISHED, leaving the
+  browser on an older continuity cursor and dropping the undo from the next
+  turn's inherited history. `onRunFailed` now runs the same server query run end
+  runs, with the unchanged rule that only a `completed` run may be promoted.
+
+  That last fix is proven by the structural CI gate and by reading, not by a
+  unit test. Extracting the reconciliation into a testable module would move the
+  two literals the T17 gate asserts out of `Chat.tsx` and amend an earlier
+  task's check a second time, which is not worth a unit test. This is a real
+  coverage gap and is recorded as one.
+
+- Deterministic suites now block live provider requests at the bootstrap.
+  `tests/conftest.py` sets `models.ALLOW_MODEL_REQUESTS` False for every test
+  that does not carry the `network` marker, and restores it for the two external
+  suites that exist to reach a real service. It is a backstop, not the proof:
+  the D-76 module's own guard makes provider *construction* raise, which is the
+  stronger claim.
+
+- A durable execution framework is the right class of answer to abandoned
+  non-terminal runs, and is deliberately out of scope. Pydantic AI ships
+  Temporal, DBOS, Prefect, and Restate integrations, and they provide durability
+  only for work executing inside the workflow. This control path invokes no
+  `Agent`, so attaching durability to the agent would not cover it, and adopting
+  one would turn this task into application-wide orchestration. DBOS is the one
+  to evaluate first if Trellis ever wants it, being PostgreSQL backed. Separate
+  decision.
 
 - "No automatic redo is attempted" is guaranteed by absence rather than by a
   guard, in the same sense the tool profile is: no code path re-applies a
@@ -2885,7 +2957,7 @@ cd backend && DATABASE_URL=... pytest -m "not network"
 cd frontend && npm run build
 ```
 
-Observed: 18 passed in `test_d77_current_state.py`; 387 passed and 13 deselected
+Observed: 18 passed in `test_d77_current_state.py`; 393 passed and 13 deselected
 cumulatively. The replay invariant is proved as one equality across the returned
 value, the stored `tool_invocations.result`, and a `replay_completed` read.
 Membership-before-LIMIT is proved with 30 duplicate pairs against a 50-row bound.

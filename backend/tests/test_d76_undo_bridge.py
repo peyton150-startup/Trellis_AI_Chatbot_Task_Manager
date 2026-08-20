@@ -29,6 +29,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic_core import to_jsonable_python
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models.function import FunctionModel
 
@@ -835,6 +836,61 @@ def test_an_unusable_continuity_cursor_degrades_and_never_blocks_undo(db, contin
     assert len(runs.load_history(control_id, ACTOR_ID)) == 2
 
 
+# --------------------------------------------------- the transport boundary
+
+
+def test_a_control_failure_is_stated_in_the_protocol(db, monkeypatch):
+    """RUN_ERROR, not a truncated stream. Found by neutral review.
+
+    The model path reaches AG-UI through `transform_stream`, which converts a
+    raised exception into a protocol error event. The control path does not: it
+    hands already-protocol-level events to `streaming_response`, whose
+    `encode_stream` in pinned 2.27.0 is a bare `async for` that encodes what it
+    is given. Without the boundary in `_control_events`, an exception aborts the
+    SSE body after RUN_STARTED and the browser is left with a truncated response
+    and no lifecycle event to react to.
+
+    Both writes are made to fail, which is the harshest case: the compensation
+    committed, the turn could not be recorded, and the failure could not be
+    recorded either. The protocol must still say so.
+    """
+    run_id, [task] = _deleting_run(db, ["Transport failure"])
+
+    def _unavailable(*args, **kwargs):
+        raise RuntimeError("persistence unavailable")
+
+    monkeypatch.setattr(runs, "complete_control_turn", _unavailable)
+    monkeypatch.setattr(runs, "fail_run_if_running", _unavailable)
+
+    response = _post("undo that", previous_run_id=run_id)
+    assert response.status_code == 200
+
+    kinds = [event["type"] for event in _events(response)]
+    assert kinds == ["RUN_STARTED", "RUN_ERROR"], kinds
+
+    error = _events(response)[1]
+    assert error["code"] == "TRELLIS_CONTROL_FAILURE"
+    # Generic. A protocol event is client-facing text, and the exception may
+    # carry a database error; the detail belongs in the run row and the log.
+    assert "persistence unavailable" not in error["message"]
+
+    monkeypatch.undo()
+
+    # The compensation committed, which is exactly why the message warns that
+    # current task state may have changed.
+    assert task.id in _tasks_by_id(db)
+
+
+def test_a_successful_control_turn_never_emits_run_error(db):
+    """RUN_ERROR and RUN_FINISHED are alternative terminal events, never both."""
+    run_id, _ = _deleting_run(db, ["Clean finish"])
+
+    kinds = [event["type"] for event in _events(_post("undo that", previous_run_id=run_id))]
+
+    assert "RUN_ERROR" not in kinds
+    assert kinds[-1] == "RUN_FINISHED"
+
+
 # ------------------------------------------------- failure after the commit
 
 
@@ -870,7 +926,7 @@ def test_history_failure_after_the_compensation_commits(db, monkeypatch):
     def _unavailable(*args, **kwargs):
         raise RuntimeError("history store unavailable")
 
-    monkeypatch.setattr(runs, "save_history", _unavailable)
+    monkeypatch.setattr(runs, "complete_control_turn", _unavailable)
 
     with pytest.raises(RuntimeError, match="history store unavailable"):
         agent._run_control_turn(created, "undo that", run_id)
@@ -903,6 +959,189 @@ def test_history_failure_after_the_compensation_commits(db, monkeypatch):
     assert (
         sum(1 for e in _events_for(db, run_id) if e["operation"] == "restored") == 1
     ), "the retry applied a second compensation wave"
+
+
+def test_the_persistence_tail_is_one_transaction(db, monkeypatch):
+    """History and completion commit together, or neither does.
+
+    Found by neutral review. These used to be two calls on two connections, so
+    a `save_history` that committed followed by a failing `set_status` left a
+    FAILED run carrying a fully formed "Undone." transcript. Nothing was
+    corrupted, but the note claiming a failed control turn has empty history
+    was false for that ordering, and a surface rendering that run would show a
+    success narrative under a failure banner.
+
+    The fix removes the ordering rather than documenting it, so this asserts the
+    property the ordering used to break: when the persistence tail fails, the
+    turn has no history at all. That is what makes an empty history on a failed
+    control run mean something.
+    """
+    created = runs.create_control_turn(ACTOR_ID, "undo that", None)
+    history = to_jsonable_python(
+        agent._control_history([], "undo that", "Undone. I reversed 1 task change.")
+    )
+
+    monkeypatch.setattr(
+        runs.sql,
+        "COMPLETE_CONTROL_TURN",
+        "UPDATE agent_runs SET no_such_column = 1 WHERE id = %(run_id)s",
+    )
+
+    with pytest.raises(Exception):
+        runs.complete_control_turn(created.id, history)
+
+    monkeypatch.undo()
+
+    # Neither half landed.
+    assert runs.load_history(created.id, ACTOR_ID) == []
+    assert runs.load(created.id, ACTOR_ID).status is RunStatus.RUNNING
+
+    # And the same call succeeding writes both together.
+    runs.complete_control_turn(created.id, history)
+    assert len(runs.load_history(created.id, ACTOR_ID)) == 2
+    assert runs.load(created.id, ACTOR_ID).status is RunStatus.COMPLETED
+
+
+def test_a_failed_turn_keeps_exactly_its_creation_history(db, monkeypatch):
+    """The corrected invariant. Not "empty", but "unchanged since creation".
+
+    "A failed control turn has empty history" was only ever true of a root turn.
+    A turn that inherited a completed predecessor's history is born carrying it,
+    and losing that on failure would be its own defect. What must never appear is
+    a partial control exchange: the user message without the response, or either
+    one on a run that never reached `completed`.
+    """
+    predecessor = _run()
+    inherited = [
+        {
+            "parts": [
+                {
+                    "content": "earlier conversation",
+                    "timestamp": "2026-08-20T00:00:00Z",
+                    "part_kind": "user-prompt",
+                }
+            ],
+            "kind": "request",
+        }
+    ]
+    runs.save_history(predecessor.id, inherited)
+
+    monkeypatch.setattr(
+        runs.sql,
+        "COMPLETE_CONTROL_TURN",
+        "UPDATE agent_runs SET no_such_column = 1 WHERE id = %(run_id)s",
+    )
+
+    for predecessor_id, expected in [(None, 0), (predecessor.id, 1)]:
+        created = runs.create_control_turn(ACTOR_ID, "undo that", predecessor_id)
+        assert len(created.message_history) == expected
+
+        with pytest.raises(Exception):
+            runs.complete_control_turn(
+                created.id,
+                to_jsonable_python(
+                    agent._control_history(
+                        created.message_history, "undo that", "Undone."
+                    )
+                ),
+            )
+
+        after = runs.load_history(created.id, ACTOR_ID)
+        assert after == created.message_history, (
+            "a failed control turn changed the history it was created with"
+        )
+        assert len(after) == expected
+        assert runs.load(created.id, ACTOR_ID).status is RunStatus.RUNNING
+
+
+def test_terminal_status_is_one_way(db):
+    """A run may reach one terminal status, and nothing may rewrite it.
+
+    Without the guard, late cleanup in an outer layer could overwrite a
+    committed completion with a failure, and the run record would then
+    contradict the work that actually happened.
+    """
+    created = runs.create_control_turn(ACTOR_ID, "undo that", None)
+    history = to_jsonable_python(agent._control_history([], "undo that", "Undone."))
+
+    runs.complete_control_turn(created.id, history)
+    assert runs.load(created.id, ACTOR_ID).status is RunStatus.COMPLETED
+
+    # Cleanup arriving late finds nothing to do, and says so by returning None.
+    assert runs.fail_run_if_running(created.id, "late cleanup") is None
+    assert runs.load(created.id, ACTOR_ID).status is RunStatus.COMPLETED
+    assert runs.load(created.id, ACTOR_ID).error is None
+
+    # And a second completion of an already-terminal run is refused rather than
+    # silently rewriting it.
+    with pytest.raises(runs.RunAlreadyTerminalError):
+        runs.complete_control_turn(created.id, history)
+
+    failed = runs.create_control_turn(ACTOR_ID, "undo that", None)
+    assert runs.fail_run_if_running(failed.id, "first failure") is not None
+    assert runs.fail_run_if_running(failed.id, "second failure") is None
+    assert runs.load(failed.id, ACTOR_ID).error == "first failure"
+
+
+def test_a_failing_failure_write_surfaces_the_original_cause(db, monkeypatch):
+    """When even the FAILED marking cannot be written, report the cause.
+
+    Found by neutral review. If writes are failing broadly, the error raised by
+    the failure-marking write is a symptom and the persistence error is the
+    cause. Raising the symptom would hide why the turn actually failed.
+
+    The run is then left non-terminal, and that is recorded rather than fixed.
+    It is a pre-existing property of every Trellis run, not something this path
+    introduces: the model path writes terminal status the same way and can fail
+    the same way. What this test pins is that the failure is legible and that
+    the committed compensation is untouched.
+    """
+    run_id, [task] = _deleting_run(db, ["Both writes lost"])
+    created = runs.create_control_turn(ACTOR_ID, "undo that", None)
+
+    def _tail_unavailable(*args, **kwargs):
+        raise RuntimeError("persistence unavailable")
+
+    def _status_unavailable(*args, **kwargs):
+        raise RuntimeError("status write also unavailable")
+
+    monkeypatch.setattr(runs, "complete_control_turn", _tail_unavailable)
+    monkeypatch.setattr(runs, "fail_run_if_running", _status_unavailable)
+
+    with pytest.raises(RuntimeError) as raised:
+        agent._run_control_turn(created, "undo that", run_id)
+
+    # The cause propagates, not the symptom.
+    assert "persistence unavailable" in str(raised.value)
+    assert "status write also unavailable" not in str(raised.value)
+
+    # But the symptom is not discarded either. It is attached as a note, so a
+    # reader sees both and neither is mistaken for the other.
+    notes = getattr(raised.value, "__notes__", [])
+    assert any("status write also unavailable" in note for note in notes), notes
+
+    monkeypatch.undo()
+
+    # The compensation stands, which is the part that matters to the user.
+    assert task.id in _tasks_by_id(db)
+    assert (
+        sum(1 for e in _events_for(db, run_id) if e["operation"] == "restored") == 1
+    )
+
+    # The run is left non-terminal. Recorded, not repaired: nothing can write a
+    # status while writes are failing, and a reaper is a separate decision.
+    stuck = runs.load(created.id, ACTOR_ID)
+    assert stuck.status is RunStatus.RUNNING
+    assert stuck.error is None
+
+    # The consequence is bounded to one turn, and this is why it is not a
+    # lockout. The browser advances `previousRunId` on every RUN_STARTED, so
+    # the stuck run is only the target until any next turn issues a new id.
+    _, text = _control_turn("undo that", previous_run_id=created.id)
+    assert "has not finished yet" in text
+
+    _, recovered = _control_turn("undo that", previous_run_id=run_id)
+    assert "already been undone" in recovered
 
 
 def test_failure_before_the_compensation_claims_no_committed_mutation(db, monkeypatch):

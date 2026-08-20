@@ -3540,9 +3540,24 @@ caller, and deliberately does not give it to the model.
    may itself have written. Nothing inside the kernel therefore stops a second
    caller. The predicate that does stop it is the eligibility rule, and it has to
    be evaluated where a second caller cannot have read it before the first
-   committed. The invariant is that for one target run and any number of
-   concurrent attempts, at most one reports `applied > 0`, and it is proved by a
-   real three-thread race against real PostgreSQL rather than asserted.
+   committed.
+
+   The invariant has two halves and both are required. Saying the lock is what
+   prevents a double undo overstates it, and the author mutation audit is what
+   established that:
+
+   ```text
+   Safety:
+       the existing kernel guards ensure at most one compensation applies.
+
+   Serialization:
+       FOR UPDATE ensures every competing loser observes the authoritative
+       post-compensation state and receives the correct refusal reason.
+   ```
+
+   Both halves are proved by a real three-thread race against real PostgreSQL
+   rather than asserted: exactly one attempt applies, and every loser reports
+   already-compensated rather than a kernel conflict.
 
    The lock is on the run row rather than on the affected tasks because the undo
    unit is a run: a run that deleted all of its tasks locks no task rows at all,
@@ -3617,12 +3632,43 @@ caller, and deliberately does not give it to the model.
    `AGUIAdapter(get_agent(), ...)` would construct the NVIDIA model, and
    therefore require `NVIDIA_API_KEY`, for a command that has no use for either.
 
-8. **`RUN_FINISHED` comes after the run is durably `completed`.** The browser
+8. **`RUN_FINISHED` comes after the run is durably `completed`, and a failure
+   is stated in the protocol rather than by truncating the stream.** The browser
    fetches `GET /api/runs/{id}` the moment it sees run end and promotes
    continuity only on `completed`, so finishing the stream before finishing the
    turn would drop the control turn out of the conversation for no reason but a
    self-inflicted race. `RUN_STARTED` still comes first, because that is where
    the browser learns the application run id.
+
+   The error boundary is this path's own, and its absence was a real defect
+   found by neutral review. The model path reaches AG-UI through
+   `transform_stream`, which converts a raised exception into a protocol error
+   event. This path does not: it hands already-protocol-level events to
+   `streaming_response`, and the pinned 2.27.0 `encode_stream` is a bare
+   `async for` that encodes what it is given. An escaping exception therefore
+   aborted the SSE body after `RUN_STARTED`, leaving the browser with a
+   truncated response and no lifecycle event to react to.
+
+   ```text
+   success    RUN_STARTED -> TEXT_MESSAGE_* -> RUN_FINISHED
+   failure    RUN_STARTED -> RUN_ERROR      -> end of stream
+   ```
+
+   The two terminal events are alternatives and never both, because emitting
+   `RUN_FINISHED` after `RUN_ERROR` would tell the browser the run finished
+   normally after telling it the run failed. The error message is generic: the
+   exception may carry a database error, a protocol event is client-facing
+   text, and the detail belongs in the run's stored `error` and the server log.
+
+   **Continuity is reconciled after a transport failure, never assumed.** A
+   control turn can commit `completed` with its history and then lose the
+   connection before `RUN_FINISHED` arrives. Run end never fires, continuity
+   stays on the older run, and the next ordinary turn inherits history that
+   omits the undo that actually happened. So a transport failure now triggers
+   the same server query run end does, and the promotion rule is unchanged and
+   is the point: only a run PostgreSQL reports as `completed` may become the
+   continuity cursor. A transport failure is a reason to go and check, never a
+   reason to guess.
 
 9. **Every recognized command produces a run, including every refusal.** A
    semantic refusal is a COMPLETED control run carrying the refusal in its
@@ -3658,6 +3704,68 @@ caller, and deliberately does not give it to the model.
     redo is attempted, because that would be a second uncontrolled mutation on an
     error path. Retrying the same command cannot double-apply: the target now
     carries a compensation wave and is ineligible.
+
+    The turn's history and its completion are **one transaction**, and neutral
+    review is why. They were two calls on two connections, so a history write
+    that committed followed by a failing status write left a FAILED run carrying
+    a fully formed "Undone." transcript. Nothing was corrupted and nothing
+    double-applied, but the claim that a failed control turn has empty history
+    was false for that ordering, and a surface rendering that run would have
+    shown a success narrative under a failure banner.
+    `runs.complete_control_turn` removes the ordering rather than documenting
+    it. It is deliberately not merged with the kernel's transaction, which would
+    put a compensating mutation and a conversation transcript in one atomic
+    unit; that is the durable-journal design this decision declines to attempt,
+    and the window between the two commits stays open, injected rather than
+    claimed closed.
+
+    **Terminal status is one way, and both writes are guarded.** A run moves
+    from `running` to exactly one terminal status, and nothing rewrites a
+    terminal one:
+
+    ```text
+    running -> completed      COMPLETE_CONTROL_TURN
+    running -> failed         FAIL_RUN_IF_RUNNING
+    completed -> failed       matches no row
+    failed -> completed       matches no row
+    ```
+
+    Without the predicate, late cleanup in an outer layer could overwrite a
+    committed completion with a failure, and the run record would then
+    contradict the work that actually happened. A zero-row result is an answer
+    rather than an error: something else finished the run first and its outcome
+    stands.
+
+    **The failed-history invariant is "unchanged since creation", not "empty".**
+    A control turn born from a completed predecessor carries that predecessor's
+    history, and losing it on failure would be its own defect. What must never
+    appear is a partial control exchange. Root turns stay empty, inherited turns
+    keep exactly what they inherited, and the synthetic pair lands only in the
+    same transaction that records `completed`.
+
+    If even the failure-marking write cannot be executed, the original cause
+    propagates, because when writes are failing broadly the second exception is
+    a symptom and the first is the reason the turn failed. The secondary error
+    is not discarded: it is logged and attached to the primary exception as a
+    note, so a reader sees both and neither is mistaken for the other. The run
+    is then left non-terminal. That is a pre-existing property of every Trellis
+    run rather than something this path introduces: the model path writes
+    terminal status the same way and can fail the same way. Its one new
+    consequence is that the browser's previous-run cursor points at a run that
+    will never resolve, so the next "undo that" refuses as still active. The
+    cursor advances on every `RUN_STARTED`, so that is bounded to one turn
+    rather than a session lockout, and general cleanup of abandoned
+    non-terminal runs is a separate decision.
+
+    A durable execution framework is the right *class* of answer to abandoned
+    runs, and it is deliberately not adopted here. Pydantic AI ships
+    integrations for Temporal, DBOS, Prefect, and Restate, and they provide
+    durability only for work that runs inside the workflow. This control path
+    invokes no `Agent` at all, so attaching one to the agent would not make it
+    durable, and adopting one would turn this decision into application-wide
+    orchestration. If Trellis later wants that, DBOS is the one to evaluate
+    first, because it is PostgreSQL backed and this build already treats
+    PostgreSQL as authority. Separate decision, not this one.
 
 14. **One earlier gate is amended, and the amendment is disclosed rather than
     quiet.** T17's frontend step asserted the continuity locator by its exact

@@ -123,6 +123,18 @@ class UndoAttempt:
         return 0 if self.result is None else self.result.applied
 
 
+class RunAlreadyTerminalError(RuntimeError):
+    """A one-way status transition found the run was already terminal.
+
+    Not a section 6 client-facing rejection. It means two writers raced for the
+    same run's outcome, and the loser must not overwrite the winner.
+    """
+
+    def __init__(self, run_id: UUID) -> None:
+        super().__init__(f"run {run_id} is already terminal")
+        self.run_id = run_id
+
+
 @dataclass(frozen=True)
 class CreatedTurn:
     """What creating a turn commits: the new run id and its starting history.
@@ -349,6 +361,60 @@ def save_history(run_id: UUID, message_history: list) -> None:
             {"run_id": run_id, "message_history": Json(message_history)},
         )
         conn.commit()
+
+
+def complete_control_turn(run_id: UUID, message_history: list) -> AgentRun:
+    """Persist a control turn's history and completion as one transaction.
+
+    D-76, corrected after neutral review. These were two calls, and therefore
+    two transactions, and the gap between them was a state the documentation
+    said could not happen: `save_history` commits on its own connection, so a
+    failure in the following `set_status(COMPLETED)` left a FAILED run carrying
+    a fully formed "Undone." transcript. Nothing was corrupted, but a surface
+    reading that run would show a coherent success narrative under a failure
+    banner, and the note claiming a failed control turn has empty history was
+    simply false for that ordering.
+
+    Writing both on one connection removes the ordering rather than documenting
+    it. Either the turn is completed with its history, or neither landed and the
+    history is empty, which is what makes the failure legible: an empty history
+    on a failed control run now means what it says.
+
+    This is deliberately not merged with the undo kernel's transaction. That
+    would put a compensating mutation and a conversation transcript in one
+    atomic unit, which is the durable-journal design D-76 declines to attempt.
+    The window between the kernel's commit and this one stays open, and is
+    documented and injected rather than claimed closed.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.COMPLETE_CONTROL_TURN,
+            {"run_id": run_id, "message_history": Json(message_history)},
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise RunAlreadyTerminalError(run_id)
+    return AgentRun.model_validate(row)
+
+
+def fail_run_if_running(run_id: UUID, error: str) -> AgentRun | None:
+    """Record a terminal failure, but never over a run that already finished.
+
+    D-76. `set_status` moves a run to any status unconditionally, which is right
+    for the paths that own the whole lifecycle. This is for cleanup, which does
+    not: a late failure written on top of a committed completion would make the
+    run record contradict the work that actually happened.
+
+    Returns None when the run was already terminal. That is an answer, not an
+    error, and the caller is expected to leave it alone.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.FAIL_RUN_IF_RUNNING,
+            {"run_id": run_id, "error": error},
+        ).fetchone()
+        conn.commit()
+    return None if row is None else AgentRun.model_validate(row)
 
 
 def set_status(run_id: UUID, status: RunStatus, error: str | None = None) -> AgentRun:

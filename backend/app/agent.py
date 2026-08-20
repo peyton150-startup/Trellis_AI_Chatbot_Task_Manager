@@ -70,12 +70,14 @@ names as the only source of history anywhere in the codebase. Nothing here
 constructs a message list from a request.
 """
 
+import logging
 from dataclasses import dataclass, field
 from functools import cache
 from uuid import UUID, uuid4
 
 from ag_ui.core import (
     RunAgentInput,
+    RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
     TextMessageContentEvent,
@@ -134,6 +136,8 @@ from .models import (
 # confirmed the framework maps a continuation back to the original call through
 # it. Stripped in exactly one place, `_continuation_interrupt_id`.
 _INTERRUPT_PREFIX = "int-"
+
+log = logging.getLogger("trellis.agent")
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -758,12 +762,49 @@ async def _control_events(
     Everything between the two is one text message. No tool-call events, because
     no tool ran, and inventing a `delete_tasks` result the model never requested
     would put a fabricated call in the transcript the Run Inspector renders.
+
+    **The `except` is not optional, and its absence was a real defect.** The
+    model path reaches AG-UI through `transform_stream`, which converts a raised
+    exception into a protocol error event. This path does not: it hands
+    already-protocol-level events to `streaming_response`, and the pinned 2.27.0
+    `encode_stream` is a bare `async for` that encodes what it is given. An
+    exception escaping here therefore aborts the SSE body mid-stream after
+    `RUN_STARTED`, leaving the browser with a truncated response and no run
+    lifecycle event to react to.
+
+    So the failure is stated in the protocol instead:
+
+    ```text
+    success    RUN_STARTED -> TEXT_MESSAGE_* -> RUN_FINISHED
+    failure    RUN_STARTED -> RUN_ERROR      -> end of stream
+    ```
+
+    `RUN_FINISHED` is never emitted after `RUN_ERROR`. The two are alternative
+    terminal events, and emitting both would tell the browser the run finished
+    normally after telling it the run failed.
+
+    The message is deliberately generic. The exception may carry a database
+    error, and a protocol event is client-facing text; the detail belongs in the
+    run's stored `error` and the server log, both of which are actor scoped.
     """
     yield RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id)
 
-    outcome = await run_in_threadpool(
-        _run_control_turn, created, user_message, previous_run_id
-    )
+    try:
+        outcome = await run_in_threadpool(
+            _run_control_turn, created, user_message, previous_run_id
+        )
+    except Exception:
+        log.exception(
+            "control turn failed", extra={"trellis_run_id": str(created.id)}
+        )
+        yield RunErrorEvent(
+            message=(
+                "The action did not finish normally. Current task state may "
+                "have changed, so the board will refresh from committed state."
+            ),
+            code="TRELLIS_CONTROL_FAILURE",
+        )
+        return
 
     message_id = str(uuid4())
     yield TextMessageStartEvent(message_id=message_id, role="assistant")
@@ -798,26 +839,58 @@ def _run_control_turn(
     try:
         outcome = _undo_previous_outcome(previous_run_id)
     except Exception as exc:
-        runs.set_status(created.id, RunStatus.FAILED, str(exc))
+        _record_control_failure(created.id, str(exc), exc)
         raise
 
     try:
-        runs.save_history(
+        runs.complete_control_turn(
             created.id,
             to_jsonable_python(
                 _control_history(created.message_history, user_message, outcome.text)
             ),
         )
-        runs.set_status(created.id, RunStatus.COMPLETED)
     except Exception as exc:
         stored_error = (
             f"mutation_committed={str(outcome.mutation_committed).lower()}; "
             f"response_error={exc}"
         )
-        runs.set_status(created.id, RunStatus.FAILED, stored_error)
+        _record_control_failure(created.id, stored_error, exc)
         raise
 
     return outcome
+
+
+def _record_control_failure(run_id: UUID, stored_error: str, cause: Exception) -> None:
+    """Mark the control run failed, without ever masking why it failed.
+
+    Two rules, and the second one is why this is a function rather than three
+    lines at each call site.
+
+    The write is guarded, so cleanup cannot overwrite a run that already reached
+    a terminal status. A zero-row result means something else finished this run
+    first and its outcome stands.
+
+    If the write itself fails, the caller's original exception is the one that
+    propagates. When writes are failing broadly the second exception is a
+    symptom and the first is the reason the turn failed, so raising the symptom
+    would hide the cause. The secondary error is not discarded though: it is
+    logged and attached to the primary exception as a note, so a reader sees
+    both and neither is mistaken for the other.
+
+    The run is then left non-terminal. Nothing can write a status while writes
+    are failing, so that is recorded rather than repaired. It is a pre-existing
+    property of every Trellis run, not something this path introduces, and
+    general cleanup of abandoned non-terminal runs is a separate decision.
+    """
+    try:
+        runs.fail_run_if_running(run_id, stored_error)
+    except Exception as persistence_error:
+        log.exception(
+            "could not persist the terminal failure for control run %s", run_id
+        )
+        cause.add_note(
+            f"secondary failure while persisting FAILED state: {persistence_error!r}"
+        )
 
 
 def _undo_previous_outcome(previous_run_id: UUID | None) -> _ControlOutcome:

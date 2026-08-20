@@ -6171,7 +6171,45 @@ jobs:
           grep -Fq 'restored_version = _event_version(event.before) + 1' backend/app/undo.py \
             || { echo "FAIL restoration no longer advances the concurrency version"; exit 1; }
 
-          echo "PASS D76 locator, lock, and version predicates"
+          # The control turn's history and completion are one statement.
+          # Splitting them back into two writes is invisible to every
+          # happy-path test and reintroduces a FAILED run carrying a
+          # fully formed success transcript.
+          grep -Fq 'sql.COMPLETE_CONTROL_TURN,' backend/app/runs.py \
+            || { echo "FAIL the control turn no longer finalizes in one statement"; exit 1; }
+
+          # Terminal status is one way. Both guarded statements must keep
+          # their predicate, or late cleanup can overwrite a committed
+          # completion with a failure, and the run record would then
+          # contradict the work that actually happened.
+          guards=$(grep -c "AND status = .running." backend/app/sql.py || true)
+          if [ "$guards" -lt 2 ]; then
+            echo "FAIL a one-way terminal transition guard was removed (found $guards, need 2)"
+            exit 1
+          fi
+
+          grep -Fq 'FAIL_RUN_IF_RUNNING' backend/app/sql.py \
+            || { echo "FAIL the guarded failure statement is gone"; exit 1; }
+
+          # The control stream bypasses `transform_stream`, so it owns its
+          # own error boundary. Without it an exception truncates the SSE
+          # body after RUN_STARTED with no lifecycle event at all.
+          grep -Fq 'RunErrorEvent(' backend/app/agent.py \
+            || { echo "FAIL the control stream has no protocol error boundary"; exit 1; }
+
+          grep -Fq 'TRELLIS_CONTROL_FAILURE' backend/app/agent.py \
+            || { echo "FAIL the control error event lost its code"; exit 1; }
+
+          # Continuity is reconciled against the server after a transport
+          # failure, and is still only ever promoted on a completed run.
+          grep -Fq 'onRunFailed' frontend/components/Chat.tsx \
+            || { echo "FAIL continuity is not reconciled after a transport failure"; exit 1; }
+
+          # Deterministic suites must not be able to reach a provider.
+          grep -Fq 'ALLOW_MODEL_REQUESTS' backend/tests/conftest.py \
+            || { echo "FAIL the deterministic suite no longer blocks live model requests"; exit 1; }
+
+          echo "PASS D76 locator, lock, version, finalization, and boundary predicates"
 
       - name: Prove the browser forwarded-property contract
         working-directory: frontend

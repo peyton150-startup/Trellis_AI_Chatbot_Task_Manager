@@ -607,6 +607,58 @@ UPDATE agent_runs
 RETURNING *;
 """
 
+# D-76, corrected after neutral review. One statement, so a control turn's
+# canonical history and its completion cannot land separately.
+#
+# They used to be two statements on two connections, and the gap between them
+# was a state the documentation said could not happen: the history write
+# committed, the status write failed, and the run ended FAILED while carrying a
+# fully formed "Undone." transcript. Nothing was corrupted and nothing
+# double-applied, but a surface rendering that run would show a success
+# narrative under a failure banner, and "a failed control turn has empty
+# history" was simply false for that ordering.
+#
+# `AND status = 'running'` is the second half, and it is a state machine rather
+# than a convenience. A run may move from running to exactly one terminal
+# status, and nothing may rewrite a terminal one:
+#
+#     running -> completed        allowed, here
+#     running -> failed           allowed, by FAIL_RUN_IF_RUNNING
+#     completed -> failed         matches no row
+#     failed -> completed         matches no row
+#
+# Without it, late cleanup in an outer layer could overwrite a committed
+# completion with a failure, and the run record would then contradict the work
+# that actually happened.
+#
+# `ended_at` is stamped here for the same reason UPDATE_RUN_STATUS stamps it:
+# a terminal run without an end time is not a state any reader can interpret.
+COMPLETE_CONTROL_TURN = """
+UPDATE agent_runs
+   SET message_history = %(message_history)s,
+       status = 'completed',
+       error = NULL,
+       ended_at = now()
+ WHERE id = %(run_id)s
+   AND status = 'running'
+RETURNING *;
+"""
+
+# D-76. The failure half of the same one-way transition.
+#
+# Zero rows means the run was already terminal, and that is an answer rather
+# than an error: something else finished this run first, and a failure written
+# on top of it would be a claim about work that already reported its outcome.
+FAIL_RUN_IF_RUNNING = """
+UPDATE agent_runs
+   SET status = 'failed',
+       error = %(error)s,
+       ended_at = now()
+ WHERE id = %(run_id)s
+   AND status = 'running'
+RETURNING *;
+"""
+
 UPDATE_RUN_HISTORY = """
 UPDATE agent_runs
    SET message_history = %(message_history)s
