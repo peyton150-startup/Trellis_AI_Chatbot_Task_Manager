@@ -3670,6 +3670,42 @@ caller, and deliberately does not give it to the model.
    continuity cursor. A transport failure is a reason to go and check, never a
    reason to guess.
 
+   **Each invocation is bound to the run the server issued for it.** The first
+   implementation resolved the run to reconcile from one mutable cursor that
+   every `RUN_STARTED` overwrote, and recorded that binding it to the failed
+   run's own identity was not known to be possible. A blind review disproved
+   that: `AgentSubscriber` delivers the originating `RunAgentInput` to every
+   callback, `onRunFailed` included. The stale cursor could not promote the
+   wrong run, because promotion is gated on a server-confirmed `completed`
+   status, but it could lose a promotion outright: run B completes durably, B's
+   transport drops, run C starts before B's delayed failure callback fires, the
+   reconciler asks about C, and B's canonical history is never adopted. That is
+   the exact staleness this mechanism exists to prevent.
+
+   Reconciliation now correlates the two identifiers instead of conflating
+   them. `input.runId` is client generated and fresh per invocation, and is
+   used only to look up which application run this invocation belongs to; it is
+   never sent to the server as authority and never reaches `fetchRun`.
+   `event.threadId` is the server-issued `agent_runs.id`, and is the only value
+   ever queried or promoted. `input.threadId` is unusable for this and is
+   rejected by the gate: the AG-UI client sets it from its own constant thread
+   id, so it is identical across every run in a session.
+
+   `RUN_STARTED` establishes the binding, `RUN_FINISHED` reconciles the run it
+   names, and a transport failure resolves its own invocation back to its run.
+   An invocation that failed before `RUN_STARTED` arrived resolves to nothing
+   and is left alone, because there is no server-issued run to ask about and a
+   guess would be worse than silence. `thread.runEnd` keeps the board refresh
+   and no longer carries continuity identity, since it does not carry the
+   server-issued id.
+
+   The rule moved to `frontend/lib/continuity.ts` so it could be proven
+   behaviorally. The prior gate was a regular expression over `Chat.tsx`,
+   accepted as a tradeoff at the time; it asserted wiring that was in fact all
+   present and correct, and was structurally blind to the ordering defect. A
+   passing structural gate is not evidence about an interleaving it cannot
+   express.
+
 9. **Every recognized command produces a run, including every refusal.** A
    semantic refusal is a COMPLETED control run carrying the refusal in its
    canonical history; only an infrastructure failure produces a FAILED one. That

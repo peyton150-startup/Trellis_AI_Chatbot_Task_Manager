@@ -2876,26 +2876,55 @@ passing at the reviewed SHA.
   turn's inherited history. `onRunFailed` now runs the same server query run end
   runs, with the unchanged rule that only a `completed` run may be promoted.
 
-  That last fix has no unit test, and the reason is a trade rather than an
-  oversight: extracting the reconciliation into a testable module would move the
-  two literals the T17 gate asserts out of `Chat.tsx` and amend an earlier
-  task's check a second time, which is not worth a unit test.
+  That fix originally shipped with no unit test, recorded as a trade: extracting
+  the reconciliation into a testable module would move the two literals the T17
+  gate asserts out of `Chat.tsx` and amend an earlier task's check a second time.
+  The D-76 gate instead parsed `Chat.tsx` and asserted the whole wiring, and that
+  gate was itself mutation-proven against four mutations.
 
-  So the D-76 gate asserts the whole wiring instead of the existence of a
-  callback name, and the gate itself is mutation-proven. It parses `Chat.tsx`
-  and requires that `onRunFailed` calls the reconciler, that the reconciler asks
-  the server through `fetchRun`, that promotion sits inside the
-  `detail.status === "completed"` condition, and that exactly one promotion
-  exists in that function. Four mutations were run against the gate, not against
-  a test: rewiring the failure hook to a different event, making it a no-op,
-  promoting unconditionally, and replacing the server read with a resolved
-  literal. All four are caught.
+  **A second blind review found a real defect that gate could not express, and
+  the trade has been reversed.** The reconciler resolved its target from one
+  mutable `currentRunId` ref that every `RUN_STARTED` overwrote, while
+  `onRunFailed` discarded its callback parameters entirely. Every literal the
+  gate asserted was present and correct; the defect was in the ordering. Run B
+  completes durably, B's transport drops, run C starts before B's delayed
+  failure callback fires, and the reconciler asks about C. B's completion is
+  never adopted. The stale ref could never promote the *wrong* run, because the
+  completed-only server check still gates promotion, so this loses a promotion
+  rather than corrupting state, but losing it reintroduces exactly the stale
+  history this mechanism exists to prevent.
 
-  What this still is not is a browser behavioural test. Nothing here proves the
-  runtime actually invokes `onRunFailed` when a stream dies, or that the ordering
-  of a delayed failure callback against a newer run is safe. That gap is real and
-  is recorded as one; it is the difference between "the wiring cannot be deleted
-  without CI noticing" and "the wiring demonstrably fires".
+  The note previously said binding to the failed run's own identity was not
+  known to be possible. That was wrong, and is corrected here: `AgentSubscriber`
+  delivers the originating `RunAgentInput` to every callback including
+  `onRunFailed`. What was true is narrower, that the option was not used.
+
+  The rule now lives in `frontend/lib/continuity.ts` as `RunBindings` and
+  `reconcileContinuity`, free of React and of the transport. `RUN_STARTED` binds
+  the client-generated `input.runId` to the server-issued `event.threadId`,
+  `RUN_FINISHED` reconciles the run it names, and a transport failure resolves
+  its own invocation back to its own run. `input.runId` is correlation only and
+  never reaches `fetchRun`; `input.threadId` is rejected by the gate because the
+  AG-UI client sets it from its own constant thread id, making it identical
+  across every run in a session. `prepareRunAgentInput` was read to confirm
+  both: `runId: e?.runId || uuidv4()` and `threadId: this.threadId`.
+
+  Eight behavioral tests now run in CI as `npm run test:continuity`. The central
+  one is the interleaving the regular expression was blind to: bind B, bind C,
+  reconcile a delayed failure for B, and assert C is never even queried, not
+  merely never promoted. The others cover completed-only promotion across
+  `failed`, `running`, `awaiting_approval`, and `interrupted`, an unbound
+  invocation promoting nothing and guessing no id, a failed status lookup, the
+  approval-continuation rebinding case, and release. Six mutations were run
+  against the module and all six are caught, the shared-ref restoration killing
+  four tests at once. The structural gate was rewritten rather than deleted: it
+  now asserts the binding wiring and forbids `input.threadId` and continuity
+  identity taken from `thread.runEnd`.
+
+  What this still is not is a browser test. Nothing here proves the runtime
+  actually invokes `onRunFailed` when a stream dies. That gap is real and is
+  recorded as one. What has changed is that the ordering question, previously
+  bundled into the same gap, is now settled in code and proven by test.
 
 - Deterministic suites now block live provider requests at the bootstrap.
   `tests/conftest.py` sets `models.ALLOW_MODEL_REQUESTS` False for every test

@@ -4999,11 +4999,21 @@ jobs:
           grep -Fq 'new TrellisHttpAgent({' components/Chat.tsx \
             || { echo "FAIL Chat bypasses TrellisHttpAgent"; exit 1; }
 
-          grep -Fq 'detail.status === "completed"' components/Chat.tsx \
+          # A second neutral review found that resolving the run to reconcile
+          # from a single mutable ref in Chat.tsx let a delayed failure callback
+          # reconcile a newer run. Fixing that moved the reconciliation rule
+          # into lib/continuity.ts so it could be tested behaviorally instead
+          # of asserted by regular expression. This step therefore follows the
+          # rule to its new home. The property asserted is unchanged: promotion
+          # happens only for a run the server reports `completed`.
+          grep -Fq 'detail.status === "completed"' lib/continuity.ts \
             || { echo "FAIL continuity is not gated by completed server status"; exit 1; }
 
-          grep -Fq 'agent.setContinuityRunId(runId)' components/Chat.tsx \
+          grep -Fq 'promote(runId)' lib/continuity.ts \
             || { echo "FAIL completed run id is not promoted"; exit 1; }
+
+          grep -Fq 'agent.setContinuityRunId(completedRunId)' components/Chat.tsx \
+            || { echo "FAIL Chat does not promote through the Trellis agent"; exit 1; }
 
           if grep -Fq 'new HttpAgent({' components/Chat.tsx; then
             echo "FAIL Chat directly constructs HttpAgent"
@@ -6203,45 +6213,48 @@ jobs:
           # Continuity is reconciled against the server after a transport
           # failure, and is still only ever promoted on a completed run.
           #
-          # This path has no unit test. Extracting it into a testable
-          # module would move the two literals the T17 gate asserts out of
-          # Chat.tsx and amend an earlier task's check a second time, which
-          # is not worth a unit test. So the gate asserts the whole wiring
-          # rather than the existence of a callback name: the failure hook
-          # must call the reconciler, the reconciler must ask the server,
-          # and promotion must sit inside the completed-only condition.
-          # Each of the three is separately mutation-proven.
+          # This gate was previously a regular expression over Chat.tsx,
+          # accepted at the time as a tradeoff because extracting the rule
+          # would move literals an earlier task's check asserted. A blind
+          # review then found a real defect that shape of gate could not
+          # detect: the reconciler resolved its target from one mutable ref,
+          # so a delayed failure callback for run B reconciled run C. A
+          # structural parser cannot see that, because the wiring it asserted
+          # was all present and correct.
+          #
+          # The rule now lives in frontend/lib/continuity.ts and is proven
+          # behaviorally. The regression that matters is the interleaving the
+          # regular expression was blind to: bind B, bind C, then reconcile a
+          # delayed failure for B and assert that C is never even queried.
           python - <<'PY'
           import re, sys, pathlib
           src = pathlib.Path("frontend/components/Chat.tsx").read_text(encoding="utf-8")
 
-          if not re.search(r"onRunFailed:\s*\(\)\s*=>\s*\{\s*reconcileContinuity\(\);", src):
-              sys.exit("FAIL onRunFailed does not call reconcileContinuity")
+          # The failure hook must resolve its own invocation rather than read a
+          # shared cursor. Binding to input.runId is correlation only; it is
+          # never passed to the server as authority.
+          if not re.search(r"onRunFailed:\s*\(\{\s*input\s*\}\)\s*=>", src):
+              sys.exit("FAIL onRunFailed ignores the invocation that produced it")
 
-          body = re.search(
-              r"const reconcileContinuity = useCallback\(\(\) => \{(.*?)\n  \}, \[agent\]\);",
-              src,
-              re.S,
-          )
-          if body is None:
-              sys.exit("FAIL the reconciler is gone or was restructured")
-          body = body.group(1)
+          if "bindings.resolve(input.runId)" not in src:
+              sys.exit("FAIL the failure hook does not resolve its own application run")
 
-          if "fetchRun(runId)" not in body:
-              sys.exit("FAIL reconciliation does not ask the server for run state")
+          if "bindings.bind(input.runId, event.threadId)" not in src:
+              sys.exit("FAIL RUN_STARTED does not bind the invocation to the server-issued run")
 
-          guarded = re.search(
-              r'if \(detail\.status === "completed"\) \{\s*agent\.setContinuityRunId\(runId\);\s*\}',
-              body,
-          )
-          if guarded is None:
-              sys.exit("FAIL continuity promotion is not gated on a server-completed run")
+          # Continuity identity must come from the lifecycle event that carries
+          # the server-issued id, never from thread.runEnd, which does not.
+          run_end = re.search(r'useAuiEvent\("thread\.runEnd", \(\) => \{(.*?)\n  \}\);', src, re.S)
+          if run_end is None:
+              sys.exit("FAIL the run-end board refresh is gone")
+          if "reconcile" in run_end.group(1):
+              sys.exit("FAIL continuity identity is taken from thread.runEnd again")
 
-          promotions = body.count("setContinuityRunId(")
-          if promotions != 1:
-              sys.exit(f"FAIL {promotions} continuity promotions in the reconciler; exactly one, inside the guard")
+          # Only the server-issued value may ever be looked up or promoted.
+          if "input.threadId" in src:
+              sys.exit("FAIL a client-supplied threadId is treated as a run identity")
 
-          print("PASS continuity reconciliation is wired and completed-only")
+          print("PASS continuity reconciliation binds each invocation to its own run")
           PY
 
           # Deterministic suites must not be able to reach a provider.
@@ -6253,6 +6266,13 @@ jobs:
       - name: Prove the browser forwarded-property contract
         working-directory: frontend
         run: npm run test:transport
+
+      # Replaces the structural assertion the blind review proved insufficient.
+      # This is the behavioral half: the delayed-failure interleaving, the
+      # completed-only promotion, the unbound invocation, and the release.
+      - name: Prove continuity reconciliation binds each invocation to its run
+        working-directory: frontend
+        run: npm run test:continuity
 
       - name: Run cumulative non-network backend suite
         working-directory: backend

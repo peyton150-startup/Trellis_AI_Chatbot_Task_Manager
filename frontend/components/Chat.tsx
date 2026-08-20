@@ -7,6 +7,7 @@ import { Thread } from "@/components/thread";
 import { ApprovalCard } from "@/components/ApprovalCard";
 import { NGROK_BYPASS_HEADERS } from "@/lib/ngrokDemoIngress";
 import { fetchRun } from "@/lib/api";
+import { RunBindings, reconcileContinuity } from "@/lib/continuity";
 import { TrellisHttpAgent } from "@/lib/TrellisHttpAgent";
 import { useRun } from "@/lib/useRun";
 
@@ -18,30 +19,21 @@ function RunCompletionListener({
   agent,
   onRunComplete,
 }: ChatProps & { agent: TrellisHttpAgent }) {
-  const currentRunId = useRef<string | null>(null);
+  // One binding per client invocation, so a late callback reconciles the run it
+  // belongs to. See lib/continuity.ts for why a single mutable cursor raced.
+  const runBindings = useRef(new RunBindings());
 
-  // One reconciliation rule, called from run end and from transport failure.
-  // Deliberately kept inline rather than extracted to a module: the T17 gate
-  // asserts these two literals in this file, and moving them would amend an
-  // earlier task's check for a second time.
-  const reconcileContinuity = useCallback(() => {
-    const runId = currentRunId.current;
-    if (runId === null) return;
-
-    // Promote only server-confirmed completed runs. awaiting_approval, failed,
-    // interrupted, or still-running runs leave the previous continuity cursor
-    // unchanged.
-    void fetchRun(runId)
-      .then((detail) => {
-        if (detail.status === "completed") {
-          agent.setContinuityRunId(runId);
-        }
-      })
-      .catch(() => {
-        // A failed status lookup must never guess that the run completed.
-        // Keep the previous authoritative continuity cursor.
-      });
-  }, [agent]);
+  // One reconciliation rule, now taking the run explicitly instead of reading
+  // whichever run happens to be current at callback time.
+  const reconcile = useCallback(
+    (runId: string | null) =>
+      reconcileContinuity({
+        runId,
+        fetchRun,
+        promote: (completedRunId) => agent.setContinuityRunId(completedRunId),
+      }),
+    [agent],
+  );
 
   // D-67 keeps this separate from useRun(): T16 owns approval state, while
   // continuity only needs the server-issued application run id.
@@ -49,48 +41,59 @@ function RunCompletionListener({
   // D-76 adds the second cursor here, and the placement is the point. The
   // previous-run cursor advances on RUN_STARTED, the moment the server issues
   // the id, and never waits for the run to end. That is what makes a run that
-  // commits a mutation and then fails still nameable by "undo that". Continuity
-  // promotion below is unchanged and remains completed-only.
+  // commits a mutation and then fails still nameable by "undo that".
+  //
+  // After the second neutral review, all three lifecycle callbacks are bound to
+  // the same subscription and all three carry the invocation that produced
+  // them. RUN_STARTED establishes the invocation to application-run binding,
+  // RUN_FINISHED reconciles the exact run it names, and a transport failure
+  // resolves its own invocation back to the run the server issued for it.
+  // Continuity promotion is unchanged and remains completed-only.
   useEffect(() => {
+    const bindings = runBindings.current;
     const subscription = agent.subscribe({
-      onRunStartedEvent: ({ event }) => {
+      onRunStartedEvent: ({ event, input }) => {
         if (event.threadId) {
-          currentRunId.current = event.threadId;
+          bindings.bind(input.runId, event.threadId);
           agent.setPreviousRunId(event.threadId);
         }
       },
-    });
 
-    return () => subscription.unsubscribe();
-  }, [agent]);
+      // Reconcile the run this event names, not the newest one. The completed
+      // only guard means an interrupt outcome is safe to pass through: the
+      // server reports awaiting_approval and nothing is promoted.
+      onRunFinishedEvent: ({ event, input }) => {
+        void reconcile(event.threadId);
+        bindings.release(input.runId);
+      },
 
-  useAuiEvent("thread.runEnd", () => {
-    void onRunComplete();
-    reconcileContinuity();
-  });
-
-  // D-76, after neutral review. Reconciliation runs on transport failure too,
-  // and the reason is a window neither cursor covered on its own.
-  //
-  // A control turn can commit `completed` with its canonical history and then
-  // lose the SSE connection before RUN_FINISHED reaches the browser. Run end
-  // never fires, so continuity stays on the older run, and the next ordinary
-  // turn inherits history that omits the undo that actually happened. The
-  // server is right and the browser is stale.
-  //
-  // The fix is not to promote on error. It is to ask the server. The rule is
-  // unchanged and is the whole point of D-67: only a run PostgreSQL reports as
-  // `completed` may become the continuity cursor. A transport failure is a
-  // reason to go and check, never a reason to assume.
-  useEffect(() => {
-    const subscription = agent.subscribe({
-      onRunFailed: () => {
-        reconcileContinuity();
+      // D-76, after neutral review. Reconciliation runs on transport failure
+      // too, and the reason is a window neither cursor covered on its own.
+      //
+      // A control turn can commit `completed` with its canonical history and
+      // then lose the SSE connection before RUN_FINISHED reaches the browser.
+      // Run end never fires, so continuity stays on the older run, and the next
+      // ordinary turn inherits history that omits the undo that actually
+      // happened. The server is right and the browser is stale.
+      //
+      // The fix is not to promote on error. It is to ask the server, about this
+      // invocation's own run. An unbound invocation means RUN_STARTED never
+      // arrived, so there is no server-issued run to ask about and nothing is
+      // guessed.
+      onRunFailed: ({ input }) => {
+        void reconcile(bindings.resolve(input.runId));
+        bindings.release(input.runId);
       },
     });
 
     return () => subscription.unsubscribe();
-  }, [agent, reconcileContinuity]);
+  }, [agent, reconcile]);
+
+  // Board refresh only. Continuity identity comes from the AG-UI lifecycle
+  // events above, which carry the server-issued run id; this one does not.
+  useAuiEvent("thread.runEnd", () => {
+    void onRunComplete();
+  });
 
   return null;
 }
