@@ -2781,6 +2781,25 @@ loser refuses as already compensated, which fails without the lock.
 The ABA regression creates a task at version N, deletes it, undoes the deletion,
 and then proves a guarded write at `expected_version = N` still matches no row.
 
+Two established gates were amended, which is disclosed here because an earlier
+task's check moving is exactly the thing that should not happen silently. Both
+failed on the first CI run and both were genuine regressions from this task.
+
+`T17 cross-turn continuity` greps for
+`forwardedProps[CONTINUITY_KEY] = this.continuityRunId`. Extracting the pure
+`trellisForwardedProps` helper moved that assignment from a field read to a
+parameter. The step now asserts the same top-level assignment of the same frozen
+key, plus that the helper performs it, and the forwarded-property loop was
+replaced by two explicit per-key branches so the literal is greppable again.
+
+`T10 tools` hand-writes the canonical `list_tasks` payload and compares its hash
+to the lease. `duplicates_only` joined `ListTasksArgs`, so the canonical payload
+gained a key. The gate still asserts that the tool hashes the canonical payload.
+
+Both amended steps, and the D-76 structural step, were extracted from
+`ci.yml` and executed locally before the fix was pushed. Full CI is 36 of 36
+passing at the reviewed SHA.
+
 **Limitations and review status:**
 
 - The compensation and the control run's history are two transactions, not one.

@@ -3659,7 +3659,29 @@ caller, and deliberately does not give it to the model.
     error path. Retrying the same command cannot double-apply: the target now
     carries a compensation wave and is ineligible.
 
-14. **What this does not do.** No `/api/runs/{id}/undo`, no T18 button, no ninth
+14. **One earlier gate is amended, and the amendment is disclosed rather than
+    quiet.** T17's frontend step asserted the continuity locator by its exact
+    spelling, `forwardedProps[CONTINUITY_KEY] = this.continuityRunId`. Extracting
+    the forwarded-property assembly into a pure helper moved that assignment from
+    a field read to a parameter, so the literal no longer exists. The property
+    the step defends is unchanged and the step still defends it: the frozen D-67
+    key is still assigned at the top level of the forwarded properties from
+    Trellis-owned state, and the step additionally asserts that the helper is
+    what performs it. The loop that first replaced the assignment was itself
+    replaced by two explicit per-key branches, so both gates assert a literal
+    rather than a shape no grep can see.
+
+    T10 hand-writes the canonical `list_tasks` payload and compares its hash to
+    the lease. D-77 added `duplicates_only` to `ListTasksArgs`, so the canonical
+    payload gained a key and the hand-written copy went stale. The gate still
+    asserts that the tool hashes the canonical payload.
+
+    Neither amendment weakens what its gate proved, and both were executed
+    locally before the branch was pushed. They are recorded here because an
+    earlier task's check moving is the kind of change that should never happen
+    silently.
+
+15. **What this does not do.** No `/api/runs/{id}/undo`, no T18 button, no ninth
     tool, no change to `undo.py`'s semantics beyond extracting the body to a
     caller-owned-connection seam with the check order and transaction boundary
     intact. No migration, table, column, endpoint, status value, error code, or
