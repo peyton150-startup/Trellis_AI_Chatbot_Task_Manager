@@ -4,7 +4,14 @@ from enum import Enum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    model_validator,
+)
 
 from app.limits import (
     BROWSER_USER_MESSAGE_MAX_CHARS,
@@ -114,6 +121,14 @@ TaskTitle = Annotated[str, Field(min_length=1, max_length=500)]
 # carries an explicit ceiling. The values live in `limits.py` because they are
 # safety invariants rather than tunables; see that module for the argument.
 TaskNotes = Annotated[str, Field(max_length=TASK_NOTES_MAX_CHARS)]
+# D-78. Only the new fragment, never the whole value. The lower bound is the
+# point: an empty append is a call that asks for nothing, and answering it
+# with a version increment and an event would record a mutation that did not
+# happen. The upper bound is a cheap early refusal; the binding check is the
+# merged size, which cannot be known until the authoritative row is locked.
+AppendedTaskNotes = Annotated[
+    str, Field(min_length=1, max_length=TASK_NOTES_MAX_CHARS)
+]
 UserMessageText = Annotated[str, Field(max_length=BROWSER_USER_MESSAGE_MAX_CHARS)]
 PlanSummary = Annotated[str, Field(max_length=PLAN_SUMMARY_MAX_CHARS)]
 PlanStep = Annotated[str, Field(max_length=PLAN_STEP_MAX_CHARS)]
@@ -423,6 +438,29 @@ class MutableTaskFields(TrellisModel):
 class UpdateTaskArgs(MutableTaskFields):
     task_id: UUID
     expected_version: int
+
+    # D-78. Append lives here and deliberately not on `MutableTaskFields`.
+    # `BulkUpdateTasksArgs` inherits that base, so a field added there would
+    # expose bulk append to the model, and bulk append is not authorized: it
+    # would need per-row merging, per-row final-size validation, and set-based
+    # semantics that this decision does not provide.
+    append_notes: AppendedTaskNotes | None = None
+
+    @model_validator(mode="after")
+    def _one_note_intent(self) -> "UpdateTaskArgs":
+        """Replacement and append are alternatives, never a combined request.
+
+        A call carrying both does not have one obvious meaning. Refusing it is
+        cheaper than inventing an order, and it keeps the model's two verbs
+        mapped onto two fields rather than onto a precedence rule nobody can
+        read off the schema.
+        """
+        if self.append_notes is not None and "notes" in self.model_fields_set:
+            raise ValueError(
+                "notes replaces the whole value and append_notes adds to it; "
+                "send one or the other"
+            )
+        return self
 
 
 class BulkUpdateTasksArgs(MutableTaskFields):

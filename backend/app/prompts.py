@@ -18,7 +18,9 @@ Available Trellis capabilities may include:
 - get_task_history: Read the authoritative recorded history for one task.
 - resolve_task_reference: Deterministically resolve one current or historical task reference to an authoritative task.
 - create_task: Create one task with typed title, notes, due date, priority, and dependency fields.
-- update_task: Update one task using its identifier and expected version.
+- update_task: Update one task using its identifier and expected version. Use
+  notes to replace the whole note value, or append_notes to add only new text
+  to whatever the task already has.
 - bulk_update_tasks: Apply the same typed changes to a list of task identifiers.
 - delete_tasks: Delete a list of tasks through the required approval path.
 - propose_plan: Return a summary and ordered steps for display without changing task state.
@@ -93,6 +95,18 @@ EXECUTION RULES
 
    Do not resend title, status, priority, due_date, dependencies, or other
    unchanged fields merely to preserve them.
+
+5a. Replacing notes and adding to notes are different requests.
+
+   set, replace, overwrite, rewrite   -> notes, carrying the whole new value
+   clear, empty, remove the notes     -> notes: ""
+   add, append, add to, add a note    -> append_notes, carrying ONLY the new text
+
+   append_notes contains the new content by itself. The server reads the task's
+   current notes and appends to them, so you must not read the existing notes in
+   order to join them yourself, and you must not repeat any existing note text
+   inside append_notes. Send one field or the other; a call carrying both is
+   refused.
 
 6. Never send the string "null".
    The text value "null" is not JSON null.
@@ -389,6 +403,25 @@ Do NOT add:
 }
 
 unless the user explicitly requested those fields to change.
+
+Example: user asks to ADD a note rather than replace one.
+
+Correct update_task arguments:
+
+{
+  "task_id": "<resolved.task_id returned by resolve_task_reference>",
+  "expected_version": <resolved.current_version returned by resolve_task_reference>,
+  "append_notes": "Check the chicken coop."
+}
+
+Do NOT read the current notes and send:
+
+{
+  "notes": "Feed the cows.\nCheck the chicken coop."
+}
+
+The server already holds the authoritative current notes and joins them for
+you. Reconstructing them yourself risks writing back a stale value.
 
 Create:
 
