@@ -2752,7 +2752,7 @@ cd frontend && npm run test:transport
 cd frontend && npm run build
 ```
 
-Observed: 28 passed in `test_d76_undo_bridge.py`; 381 passed and 13 deselected in
+Observed: 34 passed in `test_d76_undo_bridge.py`; 387 passed and 13 deselected in
 the cumulative backend suite; 9 passed in the frontend transport test; Next.js
 16.3.1 production build compiled and generated 3 static pages.
 
@@ -2769,7 +2769,8 @@ Concurrency is proved rather than argued: three threads race one target run
 against real PostgreSQL through a barrier, exactly one reports `applied > 0`, and
 exactly one compensation wave exists afterwards.
 
-The author mutation audit ran 20 mutations and initially caught 19. The survivor
+The author mutation audit ran 20 structural mutations and initially caught 19,
+plus 4 later mutations on the failure paths, all caught. The survivor
 is worth stating plainly: dropping `FOR UPDATE` from the undo attempt left every
 test green. The at-most-one-applied invariant does not actually depend on the
 lock, because the kernel's guards catch the losers by primary key, by version, or
@@ -2809,10 +2810,22 @@ passing at the reviewed SHA.
   double-apply, because the target then carries a compensation wave and is
   ineligible. Making those atomic is a durable-journal design and is deliberately
   not attempted here.
-- The failure-after-commit path is reasoned from the existing `_record_failure`
-  contract and exercised only through its shared status-writing helpers; there is
-  no fault-injection test that crashes between the kernel commit and
-  `save_history`.
+
+  That window is injected rather than argued. `save_history` is made to raise
+  after the kernel commits, and the regression asserts the restored row under its
+  original id at a forward version, the FAILED run, `mutation_committed=true` in
+  the error, empty history on the failed turn, and that retrying the same command
+  refuses and leaves exactly one compensation wave. The pre-commit branch is
+  injected separately at `attempt_run_undo` and must not claim a mutation
+  committed, because if both branches wrote the same error the marker would stop
+  distinguishing anything.
+
+- "No automatic redo is attempted" is guaranteed by absence rather than by a
+  guard, in the same sense the tool profile is: no code path re-applies a
+  compensated run's original mutations, and there is no primitive that would.
+  It is therefore not independently mutation-testable, and a mutation written to
+  probe it survived because the call it inserted is a no-op by construction.
+  That is recorded rather than dressed up as a passing check.
 - `_control_history_predecessor` adds up to two `runs.load` reads on the control
   path to learn each candidate predecessor's status. They are single indexed
   reads and were not measured. Checking the continuity candidate here rather
@@ -2872,7 +2885,7 @@ cd backend && DATABASE_URL=... pytest -m "not network"
 cd frontend && npm run build
 ```
 
-Observed: 18 passed in `test_d77_current_state.py`; 381 passed and 13 deselected
+Observed: 18 passed in `test_d77_current_state.py`; 387 passed and 13 deselected
 cumulatively. The replay invariant is proved as one equality across the returned
 value, the stored `tool_invocations.result`, and a `replay_completed` read.
 Membership-before-LIMIT is proved with 30 duplicate pairs against a 50-row bound.
@@ -2894,9 +2907,20 @@ reforms under the original id with a forward version) is a single test.
   and a duplicate list hash differently and cannot share a lease. That is
   correct, and it means the two are separate invocations rather than one cached
   answer.
-- The prompt half is unproven against a live model. Rules 17 through 19 are
-  deterministic only in that they exist; whether Nemotron 3.5 Lightning acts on
-  them is a provider-behaviour question, and the live eval NVIDIA's own model
-  card asks for has not been run. A failure there would be a compatibility
-  finding, not authority to weaken the deterministic contracts.
+- No live configured-runtime-model evidence. The deterministic contracts do not
+  depend on the provider, but the prompt half of this decision is unproven
+  against a real model: rules 17 through 19 are deterministic only in that they
+  exist, and whether the configured model acts on them is a provider-behaviour
+  question. A live behavioural eval against the configured NVIDIA runtime model
+  has not been run, because this environment carries no runtime credential or
+  model configuration. Whoever runs it must record the exact `MODEL_ID` actually
+  exercised rather than the model anyone expected.
+
+  This entry deliberately names no specific model. `docs/DECISIONS.md` D-63 is
+  the source of truth for the runtime model and currently declares
+  `z-ai/glm-5.2` the sole one. If production has moved, that is an append-only
+  decision superseding D-63, not something an implementation note may settle by
+  mentioning a different name in passing. A failure in that eval would be a
+  provider-compatibility finding, not authority to weaken the deterministic
+  contracts.
 - This entry records author-run verification only; neutral review is pending.

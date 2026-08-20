@@ -835,6 +835,125 @@ def test_an_unusable_continuity_cursor_degrades_and_never_blocks_undo(db, contin
     assert len(runs.load_history(control_id, ACTOR_ID)) == 2
 
 
+# ------------------------------------------------- failure after the commit
+
+
+def test_history_failure_after_the_compensation_commits(db, monkeypatch):
+    """The narrow window the two-transaction design leaves open, injected.
+
+    Compensation and the control turn's history are not one transaction, and
+    D-76 does not pretend otherwise. What it does claim is what happens when the
+    second half fails after the first has already committed, and that claim was
+    previously reasoned rather than executed. This injects the failure.
+
+    The contract has four parts, and the fourth is the one that makes the other
+    three safe:
+
+        1. authoritative task state stays restored
+        2. the control run is FAILED and its error says the mutation committed
+        3. no automatic redo is attempted, because a compensating write on an
+           error path is a second uncontrolled mutation
+        4. retrying the same command cannot apply a second compensation wave
+
+    Part 4 is what makes leaving the window open acceptable. The target now
+    carries a compensation wave, so `attempt_run_undo` refuses it as already
+    compensated, and the user's natural response to a visible failure is safe.
+
+    Driven through `_run_control_turn` rather than the HTTP route on purpose.
+    The property under test is the ordering of the two persistence blocks, and
+    routing it through a stream that raises mid-response would test Starlette's
+    error semantics instead.
+    """
+    run_id, [task] = _deleting_run(db, ["Committed then lost"])
+    created = runs.create_control_turn(ACTOR_ID, "undo that", None)
+
+    def _unavailable(*args, **kwargs):
+        raise RuntimeError("history store unavailable")
+
+    monkeypatch.setattr(runs, "save_history", _unavailable)
+
+    with pytest.raises(RuntimeError, match="history store unavailable"):
+        agent._run_control_turn(created, "undo that", run_id)
+
+    monkeypatch.undo()
+
+    # 1. The compensation stands. Same identity, forward version.
+    restored = _tasks_by_id(db)
+    assert task.id in restored, "a committed compensation was rolled back"
+    assert restored[task.id]["title"] == task.title
+    assert restored[task.id]["created_at"] == task.created_at
+    assert restored[task.id]["version"] == task.version + 1
+
+    # 2. The run is failed and says so in terms a reader can act on. The board
+    #    may have moved, and the browser has to know to refetch.
+    control = runs.load(created.id, ACTOR_ID)
+    assert control.status is RunStatus.FAILED
+    assert "mutation_committed=true" in control.error
+    assert "history store unavailable" in control.error
+
+    # The turn genuinely has no history, which is why it failed rather than
+    # completing with a half-written transcript.
+    assert runs.load_history(created.id, ACTOR_ID) == []
+
+    # 3 and 4. The user retries the same command. It refuses, and nothing moves.
+    _, text = _control_turn("undo that", previous_run_id=run_id)
+
+    assert "already been undone" in text
+    assert task.id in _tasks_by_id(db), "the retry redid the deletion"
+    assert (
+        sum(1 for e in _events_for(db, run_id) if e["operation"] == "restored") == 1
+    ), "the retry applied a second compensation wave"
+
+
+def test_failure_before_the_compensation_claims_no_committed_mutation(db, monkeypatch):
+    """The other side of the same split, and the reason the two blocks differ.
+
+    A failure while the undo attempt itself is running committed nothing, so the
+    run must fail without claiming a mutation landed. If both blocks wrote the
+    same error, `mutation_committed=true` would stop distinguishing anything and
+    every genuine post-commit failure would become unreadable: the browser would
+    be told the board may have moved on turns where it certainly did not.
+
+    Injected at `attempt_run_undo`, which is the only thing between the control
+    run being created and the kernel committing.
+    """
+    run_id, [task] = _deleting_run(db, ["Never reached"])
+    created = runs.create_control_turn(ACTOR_ID, "undo that", None)
+
+    def _unavailable(*args, **kwargs):
+        raise RuntimeError("undo boundary unavailable")
+
+    monkeypatch.setattr(runs, "attempt_run_undo", _unavailable)
+
+    with pytest.raises(RuntimeError, match="undo boundary unavailable"):
+        agent._run_control_turn(created, "undo that", run_id)
+
+    monkeypatch.undo()
+
+    control = runs.load(created.id, ACTOR_ID)
+    assert control.status is RunStatus.FAILED
+    assert "undo boundary unavailable" in control.error
+    assert "mutation_committed=true" not in control.error
+
+    # Nothing moved, which is what the error is entitled to imply.
+    assert _tasks_by_id(db) == {}
+    assert not any(e["operation"] == "restored" for e in _events_for(db, run_id))
+
+
+def test_a_semantic_refusal_completes_rather_than_failing(db):
+    """A refusal is an answer, not an error. D-76 rules only infrastructure
+    failures produce a FAILED control run."""
+    foreign_id, [task] = _deleting_run(db, ["Not yours"], actor_id=OTHER_ACTOR_ID)
+
+    control_id, text = _control_turn("undo that", previous_run_id=foreign_id)
+
+    assert text == NO_TARGET_TEXT
+    control = runs.load(control_id, ACTOR_ID)
+    assert control.status is RunStatus.COMPLETED
+    assert control.error is None
+    assert task.id not in _tasks_by_id(db)
+
+
 # ---------------------------------------------------------- trust boundary
 
 

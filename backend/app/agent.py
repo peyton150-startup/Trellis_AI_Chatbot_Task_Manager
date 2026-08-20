@@ -870,9 +870,8 @@ def _control_history(inherited: list, user_message: str, response_text: str) -> 
 
         no ToolCallPart      no tool was requested
         no ToolReturnPart    no tool executed
-        no ThinkingPart      nothing reasoned, and Nemotron's own multi-turn
-                             guidance is that prior reasoning does not belong in
-                             a later turn's history anyway
+        no ThinkingPart      nothing reasoned, and prior reasoning does not
+                             belong in a later turn's history in any case
         no model_name        no provider produced this
         no provider_name     the same, said in the other field
         no framework run id  no framework invocation happened
