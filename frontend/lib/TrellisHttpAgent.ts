@@ -30,15 +30,16 @@ export function trellisForwardedProps(
 ): Record<string, unknown> {
   const forwardedProps: Record<string, unknown> = { ...(incoming ?? {}) };
 
-  for (const [key, value] of [
-    [CONTINUITY_KEY, continuityRunId],
-    [PREVIOUS_RUN_KEY, previousRunId],
-  ] as const) {
-    if (value === null) {
-      delete forwardedProps[key];
-    } else {
-      forwardedProps[key] = value;
-    }
+  if (continuityRunId === null) {
+    delete forwardedProps[CONTINUITY_KEY];
+  } else {
+    forwardedProps[CONTINUITY_KEY] = continuityRunId;
+  }
+
+  if (previousRunId === null) {
+    delete forwardedProps[PREVIOUS_RUN_KEY];
+  } else {
+    forwardedProps[PREVIOUS_RUN_KEY] = previousRunId;
   }
 
   return forwardedProps;

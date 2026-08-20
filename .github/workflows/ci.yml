@@ -2726,6 +2726,7 @@ jobs:
                       "due_after": None,
                       "priority": None,
                       "limit": 7,
+                      "duplicates_only": False,
                   }
                   return arguments, payload, []
 
@@ -4984,8 +4985,16 @@ jobs:
           grep -Fq 'override run(input: RunAgentInput)' lib/TrellisHttpAgent.ts \
             || { echo "FAIL TrellisHttpAgent does not intercept final AG-UI input"; exit 1; }
 
-          grep -Fq 'forwardedProps[CONTINUITY_KEY] = this.continuityRunId' lib/TrellisHttpAgent.ts \
+          grep -Fq 'forwardedProps[CONTINUITY_KEY] = continuityRunId' lib/TrellisHttpAgent.ts \
             || { echo "FAIL continuity locator is not top-level forwardedProps"; exit 1; }
+
+          # D-76 moved this assignment out of `run()` into the pure
+          # `trellisForwardedProps` helper, so the value is now a parameter
+          # rather than `this.continuityRunId`. The property this step
+          # asserts is unchanged: the frozen D-67 key is assigned at the top
+          # level of the forwarded properties from Trellis-owned state.
+          grep -Fq 'trellisForwardedProps(' lib/TrellisHttpAgent.ts \
+            || { echo "FAIL the forwarded-property assembly helper is gone"; exit 1; }
 
           grep -Fq 'new TrellisHttpAgent({' components/Chat.tsx \
             || { echo "FAIL Chat bypasses TrellisHttpAgent"; exit 1; }
@@ -6132,6 +6141,9 @@ jobs:
 
           grep -Fq 'PREVIOUS_RUN_KEY = "trellisPreviousRunId"' frontend/lib/TrellisHttpAgent.ts \
             || { echo "FAIL the browser stopped forwarding a distinct previous-run key"; exit 1; }
+
+          grep -Fq 'forwardedProps[PREVIOUS_RUN_KEY] = previousRunId' frontend/lib/TrellisHttpAgent.ts \
+            || { echo "FAIL the previous-run locator is not assigned at the top level"; exit 1; }
 
           grep -Fq 'agent.setPreviousRunId(event.threadId)' frontend/components/Chat.tsx \
             || { echo "FAIL the previous-run cursor no longer advances on RUN_STARTED"; exit 1; }
