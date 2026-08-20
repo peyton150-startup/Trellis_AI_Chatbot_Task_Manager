@@ -2700,3 +2700,184 @@ optimized. One full-suite run during development produced eight setup errors in
 typical 110 s; that file passes 29 of 29 in isolation and two subsequent full
 runs were clean, so it is recorded as an observed flake rather than a fixed one.
 This entry records author-run verification only; neutral review is pending.
+
+## D-76: run-relative natural-language undo bridge
+
+**Local role:** Intercepts a deliberately narrow set of run-relative commands
+("undo that", "recover everything you just deleted") in `handle_agui_request`
+before any agent exists, and answers them from application control flow. It adds
+`runs.attempt_run_undo`, the one authoritative, serialized way to undo a run;
+`runs.create_control_turn`, which opens an `agent_runs` row for a turn no model
+executed; a manual `AGUIEventStream` response built with no `Agent`; and
+`trellisPreviousRunId`, a second browser cursor distinct from D-67 continuity.
+
+**Whole-system role:** Trellis has owned an all-or-nothing undo kernel since T07
+and, until this decision, nothing in production called it. D-76 gives it its
+first caller and deliberately withholds it from the model. The demo claim is that
+deterministic application code owns state, authorization, and compensation while
+the model is measured; an undo the model could reconstruct with `create_task`
+would falsify that claim in the most visible place, because the result would look
+like restoration and would in fact be five new task identities with new
+histories. The risk it controls is authority, not convenience: for an intercepted
+command there are zero provider requests, zero framework runs, zero tool calls,
+and no model input at all beyond the message that classified.
+
+It also closes a concurrency hole that predates it. `RunDetail.can_undo` was the
+only enforcement of "a compensated run is no longer eligible", it reads nothing
+under a lock, and `undo.py` deliberately interprets a `restored` event rather
+than refusing one. Any two surfaces calling the kernel after a separate preflight
+could therefore both compensate one run. T18 will be the second surface.
+
+**Inputs and dependencies:** D-67 continuity and its refusal shape; D-44
+eligibility statuses; D-38 append-only compensation and forward versioning; D-51
+run identity; the T07 kernel; the D-75 `CreatedTurn` shape and history boundary;
+pinned pydantic-ai 2.27.0 (`AGUIEventStream`, `ModelRequest`/`ModelResponse`
+`metadata`, `ModelMessagesTypeAdapter`); ag-ui-protocol 0.1.19 event types.
+
+**Outputs and consumers:** `runs.attempt_run_undo` and `runs.UndoAttempt` are the
+operation T18 must call rather than re-deriving undoability.
+`runs._undo_eligibility` is the single eligibility predicate, read by both
+`RunDetail.can_undo` and the authoritative attempt. `runs.CONTROL_TURN_MODEL`
+marks control runs in the audit row. `undo.undo_run_on_conn` is the
+caller-owned-connection seam. `trellisPreviousRunId` is the transport contract
+the browser now maintains alongside continuity.
+
+**Verification:**
+
+```text
+cd backend && python -m ruff check .
+cd backend && DATABASE_URL=... pytest tests/test_d76_undo_bridge.py -v
+cd backend && DATABASE_URL=... pytest -m "not network"
+cd frontend && npm run test:transport
+cd frontend && npm run build
+```
+
+Observed: 28 passed in `test_d76_undo_bridge.py`; 381 passed and 13 deselected in
+the cumulative backend suite; 9 passed in the frontend transport test; Next.js
+16.3.1 production build compiled and generated 3 static pages.
+
+The pinned-API probe that authorized the design ran before any production edit
+and is reproduced as an executable regression in
+`test_synthetic_history_survives_the_real_persistence_boundary`:
+`AGUIEventStream` constructs and encodes SSE with no `Agent`;
+`ModelRequest`/`ModelResponse` carry `metadata` in 2.27.0; and the
+`to_jsonable_python` -> jsonb -> `ModelMessagesTypeAdapter.validate_python`
+round trip preserves it while leaving `model_name`, `provider_name`, and `run_id`
+null.
+
+Concurrency is proved rather than argued: three threads race one target run
+against real PostgreSQL through a barrier, exactly one reports `applied > 0`, and
+exactly one compensation wave exists afterwards.
+
+The author mutation audit ran 20 mutations and initially caught 19. The survivor
+is worth stating plainly: dropping `FOR UPDATE` from the undo attempt left every
+test green. The at-most-one-applied invariant does not actually depend on the
+lock, because the kernel's guards catch the losers by primary key, by version, or
+by absence. The lock decides the losers' refusal *reason*, and that is not
+cosmetic: without it a loser refuses ROW_RECREATED, and the control turn tells a
+human someone else recreated their task. The regression now asserts that every
+loser refuses as already compensated, which fails without the lock.
+
+The ABA regression creates a task at version N, deletes it, undoes the deletion,
+and then proves a guarded write at `expected_version = N` still matches no row.
+
+**Limitations and review status:**
+
+- The compensation and the control run's history are two transactions, not one.
+  If persistence fails after the kernel commits, task state stays restored, the
+  control run is marked FAILED with `mutation_committed=true` in its error, and
+  no automatic redo is attempted. A retry of the same command cannot
+  double-apply, because the target then carries a compensation wave and is
+  ineligible. Making those atomic is a durable-journal design and is deliberately
+  not attempted here.
+- The failure-after-commit path is reasoned from the existing `_record_failure`
+  contract and exercised only through its shared status-writing helpers; there is
+  no fault-injection test that crashes between the kernel commit and
+  `save_history`.
+- `_control_history_predecessor` adds up to two `runs.load` reads on the control
+  path to learn each candidate predecessor's status. They are single indexed
+  reads and were not measured. Checking the continuity candidate here rather
+  than letting `create_control_turn` refuse is what lets an unusable cursor
+  degrade to a root turn instead of turning a valid undo into a 403; the
+  refusal it would have raised still exists and still applies on the ordinary
+  model path.
+- The grammar is a frozen phrase set. Every phrasing outside it, including
+  "please undo" and "can you undo that", reaches the model. That is the intended
+  direction of error and will read as a miss to a user who phrases it politely.
+- `undo.py` changed only by extracting its body to `undo_run_on_conn` with the
+  numbered steps, check order, commit, and rollbacks intact. No undo semantics
+  moved.
+- No live provider evidence. The control path requires no NVIDIA credential by
+  construction, and the D-76 CI job deliberately sets none.
+- This entry records author-run verification only; neutral review is pending.
+
+## D-77: current-state truth after deletion and deterministic duplicate reads
+
+**Local role:** Makes a successful `delete_tasks` result state its own
+postcondition (`deleted`, `exists_after_tool`) before the result becomes the
+idempotent record, and adds `duplicates_only` to `ListTasksArgs` backed by one
+SQL statement that computes duplicate membership from current `tasks` rows.
+
+**Whole-system role:** This repairs an observed production failure in which the
+model reported a deleted task as a current duplicate, and the important part is
+that nothing hallucinated. The pre-delete snapshot correctly said
+`"status": "open"`, Pydantic AI correctly preserved the tool return in canonical
+history, and a later turn was shown a record that reads as a currently open task
+with nothing anywhere saying it was gone. The record was underspecified, so the
+fix belongs at the application seam that writes it rather than in prompt wording
+or in the provider.
+
+The second half puts duplicate truth in PostgreSQL. Asking the model to compare
+titles it remembers is the same category of mistake as asking it to decide
+undoability: it makes a database question depend on what happens to be in
+context. The bounded-result contract is part of the fix, because a correct query
+can still be reported falsely, and "these are all your duplicates" from a full
+page is a false statement even when every returned row is right.
+
+**Inputs and dependencies:** the T06 domain and its hard-delete semantics; the
+T05 idempotency lease and its stored result; D-73's exact-title equivalence rule
+and its bounded-query discipline; the D-76 undo path, for the integration proof.
+
+**Outputs and consumers:** `deleted` and `exists_after_tool` on every successful
+delete result, and therefore in canonical history for every later turn;
+`ListTasksArgs.duplicates_only` and `SELECT_DUPLICATE_TASKS_FOR_OWNER`;
+prompt rules 18 and 19, which state the current-state and bounded-result
+contracts the SQL cannot state for itself.
+
+**Verification:**
+
+```text
+cd backend && python -m ruff check .
+cd backend && DATABASE_URL=... pytest tests/test_d77_current_state.py -v
+cd backend && DATABASE_URL=... pytest -m "not network"
+cd frontend && npm run build
+```
+
+Observed: 18 passed in `test_d77_current_state.py`; 381 passed and 13 deselected
+cumulatively. The replay invariant is proved as one equality across the returned
+value, the stored `tool_invocations.result`, and a `replay_completed` read.
+Membership-before-LIMIT is proved with 30 duplicate pairs against a 50-row bound.
+Filter-before-group is proved with a done and an open task sharing a title. The
+D-76 x D-77 sequence (duplicate group, delete, group dissolves, undo, group
+reforms under the original id with a forward version) is a single test.
+
+**Limitations and review status:**
+
+- The bounded-result contract is enforced in the prompt, not in the tool result.
+  Nothing in the returned payload tells the model the page was truncated; the
+  model has to notice the row count. A `truncated` flag or a total count would be
+  a stronger mechanism and is a separate decision with its own bounded-query
+  proof.
+- Named-title duplicate questions ("are there two 'run the farm' tasks") are not
+  supported. Absence from a truncated page proves nothing, and adding a title
+  filter to `list_tasks` would relitigate D-73.
+- `duplicates_only` changes the canonical argument payload, so an ordinary list
+  and a duplicate list hash differently and cannot share a lease. That is
+  correct, and it means the two are separate invocations rather than one cached
+  answer.
+- The prompt half is unproven against a live model. Rules 17 through 19 are
+  deterministic only in that they exist; whether Nemotron 3.5 Lightning acts on
+  them is a provider-behaviour question, and the live eval NVIDIA's own model
+  card asks for has not been run. A failure there would be a compatibility
+  finding, not authority to weaken the deterministic contracts.
+- This entry records author-run verification only; neutral review is pending.

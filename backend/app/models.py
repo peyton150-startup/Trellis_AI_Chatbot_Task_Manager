@@ -331,6 +331,20 @@ class ListTasksArgs(TrellisModel):
     priority: TaskPriority | None = None
     limit: int = Field(default=50, ge=1, le=50)
 
+    # D-77. Narrow the same bounded owner read to titles that occur more than
+    # once among the rows that survive the other filters.
+    #
+    # A filter on the existing collection read rather than a ninth tool, because
+    # this is the same question `list_tasks` already answers with a different
+    # predicate, and the browser profile is exactly eight model-visible tools.
+    #
+    # It is not a free-text search and must not become one. Membership is
+    # whole-title, case-insensitive equality computed in SQL over current `tasks`
+    # rows. Reopening a general title filter here would relitigate D-73, which
+    # deliberately put single-reference resolution behind
+    # `resolve_task_reference` and its own bounded-query proof.
+    duplicates_only: bool = False
+
 
 class GetTaskHistoryArgs(TrellisModel):
     task_id: UUID

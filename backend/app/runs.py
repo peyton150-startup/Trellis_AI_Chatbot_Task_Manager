@@ -27,6 +27,7 @@ section 10 is amended to name it. See D-42.
 
 from datetime import timedelta
 from dataclasses import dataclass
+from enum import Enum
 from uuid import UUID
 
 from psycopg.types.json import Json
@@ -48,6 +49,7 @@ from app.models import (
     TaskEvent,
     ToolName,
     ToolStepStatus,
+    UndoResult,
 )
 
 
@@ -59,6 +61,66 @@ from app.models import (
 UNDOABLE_STATUSES = frozenset(
     {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.INTERRUPTED}
 )
+
+
+# D-76. What `agent_runs.model` records for a turn that no model executed.
+#
+# `model` is free text and this needs no migration, but the value is a claim
+# about who acted, so it is named here rather than spelled at the call site. A
+# control turn makes zero provider requests, so recording `settings.model_id`
+# would put NVIDIA's name on work NVIDIA never did.
+CONTROL_TURN_MODEL = "trellis-control"
+
+
+# D-76. The three ways a run can fail to be a well-defined undo target, as
+# distinct from the ways the kernel can refuse an attempt that was well defined.
+#
+# Deliberately not a `UndoReason`. Section 6's vocabulary and `UndoReason` both
+# describe outcomes that reach a client, and nothing here does: these values
+# choose which sentence the deterministic control turn writes. Adding members to
+# a wire enum to carry an internal distinction is how a closed vocabulary stops
+# being closed.
+class UndoIneligibility(str, Enum):
+    """Why an undo attempt on this run is not well defined."""
+
+    # `running` or `awaiting_approval`. Either can still commit another tool
+    # call, so compensating races the run's own continuation. D-44.
+    STILL_ACTIVE = "still_active"
+
+    # The run committed no task mutation, so there is nothing to compensate.
+    # A control run is always in this state, which is what stops a second
+    # "undo that" from becoming a redo of the first.
+    NO_EFFECTS = "no_effects"
+
+    # The run already carries a compensation wave. D-38: a second pass would
+    # load both waves together and undo a combined history that inverts
+    # nothing.
+    ALREADY_COMPENSATED = "already_compensated"
+
+
+@dataclass(frozen=True)
+class UndoAttempt:
+    """The authoritative outcome of one undo attempt on one run.
+
+    Three outcomes, and they are not interchangeable:
+
+        ineligible is not None   the attempt was never well defined
+        result.refused           the kernel refused on current task state
+        result.applied > 0       compensation committed
+
+    `result` is None exactly when `ineligible` is set, because an ineligible
+    attempt never reaches the kernel and therefore has no kernel outcome to
+    report. A caller that reported "refused" for both would lose the distinction
+    between "this run cannot be undone" and "this run could not be undone right
+    now", which are different sentences to a human.
+    """
+
+    ineligible: UndoIneligibility | None = None
+    result: UndoResult | None = None
+
+    @property
+    def applied(self) -> int:
+        return 0 if self.result is None else self.result.applied
 
 
 @dataclass(frozen=True)
@@ -149,6 +211,63 @@ def create_turn(
                 # No row matched the predicates. Missing, foreign, and
                 # not-completed are one refusal, as they were when this was a
                 # separate SELECT.
+                raise OutOfScopeError()
+
+        conn.commit()
+
+    return CreatedTurn(
+        id=row["id"],
+        message_history=list(row["message_history"]),
+    )
+
+
+def create_control_turn(
+    actor_id: UUID,
+    prompt: str,
+    history_predecessor_run_id: UUID | None,
+) -> CreatedTurn:
+    """Create one D-76 deterministic control turn. No provider executes.
+
+    Structurally identical to `create_turn`, and separate from it for one
+    reason: the model column. An ordinary turn records `settings.model_id`
+    because that model is about to run. A control turn records
+    `CONTROL_TURN_MODEL`, because none does, and writing the NVIDIA model id on a
+    row that never made a provider request would make `agent_runs` claim
+    something that did not happen. The Run Inspector reads that column, and an
+    audit row that lies about who acted is worse than one that is unfamiliar.
+
+    Parameterising `create_turn` with a model argument was the alternative and is
+    worse: "which runs are control runs" would then be answered by whatever each
+    caller happened to pass, rather than by one function a reader can grep.
+
+    `history_predecessor_run_id` is deliberately not called `continuity_run_id`.
+    D-76 splits the two authorities that name used to conflate. The predecessor
+    supplies canonical conversation history and nothing else. It is not the undo
+    target, it confers no undo authority, and the caller resolves it separately.
+    The D-67 refusal is unchanged and still one refusal for missing, foreign, and
+    not-completed.
+    """
+    with pool.connection() as conn:
+        if history_predecessor_run_id is None:
+            row = conn.execute(
+                sql.INSERT_RUN,
+                {
+                    "actor_id": actor_id,
+                    "prompt": prompt,
+                    "model": CONTROL_TURN_MODEL,
+                },
+            ).fetchone()
+        else:
+            row = conn.execute(
+                sql.INSERT_RUN_INHERITING_HISTORY,
+                {
+                    "actor_id": actor_id,
+                    "prompt": prompt,
+                    "model": CONTROL_TURN_MODEL,
+                    "continuity_run_id": history_predecessor_run_id,
+                },
+            ).fetchone()
+            if row is None:
                 raise OutOfScopeError()
 
         conn.commit()
@@ -268,6 +387,98 @@ def record_usage(
         ).fetchone()
         conn.commit()
     return AgentRun.model_validate(row)
+
+
+def attempt_run_undo(run_id: UUID, actor_id: UUID) -> UndoAttempt:
+    """D-76. The one authoritative way to undo a run. Serialized, actor scoped.
+
+    Every surface that offers undo calls this: the D-76 control turn today, and
+    T18's presentation entry point later. Neither may re-derive undoability, and
+    that is the whole reason this function exists rather than each caller pairing
+    `detail().can_undo` with `undo.undo_run`.
+
+    That pairing is a TOCTOU boundary, and not a theoretical one. `_can_undo`
+    reads without locking, and the kernel deliberately interprets a `restored`
+    event rather than refusing one, so two concurrent callers can both observe an
+    eligible run and both compensate it. The lock below is what closes it:
+
+        1. `SELECT_RUN_FOR_UNDO` takes a row lock on the actor-owned run.
+        2. Status, the event wave, and the compensation check are evaluated
+           inside that lock, through the same `_undo_eligibility` predicate
+           `RunDetail.can_undo` reports.
+        3. `undo.undo_run_on_conn` runs on this same connection, so the lock is
+           still held across the kernel's precheck, apply pass, and commit.
+
+    A second caller blocks at step 1, wakes after the first commits, reads the
+    compensation wave the first attempt wrote, and refuses at step 2. For one
+    target run and any number of concurrent attempts, at most one reports
+    `applied > 0`.
+
+    Missing and foreign remain one refusal, raised as `OutOfScopeError` before
+    anything about the run is disclosed.
+
+    Eligibility reads `SELECT_RUN_EFFECT_SUMMARY` rather than the event wave.
+    The kernel is about to load that wave in full, and loading it here only to
+    ask whether it is empty would double the largest read on this path.
+
+    `undo` is imported inside the function on purpose. It imports `domain`,
+    which imports the pool, and `runs` is imported by modules that must stay
+    importable without a live database.
+    """
+    from . import undo
+
+    with pool.connection() as conn:
+        row = conn.execute(
+            sql.SELECT_RUN_FOR_UNDO,
+            {"run_id": run_id, "actor_id": actor_id},
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            raise OutOfScopeError()
+
+        summary = conn.execute(
+            sql.SELECT_RUN_EFFECT_SUMMARY, {"run_id": run_id}
+        ).fetchone()
+
+        ineligible = _undo_eligibility(
+            RunStatus(row["status"]),
+            has_events=summary["has_events"],
+            has_compensation=summary["has_compensation"],
+        )
+        if ineligible is not None:
+            conn.rollback()
+            return UndoAttempt(ineligible=ineligible)
+
+        # The kernel ends this transaction on every path, and the lock is held
+        # until it does. Nothing may commit or roll back around it.
+        result = undo.undo_run_on_conn(run_id, actor_id, conn=conn)
+
+    return UndoAttempt(result=result)
+
+
+def _undo_eligibility(
+    status: RunStatus, *, has_events: bool, has_compensation: bool
+) -> UndoIneligibility | None:
+    """The single definition of whether an undo attempt is well defined.
+
+    Read by `_can_undo`, which projects it into `RunDetail` for a surface to
+    render, and by `attempt_run_undo`, which evaluates it under a row lock and
+    acts on it. One predicate, two callers, so a surface can never offer an undo
+    the authoritative path would refuse for a reason the surface does not know
+    about.
+
+    It is not a promise the attempt will succeed. The kernel can still refuse
+    with ROW_DISAPPEARED, VERSION_CONFLICT, ROW_RECREATED, or EXTERNALLY_MODIFIED
+    when current task state has moved underneath the run, and that judgment stays
+    in `undo.py` where the state is actually read.
+    """
+    if status not in UNDOABLE_STATUSES:
+        return UndoIneligibility.STILL_ACTIVE
+    if not has_events:
+        return UndoIneligibility.NO_EFFECTS
+    if has_compensation:
+        return UndoIneligibility.ALREADY_COMPENSATED
+    return None
 
 
 def load_approval(run_id: UUID, tool_call_id: str) -> Approval | None:
@@ -533,12 +744,15 @@ def _can_undo(run: AgentRun, events: list[TaskEvent]) -> bool:
     between the demo and a second undo. T18 enforces the same predicate before
     calling the kernel.
     """
-    if run.status not in UNDOABLE_STATUSES:
-        return False
-    if not events:
-        return False
-    return not any(
-        event.operation is EventOperation.RESTORED for event in events
+    return (
+        _undo_eligibility(
+            run.status,
+            has_events=bool(events),
+            has_compensation=any(
+                event.operation is EventOperation.RESTORED for event in events
+            ),
+        )
+        is None
     )
 
 

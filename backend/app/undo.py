@@ -40,11 +40,19 @@ Scope, from section 8 and D-38: one run, all or nothing, no partial undo and no
 cross-run undo. Repeated invocation is not redo. Compensation events keep the
 original ``run_id`` for audit correlation, which means a second call would load
 both waves, and undoing that combined history is not a well-defined inverse of
-anything. A run that already carries compensation events is no longer eligible,
-and ``RunDetail.can_undo`` is where that eligibility is enforced. This module
-handles a ``restored`` event it encounters rather than failing on it, because
-section 8 requires the precheck to understand one, but handling it is not a
-claim that calling undo twice is supported.
+anything. A run that already carries compensation events is no longer eligible.
+This module handles a ``restored`` event it encounters rather than failing on
+it, because section 8 requires the precheck to understand one, but handling it
+is not a claim that calling undo twice is supported.
+
+Where that eligibility is enforced changed at D-76 and the correction matters.
+It used to be ``RunDetail.can_undo`` alone, which is a read with no lock, so two
+concurrent callers could both observe an eligible run and both arrive here. The
+authoritative enforcement is now ``runs.attempt_run_undo``, which evaluates the
+same rule under ``SELECT_RUN_FOR_UNDO``'s row lock and calls
+``undo_run_on_conn`` inside that transaction. ``RunDetail.can_undo`` remains the
+projection a surface renders, and both read one shared predicate rather than two
+definitions that can drift.
 """
 
 from dataclasses import dataclass, replace
@@ -94,57 +102,81 @@ def undo_run(run_id: UUID, actor_id: UUID) -> UndoResult:
     the same way a run whose tasks were deleted refuses, which is the
     indistinguishability section 6 requires. Resolving the run itself against
     ``agent_runs`` belongs to the wire contract in T08, not here.
+
+    This entry point owns its connection, which is the shape every existing
+    caller has. D-76 adds a second caller that must hold a serializing lock on
+    the run row across the whole attempt, so the body moved to
+    ``undo_run_on_conn`` unchanged and this function became the wrapper that
+    supplies a connection. Nothing about the check order or the transaction
+    boundary moved with it: the same single transaction still spans the
+    precheck, the apply pass, and the commit, and every refusal still rolls back
+    before returning.
     """
     with _pool().connection() as conn:
-        try:
-            events = _load_events(run_id, conn=conn)
-            # 2. Section 8. An empty run is not a refusal, it is nothing to do.
-            if not events:
-                conn.rollback()
-                return UndoResult(applied=0, refused=False)
+        return undo_run_on_conn(run_id, actor_id, conn=conn)
 
-            current = _load_current_state(actor_id, events, conn=conn)
-            diverged = _load_diverged_task_ids(events, conn=conn)
 
-            # 3. PRECHECK PASS, no writes.
-            refusal = _precheck(events, current, diverged)
-            if refusal is not None:
-                conn.rollback()
-                return UndoResult(applied=0, refused=True, reason=refusal)
+def undo_run_on_conn(run_id: UUID, actor_id: UUID, *, conn) -> UndoResult:
+    """The compensation itself, on a connection the caller owns.
 
-            # 4. APPLY PASS, single transaction, same reverse order.
-            applied = _apply(run_id, actor_id, events, current, conn=conn)
-            conn.commit()
+    Transcribed from ``undo_run`` with no change to the numbered steps, the
+    order of the checks, or the placement of the commit and the rollbacks. The
+    caller's transaction is this transaction: a caller that has already taken a
+    lock inside it holds that lock until the commit or rollback below, which is
+    exactly what D-76 needs and is the only reason this seam exists.
 
-            # 5.
-            return UndoResult(applied=applied, refused=False)
-        except VersionConflictError:
-            # A guarded update or guarded delete touched zero rows, so the row
-            # moved after the precheck read it. The precheck holds the finer
-            # distinction between moved and gone; at this point both are the
-            # same conflict.
+    Callers must not commit or roll back around this function. It is
+    all-or-nothing and it ends its own transaction on every path.
+    """
+    try:
+        events = _load_events(run_id, conn=conn)
+        # 2. Section 8. An empty run is not a refusal, it is nothing to do.
+        if not events:
             conn.rollback()
-            return UndoResult(
-                applied=0, refused=True, reason=UndoReason.VERSION_CONFLICT
-            )
-        except psycopg_errors.UniqueViolation:
-            # The primary key on INSERT_TASK_RESTORED. The precheck established
-            # that the id was absent, so the row reappeared in between. The
-            # transaction is already aborted here, which is why this is caught
-            # at the boundary and translated after the rollback rather than
-            # handled in place: a savepoint would let the rest of the undo
-            # proceed, and there is no correct undo that proceeds past a
-            # conflict.
+            return UndoResult(applied=0, refused=False)
+
+        current = _load_current_state(actor_id, events, conn=conn)
+        diverged = _load_diverged_task_ids(events, conn=conn)
+
+        # 3. PRECHECK PASS, no writes.
+        refusal = _precheck(events, current, diverged)
+        if refusal is not None:
             conn.rollback()
-            return UndoResult(applied=0, refused=True, reason=UndoReason.ROW_RECREATED)
-        except psycopg_errors.ForeignKeyViolation:
-            # A restored task points at a blocker that no longer exists. Reverse
-            # order restores a blocker this run deleted before any pointer to
-            # it, so this means the blocker was removed by someone else.
-            conn.rollback()
-            return UndoResult(
-                applied=0, refused=True, reason=UndoReason.ROW_DISAPPEARED
-            )
+            return UndoResult(applied=0, refused=True, reason=refusal)
+
+        # 4. APPLY PASS, single transaction, same reverse order.
+        applied = _apply(run_id, actor_id, events, current, conn=conn)
+        conn.commit()
+
+        # 5.
+        return UndoResult(applied=applied, refused=False)
+    except VersionConflictError:
+        # A guarded update or guarded delete touched zero rows, so the row
+        # moved after the precheck read it. The precheck holds the finer
+        # distinction between moved and gone; at this point both are the
+        # same conflict.
+        conn.rollback()
+        return UndoResult(
+            applied=0, refused=True, reason=UndoReason.VERSION_CONFLICT
+        )
+    except psycopg_errors.UniqueViolation:
+        # The primary key on INSERT_TASK_RESTORED. The precheck established
+        # that the id was absent, so the row reappeared in between. The
+        # transaction is already aborted here, which is why this is caught
+        # at the boundary and translated after the rollback rather than
+        # handled in place: a savepoint would let the rest of the undo
+        # proceed, and there is no correct undo that proceeds past a
+        # conflict.
+        conn.rollback()
+        return UndoResult(applied=0, refused=True, reason=UndoReason.ROW_RECREATED)
+    except psycopg_errors.ForeignKeyViolation:
+        # A restored task points at a blocker that no longer exists. Reverse
+        # order restores a blocker this run deleted before any pointer to
+        # it, so this means the blocker was removed by someone else.
+        conn.rollback()
+        return UndoResult(
+            applied=0, refused=True, reason=UndoReason.ROW_DISAPPEARED
+        )
 
 
 def _load_events(run_id: UUID, *, conn) -> list[TaskEvent]:

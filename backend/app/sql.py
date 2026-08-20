@@ -10,6 +10,60 @@ SELECT *
  LIMIT %(limit)s;
 """
 
+# D-77. The same bounded owner read, narrowed to titles that currently occur more
+# than once. Duplicate membership is a fact about the rows in `tasks` right now,
+# and this statement is the only place that fact is computed.
+#
+# The order of the three stages is the correctness condition, not a style choice.
+#
+# 1. `filtered` applies exactly the predicates SELECT_TASKS_FOR_OWNER applies, so
+#    `status = 'open' AND duplicates_only` means "duplicate titles among current
+#    open tasks" rather than "open tasks that happen to share a title with a done
+#    one". Composing filters after grouping would answer the second question.
+#
+# 2. `marked` counts the group with a window function over the filtered set. A
+#    window is used rather than a GROUP BY join because the count has to be
+#    attached to every member row without collapsing them.
+#
+# 3. LIMIT applies last, to rows that are already known to be duplicates. This is
+#    what makes zero rows a proof: membership was decided across the whole
+#    filtered collection, so an empty result means no duplicate group survived
+#    the filters, not that the page happened to miss one. The converse does not
+#    hold and D-77 says so in terms: a full page is never evidence of
+#    exhaustiveness, and a title absent from a truncated page is not proved
+#    unique.
+#
+# `lower(title)` is whole-title, case-insensitive equivalence, matching the exact
+# arm of SELECT_TASK_REFERENCE_CANDIDATES. No substring, no similarity, no
+# tokenization. Duplicate membership has one definition in this system.
+#
+# The final SELECT names the eleven `tasks` columns explicitly rather than using
+# `marked.*`. `duplicate_count` is an internal signal in exactly the sense
+# `match_rank` is, and `Task` forbids extra keys, so letting it reach the model
+# validator would turn a correct query into a validation error.
+SELECT_DUPLICATE_TASKS_FOR_OWNER = """
+WITH filtered AS (
+  SELECT *
+    FROM tasks
+   WHERE owner_id = %(owner_id)s
+     AND (%(status)s::task_status IS NULL OR status = %(status)s::task_status)
+     AND (%(due_before)s::date IS NULL OR due_date <= %(due_before)s::date)
+     AND (%(due_after)s::date IS NULL OR due_date >= %(due_after)s::date)
+     AND (%(priority)s::task_priority IS NULL OR priority = %(priority)s::task_priority)
+),
+marked AS (
+  SELECT filtered.*,
+         count(*) OVER (PARTITION BY lower(title)) AS duplicate_count
+    FROM filtered
+)
+SELECT id, owner_id, title, notes, due_date, priority, status, blocked_by,
+       version, created_at, updated_at
+  FROM marked
+ WHERE duplicate_count > 1
+ ORDER BY due_date ASC NULLS LAST, created_at ASC, id ASC
+ LIMIT %(limit)s;
+"""
+
 # D-73 single-task discovery. One owner-scoped read that spans current titles and
 # the titles recorded in that actor's own audit rows, so a renamed or deleted
 # task is still reachable by the name the user remembers.
@@ -589,6 +643,62 @@ SELECT *
   FROM agent_runs
  WHERE id = %(run_id)s
    AND actor_id = %(actor_id)s;
+"""
+
+# D-76. The serialization point for an undo attempt, and the reason the attempt
+# is a single authoritative operation rather than a preflight followed by a
+# mutation.
+#
+# `RunDetail.can_undo` answers whether an attempt is well defined, and it reads
+# without locking anything. Two browsers asking at the same moment both get true,
+# and both then call the kernel. The kernel deliberately understands a `restored`
+# event rather than refusing one, because its precheck has to interpret the
+# compensation wave it may itself have written, so nothing inside it stops the
+# second caller from compensating an already-compensated run. The predicate that
+# does stop it lives in the eligibility rule, and that rule has to be evaluated
+# where the second caller cannot have read it before the first caller committed.
+#
+# FOR UPDATE on the run row is that place. The second attempt blocks here, wakes
+# after the first transaction commits, then reads the events the first attempt
+# wrote and refuses on the compensation wave it can now see. The lock is on
+# `agent_runs` rather than on the affected tasks because the undo unit is a run:
+# a run that deleted every one of its tasks locks no task rows at all, so task
+# locks would serialize exactly the runs that need it least.
+#
+# Missing and foreign remain one refusal. Both match no row, exactly as
+# `SELECT_RUN` does, so a caller cannot learn from the answer whether a run id
+# exists under another actor.
+SELECT_RUN_FOR_UNDO = """
+SELECT id, status
+  FROM agent_runs
+ WHERE id = %(run_id)s
+   AND actor_id = %(actor_id)s
+   FOR UPDATE;
+"""
+
+# D-76. The two booleans undo eligibility needs about a run's effect wave, as one
+# aggregate rather than as the wave itself.
+#
+# `attempt_run_undo` asks whether the run committed anything and whether it has
+# already been compensated. `SELECT_ALL_EVENTS_FOR_RUN` answers both, and the
+# kernel is about to run it anyway, so reading it here as well would load the
+# largest thing on this path twice to compute two bits. `bool_or` over the same
+# rows does it in the server.
+#
+# No actor predicate, and that is not an omission. This statement is only ever
+# executed after `SELECT_RUN_FOR_UNDO` has already proved the actor owns the run,
+# on the same connection and inside the same transaction and row lock. Adding a
+# second scope check here would suggest the caller might reach it without the
+# first, which is the reading to avoid.
+#
+# An unmatched run id returns one row of `false, false` rather than no row,
+# because these are aggregates over zero rows. `NO_EFFECTS` is the correct answer
+# for a run with no events, so the degenerate case needs no special handling.
+SELECT_RUN_EFFECT_SUMMARY = """
+SELECT coalesce(bool_or(true), false) AS has_events,
+       coalesce(bool_or(operation = 'restored'), false) AS has_compensation
+  FROM task_events
+ WHERE run_id = %(run_id)s;
 """
 
 # The five-table reset specified for POST /api/demo/reset in BUILD_SPEC section

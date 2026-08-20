@@ -22,11 +22,18 @@ function RunCompletionListener({
 
   // D-67 keeps this separate from useRun(): T16 owns approval state, while
   // continuity only needs the server-issued application run id.
+  //
+  // D-76 adds the second cursor here, and the placement is the point. The
+  // previous-run cursor advances on RUN_STARTED, the moment the server issues
+  // the id, and never waits for the run to end. That is what makes a run that
+  // commits a mutation and then fails still nameable by "undo that". Continuity
+  // promotion below is unchanged and remains completed-only.
   useEffect(() => {
     const subscription = agent.subscribe({
       onRunStartedEvent: ({ event }) => {
         if (event.threadId) {
           currentRunId.current = event.threadId;
+          agent.setPreviousRunId(event.threadId);
         }
       },
     });

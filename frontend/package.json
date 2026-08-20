@@ -12,7 +12,8 @@
     "build": "next build",
     "start": "next start",
     "test:ingress": "node --test tests/ngrok-demo-ingress.test.mjs",
-    "test:notes": "node --test tests/task-card-notes.test.mjs"
+    "test:notes": "node --test tests/task-card-notes.test.mjs",
+    "test:transport": "node --test tests/trellis-forwarded-props.test.mjs"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.57",

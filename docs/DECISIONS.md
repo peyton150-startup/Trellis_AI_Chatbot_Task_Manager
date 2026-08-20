@@ -3485,3 +3485,301 @@ error code, or dependency. It changes no domain, policy, approval, undo, or
 idempotency semantics, and it does not change the order of any kernel check.
 It does not alter D-67 eligibility, D-71 authorization, D-73 resolution, or the
 D-74 ceilings.
+
+### D-76: run-relative natural-language undo, as application control flow
+
+Trellis has owned an authoritative, all-or-nothing undo kernel since T07, and
+until now nothing in production called it. This decision gives it its first
+caller, and deliberately does not give it to the model.
+
+1. **"Undo that" is control flow, not a tool.** The browser profile stays at
+   exactly eight model-visible tools and no ninth `undo_tasks` appears. A
+   recognized command is intercepted in `handle_agui_request` before any agent
+   is constructed, so the model never chooses the target, never names a task id,
+   never sees a task snapshot, and never runs. For an intercepted command the
+   counts are zero NVIDIA requests, zero framework runs, zero tool calls, and
+   zero `create_task` calls. `test_d76_undo_bridge.py` enforces that by making
+   `_runtime_model` and `get_agent` raise for the whole module rather than by
+   mocking a model that returns nothing: a change that reaches provider
+   construction fails the suite instead of quietly working.
+
+2. **Two browser cursors, because they answer two questions.** This is the
+   correction that matters most, and the single-locator design that preceded it
+   was wrong in a way a happy-path test cannot see.
+
+   ```text
+   trellisContinuityRunId   newest COMPLETED run; supplies canonical history
+   trellisPreviousRunId     newest server-issued run of any status; the only
+                            candidate undo target
+   ```
+
+   They are the same run almost always. They diverge exactly when a run commits
+   a task mutation and then fails, and D-44 makes such a run undoable precisely
+   because a tool may already have committed. Continuity does not advance past
+   it, by design. So a bridge reading continuity would answer "undo that" by
+   compensating an older successful action while leaving the failed one intact.
+   `previousRunId` advances on `RUN_STARTED`, the moment the server issues the
+   id, rather than on run end.
+
+   Both remain untrusted lookup keys in exactly the sense `{id}` is on
+   `GET /api/runs/{id}`. Ownership, status, eligibility, and history are all
+   resolved server-side, `forwardedProps` is still rebuilt empty before any
+   adapter is constructed, and the malformed and non-string refusals match the
+   D-67 extractor exactly.
+
+3. **One authoritative undo operation, serialized, and it is not a preflight
+   plus a kernel call.** `runs.attempt_run_undo` locks the actor-owned
+   `agent_runs` row with `SELECT_RUN_FOR_UNDO`, evaluates eligibility inside that
+   lock, and calls the kernel on the same connection so the lock is still held
+   across the precheck, the apply pass, and the commit.
+
+   Pairing `RunDetail.can_undo` with `undo.undo_run` was the obvious shape and it
+   is a TOCTOU bug, not a theoretical one. `_can_undo` reads nothing under a
+   lock, and `undo.py` deliberately interprets a `restored` event rather than
+   refusing one, because its precheck has to understand the compensation wave it
+   may itself have written. Nothing inside the kernel therefore stops a second
+   caller. The predicate that does stop it is the eligibility rule, and it has to
+   be evaluated where a second caller cannot have read it before the first
+   committed. The invariant is that for one target run and any number of
+   concurrent attempts, at most one reports `applied > 0`, and it is proved by a
+   real three-thread race against real PostgreSQL rather than asserted.
+
+   The lock is on the run row rather than on the affected tasks because the undo
+   unit is a run: a run that deleted all of its tasks locks no task rows at all,
+   so task locks would serialize exactly the runs least in need of it.
+
+   The author mutation audit sharpened what the lock is for, and the finding is
+   recorded rather than smoothed over. Dropping `FOR UPDATE` left the
+   at-most-one-applied invariant intact and the whole suite green, because the
+   kernel's own guards already catch every loser: a delete-undo collides on the
+   primary key, an update-undo on the version guard, and a create-undo finds its
+   rows gone. Safety is genuinely defended twice.
+
+   What the lock decides is what the loser is told. Under it, the second attempt
+   observes the winner's compensation wave and refuses as already compensated,
+   which is what happened. Without it, the loser reaches the kernel and refuses
+   with ROW_RECREATED, and the control turn then tells a human that someone else
+   recreated their task: a false explanation of a correct outcome. The
+   concurrency regression therefore asserts the losers' reason and not only
+   their count.
+
+4. **One eligibility predicate, two readers.** `_undo_eligibility` is the single
+   definition of whether an attempt is well defined. `RunDetail.can_undo`
+   projects it for a surface to render; `attempt_run_undo` evaluates it under the
+   lock and acts on it. Two definitions would let a surface offer an undo the
+   authoritative path refuses. T18 later becomes a third surface over the same
+   operation and must not invent a fourth definition of undoability.
+
+   Its three outcomes are internal and are deliberately not added to
+   `UndoReason`. That enum and the section 6 vocabulary describe things a client
+   sees; these values only choose which sentence the control turn writes.
+
+5. **Version is not rewound, and this is the load-bearing half of "restore".**
+   A restored task keeps its original id, owner, title, notes, due date,
+   priority, status, `blocked_by`, and `created_at`. Its `version` advances and
+   its `updated_at` moves forward, exactly as D-38 already specified, because
+   compensation is a new forward mutation and history is append-only.
+
+   Rewinding the number would be an ABA bug rather than a cosmetic nicety.
+   `version` is the optimistic-concurrency token `UPDATE_TASK_GUARDED` checks, so
+   a client still holding the pre-deletion version would find its stale token
+   valid again and would overwrite the restore without ever observing it. The
+   regression creates a task at version N, deletes it, undoes the deletion, and
+   then proves a guarded write at `expected_version = N` still matches no row.
+   `undo.py`'s restoration semantics are unchanged by this decision.
+
+6. **The control turn is a real turn, and its audit row does not lie.** It
+   creates an `agent_runs` row through `runs.create_control_turn`, writes
+   canonical history the next model turn inherits, and returns an ordinary AG-UI
+   response. `agent_runs.model` records `trellis-control` rather than the NVIDIA
+   model id, because no provider executed and an audit row that names the wrong
+   actor is worse than one that is unfamiliar. `model` is free text, so this
+   needs no migration.
+
+   The synthetic history is two ordinary Pydantic AI dataclasses persisted
+   through the boundary this build already uses. It carries no `ToolCallPart`,
+   no `ToolReturnPart`, no `ThinkingPart`, no `model_name`, no `provider_name`,
+   and no framework run id. Each of those left unset is a claim not made.
+
+   The history predecessor is preferred, not required. A completed and owned
+   previous run seeds the control turn, so the transcript reads as following the
+   action it reversed; otherwise a completed and owned continuity run does;
+   otherwise the control turn is a root turn. An unusable continuity cursor
+   degrades rather than refusing, and that is a deliberate difference from the
+   ordinary model path, where the same locator correctly produces a 403. There
+   the seeded turn is the entire request. Here the request is a mutation the
+   actor is entitled to, and a missing conversational predecessor must not
+   remove mutation authority.
+
+7. **Emitting is manual, and no adapter is built.** Pinned Pydantic AI 2.27.0
+   exports `AGUIEventStream`, which encodes protocol events and produces the
+   streaming response without an `Agent`. Reaching the same encoder through
+   `AGUIAdapter(get_agent(), ...)` would construct the NVIDIA model, and
+   therefore require `NVIDIA_API_KEY`, for a command that has no use for either.
+
+8. **`RUN_FINISHED` comes after the run is durably `completed`.** The browser
+   fetches `GET /api/runs/{id}` the moment it sees run end and promotes
+   continuity only on `completed`, so finishing the stream before finishing the
+   turn would drop the control turn out of the conversation for no reason but a
+   self-inflicted race. `RUN_STARTED` still comes first, because that is where
+   the browser learns the application run id.
+
+9. **Every recognized command produces a run, including every refusal.** A
+   semantic refusal is a COMPLETED control run carrying the refusal in its
+   canonical history; only an infrastructure failure produces a FAILED one. That
+   refusal run becomes the next `previousRunId`, so a second "undo that" targets
+   the refusal rather than searching backward for something undoable. There is no
+   backward search anywhere in this decision, and no fallback from
+   `previousRunId` to `continuityRunId`: both would compensate a run the user
+   did not name. It is also what makes "undo that" twice safe with no special
+   case, since a control run commits no task events and is permanently
+   ineligible by the ordinary rule. Undo never becomes redo.
+
+10. **Missing, malformed, and foreign targets are one answer.** A forged id
+    belonging to another actor produces the same sentence as no id at all.
+
+11. **Under-match, deliberately.** The accepted grammar is a frozen set of
+    whole-message phrases matched after casefolding, whitespace collapse, and
+    trailing punctuation removal. "restore D75", "recover Tractor", and "undo
+    yesterday's changes" are not intercepted, because each requires deciding
+    *what* to restore, and target interpretation is not authorized here. A missed
+    phrase costs one rephrase; a wrongly claimed one compensates a run nobody
+    named.
+
+12. **A prompt backstop, which is not the mechanism.** `prompts.py` gains a rule
+    forbidding `create_task` as a simulation of undo. A classifier miss must fail
+    safely, with the model declining rather than fabricating five replacement
+    tasks under new identities.
+
+13. **Failure after the compensation commits is recorded, never reversed.** If
+    persisting the turn fails after the kernel committed, the task state stays
+    restored, the compensation events stay, the control run is marked FAILED with
+    the committed fact in its error, and the browser refetches. No automatic
+    redo is attempted, because that would be a second uncontrolled mutation on an
+    error path. Retrying the same command cannot double-apply: the target now
+    carries a compensation wave and is ineligible.
+
+14. **What this does not do.** No `/api/runs/{id}/undo`, no T18 button, no ninth
+    tool, no change to `undo.py`'s semantics beyond extracting the body to a
+    caller-owned-connection seam with the check order and transaction boundary
+    intact. No migration, table, column, endpoint, status value, error code, or
+    dependency. D-67 eligibility, D-71 authorization, D-73 resolution, and the
+    D-74 ceilings are unchanged, and the approval continuation branch is
+    untouched and still runs first.
+
+### D-77: current-state truth after deletion, and deterministic duplicate reads
+
+This decision has an observed production failure behind it, and the failure was
+not the model inventing anything. It read an ambiguous record accurately.
+
+`delete_tasks` stored the pre-delete snapshot as its idempotent result and
+returned it. That snapshot correctly says `"status": "open"`, because that is
+what the task was the instant before it stopped existing. Pydantic AI then
+correctly preserved the tool return in canonical history. A later turn was
+therefore shown what reads as a currently open task, with nothing anywhere in the
+record saying it had been deleted, and the model treated it as a current
+duplicate. Every component behaved as specified. The record was underspecified.
+
+1. **The hard-delete architecture is unchanged.** `tasks` remains authoritative
+   current state, `task_events` remains authoritative durable history, and
+   deletion remains `DELETE ... RETURNING *`. No `TaskStatus.DELETED`, no soft
+   delete, no `deleted` column, no migration, and no historical row is admitted
+   to current task authority.
+
+2. **A successful delete result states its own postcondition.** Every per-task
+   result gains two fields beside the unchanged snapshot:
+
+   ```text
+   deleted            this invocation deleted this task
+   exists_after_tool  no current row with this id existed once this tool's
+                      transaction committed
+   ```
+
+   Named `exists_after_tool` and specifically not `exists_now`. A record
+   persisted in history cannot make a permanent claim about "now": D-76 can
+   restore that exact task under its original id, at which point a stored
+   `exists_now: false` would be a falsehood sitting in the transcript. Both
+   fields describe a postcondition at a point in the past and stay true forever.
+
+   They are not fields on `Task`. `Task` models a row in `tasks`, and a row that
+   exists never needs to say it was deleted.
+
+3. **Enrichment happens before `idempotency.complete`.** The order is
+   `domain.delete_tasks` -> events -> enriched result -> `complete(...)` ->
+   commit, and the invariant is that the first result, the stored
+   `tool_invocations.result`, and any replayed result are one value including
+   both markers. Decorating after completion would give an original call and a
+   replay two different canonical histories for the same invocation.
+
+4. **Duplicate detection is a filter on the existing read, not a ninth tool.**
+   `ListTasksArgs` gains `duplicates_only: bool = False`. The browser keeps
+   exactly eight model-visible tools and the Linear profile keeps its six.
+   `resolve_task_reference` remains single-reference discovery spanning current
+   and historical titles; `list_tasks` remains current collection browsing.
+
+5. **SQL owns duplicate truth, and the stage order is the correctness
+   condition.** `SELECT_DUPLICATE_TASKS_FOR_OWNER` filters, then marks group
+   membership with `count(*) OVER (PARTITION BY lower(title))`, then applies
+   LIMIT:
+
+   ```text
+   owner + existing filters -> duplicate membership -> ordering -> LIMIT
+   ```
+
+   Filters precede grouping, so `status='open'` with `duplicates_only` means
+   "duplicate titles among current open tasks" rather than "open tasks that share
+   a title with a done one". Membership precedes LIMIT, which is what makes an
+   empty result a proof rather than a pagination artefact.
+
+   Equivalence is whole-title and case-insensitive, matching the exact arm of
+   `SELECT_TASK_REFERENCE_CANDIDATES`. No substring, no similarity, no
+   embeddings, no model comparison. `duplicate_count` is an internal signal in
+   exactly the sense `match_rank` is, and the statement names the eleven task
+   columns explicitly so it can never reach `Task.model_validate`, which forbids
+   extras.
+
+6. **The bounded-result contract is stated, because a correct query can still be
+   reported falsely.** With a 50-row maximum:
+
+   ```text
+   zero rows      proves no duplicates exist in the filtered collection
+   nonzero rows   proves duplicates exist
+   a full page    proves neither exhaustiveness nor an exact total
+   ```
+
+   Absence of a title from a truncated page never proves that title unique, and
+   an exact count of duplicate tasks or duplicate groups is not inferable from a
+   page that may be truncated. The prompt says so in those terms. Extending this
+   to exact named-title membership, exact counts, or full pagination is a
+   separate decision with its own bounded-query proof, and is deliberately not
+   taken here: doing it by adding a free-text title filter would relitigate D-73.
+
+7. **Rule 11 is preserved rather than quietly inverted.** The prompt still
+   forbids a redundant `list_tasks` merely to verify a mutation that already
+   succeeded. What it now also says is that a *later* user request about current
+   state gets a fresh authoritative read. Same request, trust the mutation
+   result; new request, read current state.
+
+8. **D-73 is not weakened.** A deleted task stays historically discoverable
+   through `resolve_task_reference` with `exists_now=false` and a null current
+   version, and stays valid for `get_task_history`. It is never a current
+   mutation target and never a current duplicate. Historical discoverability and
+   current-state authority are separate contracts.
+
+9. **The two decisions meet at one sequence, and it is a gate rather than a
+   remark.**
+
+   ```text
+   two tasks share a title      -> both are current duplicates
+   delete one                   -> the group dissolves
+   undo that                    -> the same row returns under its original id
+                                -> the group reforms
+   ```
+
+   That only holds if duplicate membership is computed from current rows and
+   never from whether a task once existed or was deleted.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It changes no policy, approval, idempotency, or
+undo semantics, and it does not alter D-71 authorization, D-73 resolution, the
+D-74 ceilings, or the D-75 data-movement contract.

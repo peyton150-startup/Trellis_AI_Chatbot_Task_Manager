@@ -97,9 +97,29 @@ def list_tasks(
     *,
     conn: Connection,
 ) -> list[Task]:
-    """Read one owner's tasks with the closed, bounded SQL filters."""
+    """Read one owner's tasks with the closed, bounded SQL filters.
+
+    D-77 adds one branch and no new authority. Both statements carry the same
+    owner predicate, the same four filters, the same ordering, and the same
+    LIMIT; the duplicate variant additionally keeps only rows whose title occurs
+    more than once among the rows the filters already selected.
+
+    Which statement runs is decided here rather than by composing a predicate,
+    because the duplicate read is a three-stage query whose stage order is its
+    correctness condition. See `SELECT_DUPLICATE_TASKS_FOR_OWNER`.
+
+    Duplicate membership is a fact about rows that exist in `tasks` right now.
+    `task_events` is not consulted and cannot contribute a member: a deleted task
+    keeps its durable history and stops being a current duplicate at the moment
+    its row goes away.
+    """
+    statement = (
+        sql.SELECT_DUPLICATE_TASKS_FOR_OWNER
+        if arguments.duplicates_only
+        else sql.SELECT_TASKS_FOR_OWNER
+    )
     rows = conn.execute(
-        sql.SELECT_TASKS_FOR_OWNER,
+        statement,
         {
             "owner_id": owner_id,
             "status": _enum_value(arguments.status),
