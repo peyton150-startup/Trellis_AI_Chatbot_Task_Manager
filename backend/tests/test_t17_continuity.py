@@ -135,13 +135,11 @@ def test_successor_is_born_with_canonical_history(db):
 
     assert successor.id != root.id
 
-    # Prompt remains the newest accepted user message. It is not replaced by
-    # inherited conversation context.
-    assert successor.prompt == "Second prompt"
-
     # This assertion occurs immediately after create_turn, before any model
     # invocation. The successor was born with the snapshot; there was no
-    # create-empty-then-patch step.
+    # create-empty-then-patch step. `create_turn` now returns the committed
+    # creation result rather than a whole run, so the prompt is asserted below
+    # against the stored row, which is the stronger place for it anyway.
     assert successor.message_history == canonical
     assert runs.load_history(successor.id, ACTOR_ID) == canonical
 
@@ -155,6 +153,8 @@ def test_successor_is_born_with_canonical_history(db):
     ).fetchone()
     db.commit()
 
+    # Prompt remains the newest accepted user message. It is not replaced by
+    # inherited conversation context.
     assert stored["prompt"] == "Second prompt"
     assert stored["message_history"] == canonical
 

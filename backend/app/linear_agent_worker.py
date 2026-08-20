@@ -80,7 +80,6 @@ log line.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import signal
 import sys
@@ -89,6 +88,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic_ai import DeferredToolRequests
+from pydantic_core import to_jsonable_python
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 from . import agent as agent_module
@@ -659,21 +659,25 @@ def _execute(row: dict, *, agent=None) -> dict:
     ack_error = _emit(access_token, session_id, {"type": "thought", "body": ACK_BODY})
 
     continuity_run_id = _continuity_run_id(row["organization_id"], session_id)
-    run = runs.create_turn(
+    created = runs.create_turn(
         settings.actor_id, prompt, settings.model_id, continuity_run_id
     )
 
     # Before the model. See the module docstring: this write is the guard.
     with pool.connection() as conn:
-        conn.execute(sql.SET_LINEAR_INBOX_RUN, {"id": row_id, "run_id": run.id})
+        conn.execute(sql.SET_LINEAR_INBOX_RUN, {"id": row_id, "run_id": created.id})
         conn.commit()
 
-    history = runs.load_history(run.id, settings.actor_id)
-    message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(history))
+    # The starting snapshot came back from the committed creation above, so
+    # the worker does not re-read what it just wrote. Server-owned history is
+    # still the only history the model sees.
+    message_history = ModelMessagesTypeAdapter.validate_python(
+        created.message_history
+    )
 
     effects = agent_module.RunEffects()
     deps = agent_module.TrellisDeps(
-        actor_id=settings.actor_id, run_id=run.id, effects=effects
+        actor_id=settings.actor_id, run_id=created.id, effects=effects
     )
     runtime = agent if agent is not None else agent_module.get_linear_agent()
 
@@ -682,14 +686,12 @@ def _execute(row: dict, *, agent=None) -> dict:
             runtime.run(prompt, message_history=message_history, deps=deps)
         )
     except Exception:
-        return _handle_execution_failure(row, run.id, effects, access_token)
+        return _handle_execution_failure(row, created.id, effects, access_token)
 
-    runs.save_history(
-        run.id, json.loads(ModelMessagesTypeAdapter.dump_json(result.all_messages()))
-    )
+    runs.save_history(created.id, to_jsonable_python(result.all_messages()))
     usage = result.usage
     runs.record_usage(
-        run.id,
+        created.id,
         model_calls=usage.requests,
         tool_calls=usage.tool_calls,
         input_tokens=usage.input_tokens,
@@ -697,15 +699,15 @@ def _execute(row: dict, *, agent=None) -> dict:
     )
 
     if isinstance(result.output, DeferredToolRequests):
-        return _handle_unsupported_capability(row, run.id, access_token)
+        return _handle_unsupported_capability(row, created.id, access_token)
 
-    runs.set_status(run.id, RunStatus.COMPLETED)
+    runs.set_status(created.id, RunStatus.COMPLETED)
     delivery_error = _emit(
         access_token, session_id, {"type": "response", "body": str(result.output)}
     )
     _complete_and_advance(
         row_id,
-        run_id=run.id,
+        run_id=created.id,
         organization_id=row["organization_id"],
         agent_session_id=session_id,
         last_error=delivery_error or ack_error,
@@ -713,7 +715,7 @@ def _execute(row: dict, *, agent=None) -> dict:
     return {
         "outcome": OUTCOME_COMPLETED,
         "row_id": row_id,
-        "run_id": run.id,
+        "run_id": created.id,
         "delivery_error": delivery_error,
     }
 

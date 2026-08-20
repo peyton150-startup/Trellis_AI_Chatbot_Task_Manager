@@ -2579,3 +2579,124 @@ not reproduce the rendered-geometry claims, because no browser was available to
 it either; it verified the CSS cascade outcome by specificity and source order
 instead and said plainly that this supports rather than proves the visual
 result.
+
+## D-75: run history and ownership data movement
+
+**Local role:** Narrows what the model startup path moves between PostgreSQL
+and this process. Continuation became one `INSERT ... SELECT` that authorizes
+the predecessor, proves it completed, copies its canonical history, creates the
+successor, and returns the new id with its starting snapshot. `create_turn`
+returns a small `CreatedTurn` instead of a whole `AgentRun`, so neither Browser
+nor Linear re-reads the history it just committed. `load_history` selects the
+history column, a new `runs.assert_owned` answers ownership with an existence
+check, history conversions drop their intermediate JSON encodings, and the
+unused `RETURNING *` on the history write is gone.
+
+**Whole-system role:** This is the path every ordinary turn takes, so it is the
+one place where redundant reads are paid on each interaction rather than
+occasionally. It controls the risk that a narrowing of convenience quietly
+becomes a narrowing of authority: each shortened statement keeps the actor
+predicate that made the long one safe, and the D-67 refusal stays a single
+indistinguishable outcome for missing, foreign, and non-completed predecessors.
+It also establishes, with measurement rather than intuition, that the local
+history machinery is not where a Trellis turn spends its time, which is what
+justifies leaving the riskier candidates unbuilt.
+
+**Inputs and dependencies:** D-67 continuity eligibility, D-71 history
+authorization, the D-15 precedent that `load_history` resolves ownership
+itself, the `SELECT_RUN` refusal shape, psycopg's dict rows and JSONB handling,
+and pinned `pydantic-ai==2.27.0` for `validate_python` and
+`pydantic_core.to_jsonable_python`.
+
+**Outputs and consumers:** `runs.CreatedTurn`, `runs.assert_owned`,
+`sql.INSERT_RUN_INHERITING_HISTORY`, `sql.SELECT_RUN_HISTORY`,
+`sql.SELECT_RUN_OWNERSHIP`. Consumed by the Browser turn path in `agent.py`,
+the Linear worker turn path, and the idempotency replay preflight.
+`sql.INSERT_RUN_WITH_HISTORY` and `runs._load_completed_owned_run` are removed;
+CI fails if the former returns.
+
+**Verification:** `cd backend && ruff check .` clean;
+`cd backend && pytest -m "not network"` at 335 passed, 13 deselected;
+`cd frontend && npm run build` succeeds. Equivalence for both conversion
+changes is proven through a real PostgreSQL JSONB round trip, comparing stored
+rows and reloaded semantics rather than letting a new serializer and a new
+loader agree with each other. That proof is committed as
+`test_history_conversion_survives_a_real_jsonb_round_trip`, and it carries the
+message parts this path really moves, `ThinkingPart` included, rather than a
+plain dict. It was originally run as an uncommitted author probe; the neutral
+review found the claim true but not reproducible from the commit, which is the
+same defect D-21 exists to prevent, so the probe became a test. Measurement used a warmed pool and 120
+iterations: `create_turn` 3.738 ms at 154 bytes of history and 4.111 ms at
+30,220 bytes; `load_history` 2.094 ms and 2.631 ms across the same range;
+in-process conversion 0.038 ms to 1.192 ms.
+
+Author mutation audit, each mutant applied to production source, observed, then
+the exact source restored:
+
+| mutation | caught by |
+| --- | --- |
+| actor predicate removed from `SELECT_RUN_HISTORY` | `test_load_history_narrow_read_preserves_ownership` |
+| actor predicate removed from `SELECT_RUN_OWNERSHIP` | `test_replay_preflight_is_actor_scoped` |
+| actor predicate removed from the continuation insert | `test_only_owned_completed_run_can_seed_successor`, `test_invalid_continuity_claims_refuse_indistinguishably` |
+| `status = 'completed'` removed from the continuation insert | `test_only_owned_completed_run_can_seed_successor` |
+
+The second row is the one worth reading. On first run that mutant survived the
+entire suite: `idempotency.replay_completed` had no direct test, so its
+ownership predicate could be deleted with 333 tests still green. The narrowing
+in this task is only safe because that predicate holds, so the missing test was
+written before the narrowing was accepted, and it now kills the mutant.
+
+The three new tests live in `backend/tests/test_d75_run_history.py`. They were
+written into `test_invariants.py` and `test_t17_continuity.py` first, and CI
+caught that: D-29 fixes the named invariant suite at exactly fifteen tests, and
+T00L counts them. The count is a real boundary rather than an inconvenience,
+because `test_invariants.py` is the enumeration of the named invariants and not
+a general home for tests, so the new proofs moved to their own file and both
+existing files returned to their prior shape. The mutants above were re-run
+against the relocated tests and are still caught.
+
+**Limitations and review status:** Two findings are recorded here and
+deliberately not fixed, because each needs its own decision.
+
+The first is that `Agent(tool_timeout=...)` does not bound Trellis's tools. All
+eight tools in `tools.py`, the mutating ones included, are synchronous `def`
+functions. In the pinned environment, `FunctionToolset.call_tool` wraps the call
+in `anyio.fail_after`, but a sync tool reaches it through
+`anyio.to_thread.run_sync`, whose default is not to abandon the thread on
+cancellation. An executable probe with a paired async control showed the async
+tool timing out on schedule and emitting a retry prompt, while the sync tool ran
+to completion and returned its value with no timeout and no retry. This differs
+from what pydantic-ai 2.27.0's own timeout documentation describes. The
+consequence is narrow but should not be overstated: the configured 20 second
+tool timeout must not be treated as a wall-clock bound on Trellis's synchronous
+PostgreSQL tools. A lower layer such as a database statement timeout or a
+connection failure could still end the operation. A related interaction was also
+measured: because a slow sync tool is not released at the timeout and the agents
+are built with `max_concurrency=1`, a second run on the same Agent waits for the
+whole tool duration. Two overlapping runs on one Agent finished at 1.53 s and
+3.05 s against a 1.5 s tool. Browser and Linear hold separate Agent objects and
+do not share a slot; both finished at about 1.53 s when run in parallel.
+
+The second is that reasoning from an earlier user turn is sent back to the
+provider. A `ThinkingPart` survives this codebase's persistence round trip
+intact, and on the next turn `OpenAIChatModel` re-emits it, inlined into the
+assistant content as `<think>` tags for a part with no provider field id. If the
+deployed model is Nemotron 3.5 Lightning, NVIDIA's guidance is that a new user
+turn should carry prior assistant content but not prior reasoning, which makes
+this a provider-compatibility question as well as wasted prefill that grows with
+every turn. It is unpatched here because the deployed `MODEL_ID` is
+environment-supplied and was not available, and because the correct fix has to
+distinguish same-run tool-step reasoning from an older completed turn rather
+than disabling thinking history globally.
+
+No live provider evidence was collected. `MODEL_ID` and `NVIDIA_API_KEY` are
+absent from this environment, so provider TTFT, reasoning cost, real tool
+selection, provider retry incidence, and prefill latency are unmeasured, and no
+provider-side setting was changed. The Linear idle poll remains 2 seconds and
+the courtesy acknowledgement remains synchronous ahead of model start; both are
+reported rather than tuned, and each is larger than everything this task
+optimized. One full-suite run during development produced eight setup errors in
+`tests/test_request_limits.py` while the machine was loaded, at 288 s against a
+typical 110 s; that file passes 29 of 29 in isolation and two subsequent full
+runs were clean, so it is recorded as an observed flake rather than a fixed one.
+This entry records author-run verification only; neutral review is pending.

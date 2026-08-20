@@ -5977,3 +5977,96 @@ jobs:
           echo "PASS D74C: reintroduces flattening, and the card preserves them"
           echo "PASS D74C: visually while still rendering notes as escaped React"
           echo "PASS D74C: text with no HTML injection path"
+
+  d75-run-history-data-movement:
+    name: D75 run history data movement
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # The authority half. Narrowing a read must not narrow who may perform
+      # it, so the refusal shape is what this gate pins: owned yields history,
+      # while foreign and missing remain one indistinguishable refusal.
+      - name: Prove the narrowed reads keep their ownership predicates
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check app/runs.py app/sql.py app/agent.py app/idempotency.py app/linear_agent_worker.py tests/test_d75_run_history.py
+          pytest tests/test_d75_run_history.py -v
+          pytest tests/test_t17_continuity.py -v
+
+      # The statement half. These three predicates carry the whole D-67
+      # refusal contract, and a future tidy-up that drops one is invisible to
+      # any test that only exercises the happy path.
+      - name: Prove the continuation statement keeps its predicates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq 'AND predecessor.actor_id = %(actor_id)s' backend/app/sql.py \
+            || { echo "FAIL continuation insert lost its actor predicate"; exit 1; }
+
+          grep -Fq "AND predecessor.status = 'completed'" backend/app/sql.py \
+            || { echo "FAIL continuation insert lost its completed predicate"; exit 1; }
+
+          grep -Fq 'RETURNING id, message_history;' backend/app/sql.py \
+            || { echo "FAIL continuation insert no longer returns the starting snapshot"; exit 1; }
+
+          grep -Fq 'AND actor_id = %(actor_id)s' backend/app/sql.py \
+            || { echo "FAIL a narrowed run read lost its actor predicate"; exit 1; }
+
+          if grep -Fq 'INSERT_RUN_WITH_HISTORY' backend/app/sql.py; then
+            echo "FAIL the superseded two-step continuation insert is back"
+            exit 1
+          fi
+
+          echo "PASS D75 continuation statement predicates"
+
+      - name: Run cumulative non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Report the run history data movement boundary
+        run: |
+          echo "PASS D75: continuation authorizes, copies canonical history, and"
+          echo "PASS D75: creates the successor in one statement, returning the"
+          echo "PASS D75: starting snapshot so no caller re-reads what it wrote"
+          echo "PASS D75: history and ownership reads select what they need, with"
+          echo "PASS D75: every actor predicate intact and mutation-proven"
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v

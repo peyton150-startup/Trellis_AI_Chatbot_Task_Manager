@@ -3419,3 +3419,69 @@ new error code, new dependency, model or tool-call budget, token budget,
 concurrency limiter, semantic loop detection, history compaction, rate limiting,
 or authentication. It changes no domain, SQL, policy, idempotency, undo, or
 approval semantics, and it does not touch D-73 reference resolution.
+
+### D-75: narrow the run and history reads on the model startup path
+
+Every ordinary turn creates a run, hands the model its canonical starting
+history, and persists the result. That path moved more state than it used, and
+this decision narrows it without moving a single authority boundary. It is a
+data-movement decision, not a semantics decision.
+
+1. **Continuation is one statement.** `INSERT_RUN_INHERITING_HISTORY` selects
+   the predecessor's `message_history` into the successor row, carrying the
+   predecessor id, the actor predicate, and `status = 'completed'` as its WHERE
+   clause. Previously the predecessor was loaded into Python as a whole
+   `AgentRun`, its history extracted, and that history sent back to PostgreSQL
+   as an INSERT parameter. The history no longer round trips through this
+   process. The refusal is unchanged and remains one refusal: a missing
+   predecessor, another actor's predecessor, and a predecessor that is not
+   completed all match no row, insert nothing, and raise `OutOfScopeError`.
+
+2. **Creation returns what creation knows.** `create_turn` returns a
+   `CreatedTurn` carrying the new id and its starting history, both of which
+   come back from the committed write. Callers no longer immediately ask the
+   database to re-read what they just stored. This is deliberately not a
+   partially populated `AgentRun`: a run model missing most of its fields
+   invites a caller to read one that the write never returned.
+   `runs.load_history` remains the way to read an already-existing run, and
+   remains the single function that reads history.
+
+3. **Reads select what they need.** `load_history` selects the history column
+   rather than the whole row, and a new `runs.assert_owned` answers the
+   ownership question with an existence check instead of materializing a run
+   and its entire history. Both statements keep the same actor predicate
+   `SELECT_RUN` carries. Narrowing what crosses the wire does not narrow who
+   may read it, and the D-71 refusal shape is unchanged.
+
+4. **The conversions stop encoding what nothing decodes.** History loads with
+   `validate_python` against the rows psycopg already returns, and saves with
+   `to_jsonable_python`, rather than each building a complete intermediate JSON
+   encoding that only the adjacent call consumed. Equivalence is proven through
+   a real PostgreSQL JSONB round trip: the stored rows are identical and the
+   reloaded messages are semantically identical.
+
+5. **Measurement decided the scope, and it closed more candidates than it
+   opened.** With a warmed pool against real PostgreSQL, `create_turn` and
+   `load_history` are flat across a 200x increase in history size: roughly
+   3.7 ms and 2.1 ms at 154 bytes, and 4.1 ms and 2.6 ms at 30 KB. They are
+   dominated by connection acquisition and round trip, not by data volume. The
+   in-process conversion this decision halves is 0.04 ms to 1.2 ms across the
+   same range. Total local history overhead is therefore single-digit
+   milliseconds per turn.
+
+   That evidence **rejects** incremental `new_messages()` persistence, which
+   would have traded prefix-equivalence and concurrency risk against a fraction
+   of those milliseconds. It equally rejects narrowing the status and usage
+   writes, and rejects patching the D-74 accepted-body join: that join is a
+   real bounded redundant allocation, but it buys no measurable latency and the
+   ASGI replay rework is not worth spending on that.
+
+6. **Two findings are recorded rather than fixed, because fixing either is a
+   separate decision.** They are stated in `IMPLEMENTATION_NOTES.md` under the
+   same task. Neither is caused by this change and neither is repaired by it.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, or dependency. It changes no domain, policy, approval, undo, or
+idempotency semantics, and it does not change the order of any kernel check.
+It does not alter D-67 eligibility, D-71 authorization, D-73 resolution, or the
+D-74 ceilings.
