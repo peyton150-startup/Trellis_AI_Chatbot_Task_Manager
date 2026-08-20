@@ -375,10 +375,26 @@ def complete_control_turn(run_id: UUID, message_history: list) -> AgentRun:
     banner, and the note claiming a failed control turn has empty history was
     simply false for that ordering.
 
-    Writing both on one connection removes the ordering rather than documenting
-    it. Either the turn is completed with its history, or neither landed and the
-    history is empty, which is what makes the failure legible: an empty history
-    on a failed control run now means what it says.
+    Writing both in one statement removes the ordering rather than documenting
+    it. Either the turn is completed with its history, or neither landed.
+
+    The invariant that follows is "unchanged since creation", not "empty", and
+    the difference matters because a control turn is not always born empty. A
+    root turn is created with no history; a turn inheriting a completed
+    predecessor is created carrying that predecessor's history, and losing it on
+    failure would be its own defect.
+
+        root turn        stays []
+        inherited turn   stays H
+
+    What must never appear is a partial control exchange. The synthetic user
+    message and response land only in the same transaction that transitions the
+    run to `completed`.
+
+    `AND status = 'running'` makes the transition one way, so this cannot
+    overwrite a run that already reached a terminal status. Zero rows means
+    something else finished it first, and that is `RunAlreadyTerminalError`
+    rather than a silent rewrite.
 
     This is deliberately not merged with the undo kernel's transaction. That
     would put a compensating mutation and a conversation transcript in one
@@ -463,10 +479,10 @@ def attempt_run_undo(run_id: UUID, actor_id: UUID) -> UndoAttempt:
     that is the whole reason this function exists rather than each caller pairing
     `detail().can_undo` with `undo.undo_run`.
 
-    That pairing is a TOCTOU boundary, and not a theoretical one. `_can_undo`
-    reads without locking, and the kernel deliberately interprets a `restored`
-    event rather than refusing one, so two concurrent callers can both observe an
-    eligible run and both compensate it. The lock below is what closes it:
+    That pairing is a TOCTOU boundary. `_can_undo` reads without locking, and
+    the kernel deliberately interprets a `restored` event rather than refusing
+    one, so two concurrent callers can both observe an eligible run and both
+    reach the kernel.
 
         1. `SELECT_RUN_FOR_UNDO` takes a row lock on the actor-owned run.
         2. Status, the event wave, and the compensation check are evaluated
@@ -475,10 +491,26 @@ def attempt_run_undo(run_id: UUID, actor_id: UUID) -> UndoAttempt:
         3. `undo.undo_run_on_conn` runs on this same connection, so the lock is
            still held across the kernel's precheck, apply pass, and commit.
 
-    A second caller blocks at step 1, wakes after the first commits, reads the
-    compensation wave the first attempt wrote, and refuses at step 2. For one
-    target run and any number of concurrent attempts, at most one reports
-    `applied > 0`.
+    **What the lock is load bearing for is narrower than it looks, and the
+    author mutation audit is what established that.** Dropping `FOR UPDATE` left
+    the whole suite green, because safety does not actually rest on it:
+
+        Safety
+            the kernel's own guards ensure at most one compensation applies. A
+            delete-undo collides on the primary key, an update-undo on the
+            version guard, and a create-undo finds its rows already gone.
+
+        Serialization
+            `FOR UPDATE` ensures every competing loser observes the
+            authoritative post-compensation state and therefore receives the
+            correct refusal reason.
+
+    Both are required, and the second is not cosmetic. Under the lock a loser
+    reports ALREADY_COMPENSATED, which is true. Without it a loser reaches the
+    kernel and refuses ROW_RECREATED, and the control turn then tells a human
+    that someone else recreated their task: a false explanation of a correct
+    outcome. The concurrency regression asserts the losers' reason, not merely
+    their count, which is why that mutation is now caught.
 
     Missing and foreign remain one refusal, raised as `OutOfScopeError` before
     anything about the run is disclosed.

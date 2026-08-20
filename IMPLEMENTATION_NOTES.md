@@ -2828,10 +2828,16 @@ passing at the reviewed SHA.
   committed followed by a failing status write left a FAILED run carrying a
   fully formed "Undone." transcript, which made the note's unqualified claim of
   empty history on a failed turn false for that ordering. `complete_control_turn`
-  now writes both in one transaction, so an empty history on a non-completed
-  control run means what it says. Proven by breaking the status statement and
-  asserting neither half landed, and mutation-proven by splitting the
-  transaction back apart.
+  now writes both in one statement, so the two cannot separate.
+
+  The invariant that follows is "unchanged since creation", not "empty", and the
+  distinction is the one the original wording got wrong. A control turn is not
+  always born empty: a root turn starts with no history, while a turn inheriting
+  a completed predecessor is created already carrying it, and losing that on
+  failure would be its own defect. A failed turn keeps exactly what it was
+  created with, and the synthetic user message and response land only in the
+  same transaction that records `completed`. Both shapes are tested, and the
+  split-transaction mutation is caught.
 
   A failure in the failure-marking write itself re-raised the symptom and hid
   the cause. The original error now propagates while the secondary one is logged
@@ -2870,11 +2876,26 @@ passing at the reviewed SHA.
   turn's inherited history. `onRunFailed` now runs the same server query run end
   runs, with the unchanged rule that only a `completed` run may be promoted.
 
-  That last fix is proven by the structural CI gate and by reading, not by a
-  unit test. Extracting the reconciliation into a testable module would move the
+  That last fix has no unit test, and the reason is a trade rather than an
+  oversight: extracting the reconciliation into a testable module would move the
   two literals the T17 gate asserts out of `Chat.tsx` and amend an earlier
-  task's check a second time, which is not worth a unit test. This is a real
-  coverage gap and is recorded as one.
+  task's check a second time, which is not worth a unit test.
+
+  So the D-76 gate asserts the whole wiring instead of the existence of a
+  callback name, and the gate itself is mutation-proven. It parses `Chat.tsx`
+  and requires that `onRunFailed` calls the reconciler, that the reconciler asks
+  the server through `fetchRun`, that promotion sits inside the
+  `detail.status === "completed"` condition, and that exactly one promotion
+  exists in that function. Four mutations were run against the gate, not against
+  a test: rewiring the failure hook to a different event, making it a no-op,
+  promoting unconditionally, and replacing the server read with a resolved
+  literal. All four are caught.
+
+  What this still is not is a browser behavioural test. Nothing here proves the
+  runtime actually invokes `onRunFailed` when a stream dies, or that the ordering
+  of a delayed failure callback against a newer run is safe. That gap is real and
+  is recorded as one; it is the difference between "the wiring cannot be deleted
+  without CI noticing" and "the wiring demonstrably fires".
 
 - Deterministic suites now block live provider requests at the bootstrap.
   `tests/conftest.py` sets `models.ALLOW_MODEL_REQUESTS` False for every test

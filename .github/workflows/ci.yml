@@ -6202,8 +6202,47 @@ jobs:
 
           # Continuity is reconciled against the server after a transport
           # failure, and is still only ever promoted on a completed run.
-          grep -Fq 'onRunFailed' frontend/components/Chat.tsx \
-            || { echo "FAIL continuity is not reconciled after a transport failure"; exit 1; }
+          #
+          # This path has no unit test. Extracting it into a testable
+          # module would move the two literals the T17 gate asserts out of
+          # Chat.tsx and amend an earlier task's check a second time, which
+          # is not worth a unit test. So the gate asserts the whole wiring
+          # rather than the existence of a callback name: the failure hook
+          # must call the reconciler, the reconciler must ask the server,
+          # and promotion must sit inside the completed-only condition.
+          # Each of the three is separately mutation-proven.
+          python - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path("frontend/components/Chat.tsx").read_text(encoding="utf-8")
+
+          if not re.search(r"onRunFailed:\s*\(\)\s*=>\s*\{\s*reconcileContinuity\(\);", src):
+              sys.exit("FAIL onRunFailed does not call reconcileContinuity")
+
+          body = re.search(
+              r"const reconcileContinuity = useCallback\(\(\) => \{(.*?)\n  \}, \[agent\]\);",
+              src,
+              re.S,
+          )
+          if body is None:
+              sys.exit("FAIL the reconciler is gone or was restructured")
+          body = body.group(1)
+
+          if "fetchRun(runId)" not in body:
+              sys.exit("FAIL reconciliation does not ask the server for run state")
+
+          guarded = re.search(
+              r'if \(detail\.status === "completed"\) \{\s*agent\.setContinuityRunId\(runId\);\s*\}',
+              body,
+          )
+          if guarded is None:
+              sys.exit("FAIL continuity promotion is not gated on a server-completed run")
+
+          promotions = body.count("setContinuityRunId(")
+          if promotions != 1:
+              sys.exit(f"FAIL {promotions} continuity promotions in the reconciler; exactly one, inside the guard")
+
+          print("PASS continuity reconciliation is wired and completed-only")
+          PY
 
           # Deterministic suites must not be able to reach a provider.
           grep -Fq 'ALLOW_MODEL_REQUESTS' backend/tests/conftest.py \

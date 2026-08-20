@@ -705,17 +705,27 @@ SELECT *
 # without locking anything. Two browsers asking at the same moment both get true,
 # and both then call the kernel. The kernel deliberately understands a `restored`
 # event rather than refusing one, because its precheck has to interpret the
-# compensation wave it may itself have written, so nothing inside it stops the
-# second caller from compensating an already-compensated run. The predicate that
-# does stop it lives in the eligibility rule, and that rule has to be evaluated
-# where the second caller cannot have read it before the first caller committed.
+# compensation wave it may itself have written, so nothing inside it refuses the
+# second caller on eligibility grounds.
 #
-# FOR UPDATE on the run row is that place. The second attempt blocks here, wakes
-# after the first transaction commits, then reads the events the first attempt
-# wrote and refuses on the compensation wave it can now see. The lock is on
-# `agent_runs` rather than on the affected tasks because the undo unit is a run:
-# a run that deleted every one of its tasks locks no task rows at all, so task
-# locks would serialize exactly the runs that need it least.
+# What that second caller would hit instead is the kernel's own guards, and the
+# author mutation audit proved they are sufficient for safety on their own:
+# removing this lock left every test green. A delete-undo collides on the primary
+# key, an update-undo on the version guard, and a create-undo finds its rows
+# already gone. So the invariant has two halves:
+#
+#     Safety         the kernel's guards ensure at most one compensation applies
+#     Serialization  FOR UPDATE ensures every loser observes the authoritative
+#                    post-compensation state and returns the correct reason
+#
+# Both are required. Under this lock a loser reports that the run was already
+# compensated, which is true. Without it a loser refuses ROW_RECREATED, and the
+# control turn tells a human someone else recreated their task: a false
+# explanation of a correct outcome.
+#
+# The lock is on `agent_runs` rather than on the affected tasks because the undo
+# unit is a run: a run that deleted every one of its tasks locks no task rows at
+# all, so task locks would serialize exactly the runs that need it least.
 #
 # Missing and foreign remain one refusal. Both match no row, exactly as
 # `SELECT_RUN` does, so a caller cannot learn from the answer whether a run id
