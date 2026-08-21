@@ -126,8 +126,23 @@ TaskNotes = Annotated[str, Field(max_length=TASK_NOTES_MAX_CHARS)]
 # with a version increment and an event would record a mutation that did not
 # happen. The upper bound is a cheap early refusal; the binding check is the
 # merged size, which cannot be known until the authoritative row is locked.
+#
+# The description is part of the JSON schema Pydantic AI generates and sends to
+# the provider, so it states the append contract at the field itself rather than
+# leaving it to be inferred from the tool description alone. The distinction
+# then reaches the model in three mutually reinforcing places: the system
+# prompt, the tool description, and this parameter schema.
 AppendedTaskNotes = Annotated[
-    str, Field(min_length=1, max_length=TASK_NOTES_MAX_CHARS)
+    str,
+    Field(
+        min_length=1,
+        max_length=TASK_NOTES_MAX_CHARS,
+        description=(
+            "Only the new note text to append. "
+            "Do not include the task's existing notes. "
+            "The server preserves the existing notes and appends this fragment."
+        ),
+    ),
 ]
 UserMessageText = Annotated[str, Field(max_length=BROWSER_USER_MESSAGE_MAX_CHARS)]
 PlanSummary = Annotated[str, Field(max_length=PLAN_SUMMARY_MAX_CHARS)]

@@ -263,6 +263,50 @@ def test_the_model_facing_schema_carries_the_append_contract():
     assert constraint["minLength"] == 1
     assert constraint["maxLength"] == TASK_NOTES_MAX_CHARS
 
+    # The field carries its own meaning, not only its bounds. A model reading
+    # the parameter schema alone must still learn not to send back the notes it
+    # already has. The description sits on the string branch of the anyOf that
+    # the optional field generates, not at the property's top level.
+    assert "Only the new note text" in constraint["description"]
+    assert "Do not include" in constraint["description"]
+
+
+def test_the_displayed_profile_chain_holds_end_to_end():
+    """Close the gap between the enum the header parses and the real profile.
+
+    The frontend gate reads the `ToolName` enum out of source text, but the
+    authority for what the browser agent can actually do is `ALL_TOOLS`, and the
+    authority for what the model is offered is the generated function tools.
+    Those three agree today only because `ALL_TOOLS` is defined as every
+    `ToolName`.
+
+        header labels  <-> ToolName          the frontend cross-boundary test
+        ToolName       <-> ALL_TOOLS         asserted here
+        ALL_TOOLS      <-> function_tools    asserted here
+
+    Without the two links below, a refactor that made `ALL_TOOLS` narrower than
+    `ToolName` would leave the header advertising capabilities the browser agent
+    no longer has, with every existing gate still green.
+    """
+    from pydantic_ai.models.test import TestModel
+
+    from app import agent as agent_module
+    from app.models import ToolName
+
+    test_model = TestModel(call_tools=[])
+    built = agent_module.build_agent(test_model)
+    built.run_sync(
+        "hello",
+        deps=agent_module.TrellisDeps(actor_id=ACTOR_ID, run_id=uuid4()),
+    )
+
+    offered = {
+        tool.name for tool in test_model.last_model_request_parameters.function_tools
+    }
+
+    assert agent_module.ALL_TOOLS == frozenset(name.value for name in ToolName)
+    assert offered == set(agent_module.ALL_TOOLS)
+
 
 # ------------------------------------------------- what the merge produces
 

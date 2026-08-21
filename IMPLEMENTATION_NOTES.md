@@ -3149,10 +3149,20 @@ assert that its target was found; the script does.
   length invariant rather than as validation so the record does not claim more
   than the code does.
 - The cross-boundary tool gate parses the `ToolName` enum text rather than
-  importing `agent.ALL_TOOLS`. The authority is `ALL_TOOLS`, and the two agree
-  today only because `ALL_TOOLS` is defined as every `ToolName`. A capability
-  profile refactor could separate them while the parser still passes. The
-  parser also had to be taught to normalize CRLF, which is the kind of
-  brittleness that argues for executing the value instead of reading it.
+  importing `agent.ALL_TOOLS`, and the parser had to be taught to normalize
+  CRLF, which is the kind of brittleness that argues for executing a value
+  rather than reading its source. The gap that mattered is now closed from the
+  backend side instead of by rewriting the parser. The chain is asserted end to
+  end:
+
+  ```text
+  header labels  <-> ToolName          frontend cross-boundary test
+  ToolName       <-> ALL_TOOLS         backend assertion
+  ALL_TOOLS      <-> function_tools    the model-facing schema
+  ```
+
+  A refactor making `ALL_TOOLS` narrower than `ToolName` now fails CI rather
+  than leaving the header advertising capabilities the browser agent no longer
+  has. Mutation M15 is exactly that refactor and is caught.
 - Neutral blind review not yet run. Deferred by the user so that one review
   covers this PR and the D-79 PR together.
