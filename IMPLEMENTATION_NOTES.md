@@ -3056,3 +3056,89 @@ reforms under the original id with a forward version) is a single test.
   provider-compatibility finding, not authority to weaken the deterministic
   contracts.
 - This entry records author-run verification only; neutral review is pending.
+
+## D-78: deterministic single-task note append
+
+**Local role:** `update_task` gains `append_notes`, carrying only new note text.
+`domain.merge_appended_notes` joins it to the authoritative current value behind
+the row lock the mutation already takes, and `domain._effective_update` turns the
+append request into an ordinary replacement before the guarded UPDATE sees it.
+The page header gains the browser agent's tool profile.
+
+**Whole-system role:** it removes one place where the model was the temporary
+owner of authoritative state. Honouring "add a note" previously required the
+model to read the current notes, join them from memory, and send the whole value
+back, so anything that changed in between was overwritten by a write that reads
+in the audit log as a deliberate replacement. `expected_version` does not catch
+it: a stale note travels happily inside a call carrying a current version. This
+is the same class of defect as D-77, where a persisted pre-delete snapshot
+implied a task still existed, and the same shape of fix, which is to make
+deterministic code state the thing rather than letting a remembered value stand
+in for current truth.
+
+**Inputs and dependencies:** the D-74 `TASK_NOTES_MAX_CHARS` ceiling; the
+existing lock, guarded UPDATE, and idempotency lease; `_update_parameters` and
+its `model_fields_set` contract; `ALL_TOOLS` as the browser capability profile.
+
+**Outputs and consumers:** `append_notes` on `UpdateTaskArgs` only;
+`merge_appended_notes` as the single separator rule;
+`frontend/lib/agentTools.ts` as the one display list, consumed by the page
+header and by the cross-boundary test. A future bulk-append decision would
+consume the merge rule but owes per-row merging, per-row final-size validation,
+and set-based semantics.
+
+**Verification:**
+
+```text
+ruff check .                                clean
+pytest tests/test_d78_note_append.py        31 passed
+pytest -m "not network"                     424 passed, 13 deselected
+npm run test:tools                          6 passed
+npm run build                               compiled, 3 static pages
+```
+
+Author mutation audit, 11 mutations, all caught after one fix:
+
+```text
+M5  separator removed                       15 tests fail
+M6  trailing newline stops separating        2 tests fail
+M7  caller newline normalized away           SURVIVED, then fixed
+M8  fragment sized instead of merged value   2 tests fail
+M9  model_copy replaced by model_validate   13 tests fail
+M10 append moved onto MutableTaskFields      1 test fails
+M11 mutual-exclusion validator removed       2 tests fail
+M1  a ninth backend tool lands               2 tests fail
+M2  a header label dropped                   3 tests fail
+M3  a snake_case wire name displayed         3 tests fail
+M4  a header label renamed                   2 tests fail
+```
+
+**M7 is the one worth recording.** Stripping a caller-supplied leading newline
+inside `_effective_update` passed all 29 tests as originally written. The
+parametrized cases exercise `merge_appended_notes` directly, so a mutation to
+its *caller* left the merge rule provably correct while still editing the user's
+text on the way to PostgreSQL. Two database-level regressions now cover it. The
+general lesson is that a unit test of a pure helper does not protect the path
+that calls it, and mutation testing is what surfaces the difference.
+
+Two earlier mutation attempts, run through a shell heredoc, silently failed to
+apply because the heredoc mangled the backslash escapes, and reported as
+survivors. They were re-run from a script file. A mutation that does not apply
+looks exactly like a mutation the tests caught, so a mutation harness has to
+assert that its target was found; the script does.
+
+**Limitations and review status:**
+
+- Bulk append is not authorized and is structurally prevented rather than
+  merely undocumented: `append_notes` is on `UpdateTaskArgs`, a CI gate asserts
+  it is absent from `MutableTaskFields` and `BulkUpdateTasksArgs`, and a test
+  proves the bulk schema rejects it.
+- No live provider evidence. Whether the configured runtime model reliably
+  routes "add a note" to `append_notes` rather than reconstructing the whole
+  value is a compatibility question, not a correctness one; the typed backend
+  owns the semantics either way. A failing eval would be a prompt finding.
+- The header tool list is written out rather than derived at runtime, because
+  the authoritative profile is server-side and the browser is deliberately not
+  told what exists. The staleness that buys is covered by the cross-boundary
+  test, not by discipline.
+- Neutral blind review not yet run at the time of writing.

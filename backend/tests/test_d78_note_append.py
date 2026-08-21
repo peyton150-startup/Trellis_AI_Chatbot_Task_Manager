@@ -230,6 +230,34 @@ def test_an_append_to_existing_notes(db):
     assert result.tasks[0].notes == "Feed the cows.\nCheck the coop."
 
 
+def test_a_caller_supplied_leading_newline_survives_the_whole_path(db):
+    """The blank line the caller asked for is content, and reaches the row.
+
+    This exists as a separate database-level case because the merge function's
+    own unit test cannot protect it. A mutation that normalizes the fragment in
+    `_effective_update`, before the merge is ever called, leaves
+    `merge_appended_notes` correct and every parametrized case passing while
+    still editing the caller's text on the way to PostgreSQL.
+    """
+    run_id = _run()
+    task = _task(db, run_id, notes="alpha")
+
+    result = _append(db, task, "\nbeta")
+
+    assert result.tasks[0].notes == "alpha\n\nbeta"
+    assert _notes(db, task.id) == "alpha\n\nbeta"
+
+
+def test_a_fragment_of_only_whitespace_is_still_the_callers_text(db):
+    """Whitespace is not nothing. `min_length` refuses empty, not blank."""
+    run_id = _run()
+    task = _task(db, run_id, notes="alpha")
+
+    result = _append(db, task, "   ")
+
+    assert result.tasks[0].notes == "alpha\n   "
+
+
 def test_sequential_appends_accumulate(db):
     run_id = _run()
     task = _task(db, run_id, notes="one")

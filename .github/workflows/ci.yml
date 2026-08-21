@@ -6308,6 +6308,122 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  d78-deterministic-note-append:
+    name: D78 deterministic note append
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # The separator rule, the merged-size ceiling, the omitted-versus-null
+      # contract surviving the transformation, and the replay that must not
+      # append twice.
+      - name: Prove deterministic single-task note append
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check app/domain.py app/models.py app/agent.py app/prompts.py tests/test_d78_note_append.py
+          pytest tests/test_d78_note_append.py -v
+
+      - name: Prove append stays single-task and merge-time
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The inheritance boundary is the whole reason bulk append cannot
+          # leak. MutableTaskFields is shared with BulkUpdateTasksArgs, so a
+          # field added there would put an unspecified bulk append in front of
+          # the model: no per-row merge, no per-row final-size check.
+          cd backend
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from app.models import BulkUpdateTasksArgs, MutableTaskFields, UpdateTaskArgs
+
+          if "append_notes" not in UpdateTaskArgs.model_fields:
+              sys.exit("FAIL update_task lost append_notes")
+          if "append_notes" in MutableTaskFields.model_fields:
+              sys.exit("FAIL append_notes is on the shared base and leaks to bulk")
+          if "append_notes" in BulkUpdateTasksArgs.model_fields:
+              sys.exit("FAIL bulk update exposes an unauthorized append")
+          print("PASS append is single-task only")
+          PY
+
+          cd ..
+
+          # The merge must read locked state and validate the merged value, not
+          # the fragment. A legal fragment can still make an illegal note.
+          python - <<'PY'
+          import sys, pathlib
+          src = pathlib.Path("backend/app/domain.py").read_text(encoding="utf-8")
+
+          if "def merge_appended_notes" not in src:
+              sys.exit("FAIL the merge rule is gone")
+
+          lock = src.index("locked = _locked_tasks(owner_id, (arguments.task_id,)")
+          merge = src.index("effective = _effective_update(arguments, before)")
+          if lock >= merge:
+              sys.exit("FAIL the merge no longer happens behind the row lock")
+
+          if "len(merged) > TASK_NOTES_MAX_CHARS" not in src:
+              sys.exit("FAIL the merged value is not what gets size checked")
+
+          # Rebuilding through model_dump marks every field as set, after which
+          # an append that never mentioned due_date clears it.
+          if "model_validate(arguments.model_dump()" in src:
+              sys.exit("FAIL the append transformation destroys model_fields_set")
+          if 'model_copy(update={"notes": merged})' not in src:
+              sys.exit("FAIL the effective arguments are no longer a field-preserving copy")
+
+          print("PASS append merges behind the lock and preserves the fields set")
+          PY
+
+      # The header names the browser agent's capabilities. A frontend-only
+      # assertion cannot keep that honest: eight labels checked against
+      # themselves stay green on the day a ninth tool lands in the backend.
+      - name: Prove the displayed tool list matches the backend profile
+        working-directory: frontend
+        run: npm run test:tools
+
+      - name: Run cumulative non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
   d77-current-state-truth:
     name: D77 current state truth
     runs-on: ubuntu-latest
