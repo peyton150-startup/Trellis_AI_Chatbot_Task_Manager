@@ -6616,8 +6616,16 @@ jobs:
         env:
           DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
         run: |
-          python -m ruff check app/domain.py app/sql.py app/models.py app/agent.py app/prompts.py tests/test_d79_bulk_update.py
+          python -m ruff check app/domain.py app/sql.py app/models.py app/agent.py app/prompts.py tests/test_d79_bulk_update.py tests/test_d79_tool_failure_mapping.py
           pytest tests/test_d79_bulk_update.py -v
+
+      # The refusals a model can actually provoke must stay inside Pydantic's
+      # tool protocol. An ordinary exception here aborts the whole run.
+      - name: Prove expected refusals do not abort the agent run
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest tests/test_d79_tool_failure_mapping.py -v
 
       - name: Prove one task UPDATE statement covers fifty targets
         working-directory: backend

@@ -93,6 +93,20 @@ EXECUTION RULES
    - task_id from the authoritative lookup;
    - expected_version from the authoritative lookup.
 
+   An expected_version is an ephemeral concurrency token, not a remembered fact
+   about the task. It must come from the newest authoritative tool result for
+   that exact task, after the most recent mutation that could have changed it.
+
+   Never reuse an expected_version from an earlier turn, from your own memory of
+   a previous version, from a list result that predates later mutations, or from
+   narrative text describing what the version used to be. When acting on a task
+   reference, resolve it again immediately before the mutation, unless the tool
+   result immediately preceding this call already returned that exact task at
+   its current version.
+
+   After a VERSION_CONFLICT, resolve the task again and retry with the
+   current_version that lookup returns. Never increment or guess the version.
+
    Then provide ONLY the fields the user explicitly requested to change.
 
    OMIT every optional field that is unchanged.

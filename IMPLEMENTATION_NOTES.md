@@ -2616,709 +2616,166 @@ the Linear worker turn path, and the idempotency replay preflight.
 CI fails if the former returns.
 
 **Verification:** `cd backend && ruff check .` clean;
-`cd backend && pytest -m "not network"` at 335 passed, 13 deselected;
-`cd frontend && npm run build` succeeds. Equivalence for both conversion
-changes is proven through a real PostgreSQL JSONB round trip, comparing stored
-rows and reloaded semantics rather than letting a new serializer and a new
-loader agree with each other. That proof is committed as
-`test_history_conversion_survives_a_real_jsonb_round_trip`, and it carries the
-message parts this path really moves, `ThinkingPart` included, rather than a
-plain dict. It was originally run as an uncommitted author probe; the neutral
-review found the claim true but not reproducible from the commit, which is the
-same defect D-21 exists to prevent, so the probe became a test. Measurement used a warmed pool and 120
-iterations: `create_turn` 3.738 ms at 154 bytes of history and 4.111 ms at
-30,220 bytes; `load_history` 2.094 ms and 2.631 ms across the same range;
-in-process conversion 0.038 ms to 1.192 ms.
-
-Author mutation audit, each mutant applied to production source, observed, then
-the exact source restored:
-
-| mutation | caught by |
-| --- | --- |
-| actor predicate removed from `SELECT_RUN_HISTORY` | `test_load_history_narrow_read_preserves_ownership` |
-| actor predicate removed from `SELECT_RUN_OWNERSHIP` | `test_replay_preflight_is_actor_scoped` |
-| actor predicate removed from the continuation insert | `test_only_owned_completed_run_can_seed_successor`, `test_invalid_continuity_claims_refuse_indistinguishably` |
-| `status = 'completed'` removed from the continuation insert | `test_only_owned_completed_run_can_seed_successor` |
-
-The second row is the one worth reading. On first run that mutant survived the
-entire suite: `idempotency.replay_completed` had no direct test, so its
-ownership predicate could be deleted with 333 tests still green. The narrowing
-in this task is only safe because that predicate holds, so the missing test was
-written before the narrowing was accepted, and it now kills the mutant.
-
-The three new tests live in `backend/tests/test_d75_run_history.py`. They were
-written into `test_invariants.py` and `test_t17_continuity.py` first, and CI
-caught that: D-29 fixes the named invariant suite at exactly fifteen tests, and
-T00L counts them. The count is a real boundary rather than an inconvenience,
-because `test_invariants.py` is the enumeration of the named invariants and not
-a general home for tests, so the new proofs moved to their own file and both
-existing files returned to their prior shape. The mutants above were re-run
-against the relocated tests and are still caught.
-
-**Limitations and review status:** Two findings are recorded here and
-deliberately not fixed, because each needs its own decision.
-
-The first is that `Agent(tool_timeout=...)` does not bound Trellis's tools. All
-eight tools in `tools.py`, the mutating ones included, are synchronous `def`
-functions. In the pinned environment, `FunctionToolset.call_tool` wraps the call
-in `anyio.fail_after`, but a sync tool reaches it through
-`anyio.to_thread.run_sync`, whose default is not to abandon the thread on
-cancellation. An executable probe with a paired async control showed the async
-tool timing out on schedule and emitting a retry prompt, while the sync tool ran
-to completion and returned its value with no timeout and no retry. This differs
-from what pydantic-ai 2.27.0's own timeout documentation describes. The
-consequence is narrow but should not be overstated: the configured 20 second
-tool timeout must not be treated as a wall-clock bound on Trellis's synchronous
-PostgreSQL tools. A lower layer such as a database statement timeout or a
-connection failure could still end the operation. A related interaction was also
-measured: because a slow sync tool is not released at the timeout and the agents
-are built with `max_concurrency=1`, a second run on the same Agent waits for the
-whole tool duration. Two overlapping runs on one Agent finished at 1.53 s and
-3.05 s against a 1.5 s tool. Browser and Linear hold separate Agent objects and
-do not share a slot; both finished at about 1.53 s when run in parallel.
-
-The second is that reasoning from an earlier user turn is sent back to the
-provider. A `ThinkingPart` survives this codebase's persistence round trip
-intact, and on the next turn `OpenAIChatModel` re-emits it, inlined into the
-assistant content as `<think>` tags for a part with no provider field id. If the
-deployed model is Nemotron 3.5 Lightning, NVIDIA's guidance is that a new user
-turn should carry prior assistant content but not prior reasoning, which makes
-this a provider-compatibility question as well as wasted prefill that grows with
-every turn. It is unpatched here because the deployed `MODEL_ID` is
-environment-supplied and was not available, and because the correct fix has to
-distinguish same-run tool-step reasoning from an older completed turn rather
-than disabling thinking history globally.
-
-No live provider evidence was collected. `MODEL_ID` and `NVIDIA_API_KEY` are
-absent from this environment, so provider TTFT, reasoning cost, real tool
-selection, provider retry incidence, and prefill latency are unmeasured, and no
-provider-side setting was changed. The Linear idle poll remains 2 seconds and
-the courtesy acknowledgement remains synchronous ahead of model start; both are
-reported rather than tuned, and each is larger than everything this task
-optimized. One full-suite run during development produced eight setup errors in
-`tests/test_request_limits.py` while the machine was loaded, at 288 s against a
-typical 110 s; that file passes 29 of 29 in isolation and two subsequent full
-runs were clean, so it is recorded as an observed flake rather than a fixed one.
-This entry records author-run verification only; neutral review is pending.
-
-## D-76: run-relative natural-language undo bridge
-
-**Local role:** Intercepts a deliberately narrow set of run-relative commands
-("undo that", "recover everything you just deleted") in `handle_agui_request`
-before any agent exists, and answers them from application control flow. It adds
-`runs.attempt_run_undo`, the one authoritative, serialized way to undo a run;
-`runs.create_control_turn`, which opens an `agent_runs` row for a turn no model
-executed; a manual `AGUIEventStream` response built with no `Agent`; and
-`trellisPreviousRunId`, a second browser cursor distinct from D-67 continuity.
-
-**Whole-system role:** Trellis has owned an all-or-nothing undo kernel since T07
-and, until this decision, nothing in production called it. D-76 gives it its
-first caller and deliberately withholds it from the model. The demo claim is that
-deterministic application code owns state, authorization, and compensation while
-the model is measured; an undo the model could reconstruct with `create_task`
-would falsify that claim in the most visible place, because the result would look
-like restoration and would in fact be five new task identities with new
-histories. The risk it controls is authority, not convenience: for an intercepted
-command there are zero provider requests, zero framework runs, zero tool calls,
-and no model input at all beyond the message that classified.
-
-It also closes a concurrency hole that predates it. `RunDetail.can_undo` was the
-only enforcement of "a compensated run is no longer eligible", it reads nothing
-under a lock, and `undo.py` deliberately interprets a `restored` event rather
-than refusing one. Any two surfaces calling the kernel after a separate preflight
-could therefore both compensate one run. T18 will be the second surface.
-
-**Inputs and dependencies:** D-67 continuity and its refusal shape; D-44
-eligibility statuses; D-38 append-only compensation and forward versioning; D-51
-run identity; the T07 kernel; the D-75 `CreatedTurn` shape and history boundary;
-pinned pydantic-ai 2.27.0 (`AGUIEventStream`, `ModelRequest`/`ModelResponse`
-`metadata`, `ModelMessagesTypeAdapter`); ag-ui-protocol 0.1.19 event types.
-
-**Outputs and consumers:** `runs.attempt_run_undo` and `runs.UndoAttempt` are the
-operation T18 must call rather than re-deriving undoability.
-`runs._undo_eligibility` is the single eligibility predicate, read by both
-`RunDetail.can_undo` and the authoritative attempt. `runs.CONTROL_TURN_MODEL`
-marks control runs in the audit row. `undo.undo_run_on_conn` is the
-caller-owned-connection seam. `trellisPreviousRunId` is the transport contract
-the browser now maintains alongside continuity.
-
-**Verification:**
-
-```text
-cd backend && python -m ruff check .
-cd backend && DATABASE_URL=... pytest tests/test_d76_undo_bridge.py -v
-cd backend && DATABASE_URL=... pytest -m "not network"
-cd frontend && npm run test:transport
-cd frontend && npm run build
-```
-
-Observed: 40 passed in `test_d76_undo_bridge.py`; 393 passed and 13 deselected in
-the cumulative backend suite; 9 passed in the frontend transport test; Next.js
-16.3.1 production build compiled and generated 3 static pages.
-
-The pinned-API probe that authorized the design ran before any production edit
-and is reproduced as an executable regression in
-`test_synthetic_history_survives_the_real_persistence_boundary`:
-`AGUIEventStream` constructs and encodes SSE with no `Agent`;
-`ModelRequest`/`ModelResponse` carry `metadata` in 2.27.0; and the
-`to_jsonable_python` -> jsonb -> `ModelMessagesTypeAdapter.validate_python`
-round trip preserves it while leaving `model_name`, `provider_name`, and `run_id`
-null.
-
-Concurrency is proved rather than argued: three threads race one target run
-against real PostgreSQL through a barrier, exactly one reports `applied > 0`, and
-exactly one compensation wave exists afterwards.
-
-The author mutation audit ran 20 structural mutations and initially caught 19,
-plus 4 later mutations on the failure paths, all caught. The survivor
-is worth stating plainly: dropping `FOR UPDATE` from the undo attempt left every
-test green. The at-most-one-applied invariant does not actually depend on the
-lock, because the kernel's guards catch the losers by primary key, by version, or
-by absence. The lock decides the losers' refusal *reason*, and that is not
-cosmetic: without it a loser refuses ROW_RECREATED, and the control turn tells a
-human someone else recreated their task. The regression now asserts that every
-loser refuses as already compensated, which fails without the lock.
-
-The ABA regression creates a task at version N, deletes it, undoes the deletion,
-and then proves a guarded write at `expected_version = N` still matches no row.
-
-Two established gates were amended, which is disclosed here because an earlier
-task's check moving is exactly the thing that should not happen silently. Both
-failed on the first CI run and both were genuine regressions from this task.
-
-`T17 cross-turn continuity` greps for
-`forwardedProps[CONTINUITY_KEY] = this.continuityRunId`. Extracting the pure
-`trellisForwardedProps` helper moved that assignment from a field read to a
-parameter. The step now asserts the same top-level assignment of the same frozen
-key, plus that the helper performs it, and the forwarded-property loop was
-replaced by two explicit per-key branches so the literal is greppable again.
-
-`T10 tools` hand-writes the canonical `list_tasks` payload and compares its hash
-to the lease. `duplicates_only` joined `ListTasksArgs`, so the canonical payload
-gained a key. The gate still asserts that the tool hashes the canonical payload.
-
-Both amended steps, and the D-76 structural step, were extracted from
-`ci.yml` and executed locally before the fix was pushed. Full CI is 36 of 36
-passing at the reviewed SHA.
-
-**Limitations and review status:**
-
-- The compensation and the control run's history are two transactions, not one.
-  If persistence fails after the kernel commits, task state stays restored, the
-  control run is marked FAILED with `mutation_committed=true` in its error, and
-  no automatic redo is attempted. A retry of the same command cannot
-  double-apply, because the target then carries a compensation wave and is
-  ineligible. Making those atomic is a durable-journal design and is deliberately
-  not attempted here.
-
-  That window is injected rather than argued. The persistence tail is made to
-  raise after the kernel commits, and the regression asserts the restored row
-  under its original id at a forward version, the FAILED run,
-  `mutation_committed=true` in the error, and that retrying the same command
-  refuses and leaves exactly one compensation wave. The pre-commit branch is
-  injected separately at `attempt_run_undo` and must not claim a mutation
-  committed, because if both branches wrote the same error the marker would stop
-  distinguishing anything.
-
-- Neutral review, twice, found failure points inside that tail that earlier
-  versions neither handled nor tested. All are fixed rather than documented
-  around, and each fix is mutation-proven.
-
-  History and completion were two calls on two connections. A history write that
-  committed followed by a failing status write left a FAILED run carrying a
-  fully formed "Undone." transcript, which made the note's unqualified claim of
-  empty history on a failed turn false for that ordering. `complete_control_turn`
-  now writes both in one statement, so the two cannot separate.
-
-  The invariant that follows is "unchanged since creation", not "empty", and the
-  distinction is the one the original wording got wrong. A control turn is not
-  always born empty: a root turn starts with no history, while a turn inheriting
-  a completed predecessor is created already carrying it, and losing that on
-  failure would be its own defect. A failed turn keeps exactly what it was
-  created with, and the synthetic user message and response land only in the
-  same transaction that records `completed`. Both shapes are tested, and the
-  split-transaction mutation is caught.
-
-  A failure in the failure-marking write itself re-raised the symptom and hid
-  the cause. The original error now propagates while the secondary one is logged
-  and attached as a note, so neither is lost and neither is mistaken for the
-  other. The run is still left non-terminal in that case, which is recorded
-  rather than repaired: nothing can write a status while writes are failing. It
-  is a pre-existing property of every Trellis run, and the model path fails the
-  same way. The one new consequence is that the browser's previous-run cursor
-  points at a run that never resolves, so the next "undo that" refuses as still
-  active. That cursor advances on every `RUN_STARTED`, so the effect is bounded
-  to one turn rather than the session lockout it first appears to be, and the
-  regression asserts exactly that bound.
-
-  Terminal status is now one way. `COMPLETE_CONTROL_TURN` and
-  `FAIL_RUN_IF_RUNNING` both carry `AND status = 'running'`, so cleanup cannot
-  overwrite a committed completion with a failure. A zero-row result means
-  something else finished the run first, which `fail_run_if_running` reports as
-  None and `complete_control_turn` reports as `RunAlreadyTerminalError`.
-
-  The failed-history invariant was also wrong as first written. "Empty history
-  on the failed turn" is only true of a root turn; an inherited turn is born
-  carrying its predecessor's history. The invariant is that a failed turn keeps
-  exactly the history it was created with, and both shapes are tested.
-
-  The AG-UI control stream had no error boundary. The model path gets one from
-  `transform_stream`; this path hands protocol events straight to
-  `streaming_response`, whose pinned 2.27.0 `encode_stream` is a bare
-  `async for`. An escaping exception truncated the SSE body after RUN_STARTED
-  with no lifecycle event at all. It now emits `RUN_ERROR` and stops, never
-  `RUN_FINISHED` afterwards, and a transport-level test asserts the event
-  sequence with both persistence writes failing.
-
-  Continuity was not reconciled after a transport failure. A control turn could
-  commit `completed` and lose the connection before RUN_FINISHED, leaving the
-  browser on an older continuity cursor and dropping the undo from the next
-  turn's inherited history. `onRunFailed` now runs the same server query run end
-  runs, with the unchanged rule that only a `completed` run may be promoted.
-
-  That fix originally shipped with no unit test, recorded as a trade: extracting
-  the reconciliation into a testable module would move the two literals the T17
-  gate asserts out of `Chat.tsx` and amend an earlier task's check a second time.
-  The D-76 gate instead parsed `Chat.tsx` and asserted the whole wiring, and that
-  gate was itself mutation-proven against four mutations.
-
-  **A second blind review found a real defect that gate could not express, and
-  the trade has been reversed.** The reconciler resolved its target from one
-  mutable `currentRunId` ref that every `RUN_STARTED` overwrote, while
-  `onRunFailed` discarded its callback parameters entirely. Every literal the
-  gate asserted was present and correct; the defect was in the ordering. Run B
-  completes durably, B's transport drops, run C starts before B's delayed
-  failure callback fires, and the reconciler asks about C. B's completion is
-  never adopted. The stale ref could never promote the *wrong* run, because the
-  completed-only server check still gates promotion, so this loses a promotion
-  rather than corrupting state, but losing it reintroduces exactly the stale
-  history this mechanism exists to prevent.
-
-  The note previously said binding to the failed run's own identity was not
-  known to be possible. That was wrong, and is corrected here: `AgentSubscriber`
-  delivers the originating `RunAgentInput` to every callback including
-  `onRunFailed`. What was true is narrower, that the option was not used.
-
-  The rule now lives in `frontend/lib/continuity.ts` as `RunBindings` and
-  `reconcileContinuity`, free of React and of the transport. `RUN_STARTED` binds
-  the client-generated `input.runId` to the server-issued `event.threadId`,
-  `RUN_FINISHED` reconciles the run it names, and a transport failure resolves
-  its own invocation back to its own run. `input.runId` is correlation only and
-  never reaches `fetchRun`; `input.threadId` is rejected by the gate because the
-  AG-UI client sets it from its own constant thread id, making it identical
-  across every run in a session. `prepareRunAgentInput` was read to confirm
-  both: `runId: e?.runId || uuidv4()` and `threadId: this.threadId`.
-
-  That `runId` expression is stated precisely rather than as a guarantee. The
-  protocol lets a caller supply an explicit `runId`, so "always freshly
-  generated" would be stronger than AG-UI promises. What Trellis relies on is
-  narrower and is enforced: `runId` is a local correlation key only, and
-  `TrellisHttpAgent.run()` spreads the input and replaces `forwardedProps`
-  alone, never supplying or overriding `runId`. A gate asserts that, so a future
-  edit that starts minting run ids in the transport fails CI rather than
-  silently collapsing two invocations onto one binding. `RunBindings.bind` also
-  defines rebinding as overwrite rather than treating collision as impossible.
-
-  Eight behavioral tests now run in CI as `npm run test:continuity`. The central
-  one is the interleaving the regular expression was blind to: bind B, bind C,
-  reconcile a delayed failure for B, and assert C is never even queried, not
-  merely never promoted. The others cover completed-only promotion across
-  `failed`, `running`, `awaiting_approval`, and `interrupted`, an unbound
-  invocation promoting nothing and guessing no id, a failed status lookup, the
-  approval-continuation rebinding case, and release. Six mutations were run
-  against the module and all six are caught, the shared-ref restoration killing
-  four tests at once. The structural gate was rewritten rather than deleted: it
-  now asserts the binding wiring and forbids `input.threadId` and continuity
-  identity taken from `thread.runEnd`.
-
-  What this still is not is a browser test. Nothing here proves the runtime
-  actually invokes `onRunFailed` when a stream dies. That gap is real and is
-  recorded as one. What has changed is that the ordering question, previously
-  bundled into the same gap, is now settled in code and proven by test.
-
-- Deterministic suites now block live provider requests at the bootstrap.
-  `tests/conftest.py` sets `models.ALLOW_MODEL_REQUESTS` False for every test
-  that does not carry the `network` marker, and restores it for the two external
-  suites that exist to reach a real service. It is a backstop, not the proof:
-  the D-76 module's own guard makes provider *construction* raise, which is the
-  stronger claim.
-
-- A durable execution framework is the right class of answer to abandoned
-  non-terminal runs, and is deliberately out of scope. Pydantic AI ships
-  Temporal, DBOS, Prefect, and Restate integrations, and they provide durability
-  only for work executing inside the workflow. This control path invokes no
-  `Agent`, so attaching durability to the agent would not cover it, and adopting
-  one would turn this task into application-wide orchestration. DBOS is the one
-  to evaluate first if Trellis ever wants it, being PostgreSQL backed. Separate
-  decision.
-
-- "No automatic redo is attempted" is guaranteed by absence rather than by a
-  guard, in the same sense the tool profile is: no code path re-applies a
-  compensated run's original mutations, and there is no primitive that would.
-  It is therefore not independently mutation-testable, and a mutation written to
-  probe it survived because the call it inserted is a no-op by construction.
-  That is recorded rather than dressed up as a passing check.
-- `_control_history_predecessor` adds up to two `runs.load` reads on the control
-  path to learn each candidate predecessor's status. They are single indexed
-  reads and were not measured. Checking the continuity candidate here rather
-  than letting `create_control_turn` refuse is what lets an unusable cursor
-  degrade to a root turn instead of turning a valid undo into a 403; the
-  refusal it would have raised still exists and still applies on the ordinary
-  model path.
-- The grammar is a frozen phrase set. Every phrasing outside it, including
-  "please undo" and "can you undo that", reaches the model. That is the intended
-  direction of error and will read as a miss to a user who phrases it politely.
-- `undo.py` changed only by extracting its body to `undo_run_on_conn` with the
-  numbered steps, check order, commit, and rollbacks intact. No undo semantics
-  moved.
-- No live provider evidence. The control path requires no NVIDIA credential by
-  construction, and the D-76 CI job deliberately sets none.
-- This entry records author-run verification only; neutral review is pending.
-
-## D-77: current-state truth after deletion and deterministic duplicate reads
-
-**Local role:** Makes a successful `delete_tasks` result state its own
-postcondition (`deleted`, `exists_after_tool`) before the result becomes the
-idempotent record, and adds `duplicates_only` to `ListTasksArgs` backed by one
-SQL statement that computes duplicate membership from current `tasks` rows.
-
-**Whole-system role:** This repairs an observed production failure in which the
-model reported a deleted task as a current duplicate, and the important part is
-that nothing hallucinated. The pre-delete snapshot correctly said
-`"status": "open"`, Pydantic AI correctly preserved the tool return in canonical
-history, and a later turn was shown a record that reads as a currently open task
-with nothing anywhere saying it was gone. The record was underspecified, so the
-fix belongs at the application seam that writes it rather than in prompt wording
-or in the provider.
-
-The second half puts duplicate truth in PostgreSQL. Asking the model to compare
-titles it remembers is the same category of mistake as asking it to decide
-undoability: it makes a database question depend on what happens to be in
-context. The bounded-result contract is part of the fix, because a correct query
-can still be reported falsely, and "these are all your duplicates" from a full
-page is a false statement even when every returned row is right.
-
-**Inputs and dependencies:** the T06 domain and its hard-delete semantics; the
-T05 idempotency lease and its stored result; D-73's exact-title equivalence rule
-and its bounded-query discipline; the D-76 undo path, for the integration proof.
-
-**Outputs and consumers:** `deleted` and `exists_after_tool` on every successful
-delete result, and therefore in canonical history for every later turn;
-`ListTasksArgs.duplicates_only` and `SELECT_DUPLICATE_TASKS_FOR_OWNER`;
-prompt rules 18 and 19, which state the current-state and bounded-result
-contracts the SQL cannot state for itself.
-
-**Verification:**
-
-```text
-cd backend && python -m ruff check .
-cd backend && DATABASE_URL=... pytest tests/test_d77_current_state.py -v
-cd backend && DATABASE_URL=... pytest -m "not network"
-cd frontend && npm run build
-```
-
-Observed: 18 passed in `test_d77_current_state.py`; 393 passed and 13 deselected
-cumulatively. The replay invariant is proved as one equality across the returned
-value, the stored `tool_invocations.result`, and a `replay_completed` read.
-Membership-before-LIMIT is proved with 30 duplicate pairs against a 50-row bound.
-Filter-before-group is proved with a done and an open task sharing a title. The
-D-76 x D-77 sequence (duplicate group, delete, group dissolves, undo, group
-reforms under the original id with a forward version) is a single test.
-
-**Limitations and review status:**
-
-- The bounded-result contract is enforced in the prompt, not in the tool result.
-  Nothing in the returned payload tells the model the page was truncated; the
-  model has to notice the row count. A `truncated` flag or a total count would be
-  a stronger mechanism and is a separate decision with its own bounded-query
-  proof.
-- Named-title duplicate questions ("are there two 'run the farm' tasks") are not
-  supported. Absence from a truncated page proves nothing, and adding a title
-  filter to `list_tasks` would relitigate D-73.
-- `duplicates_only` changes the canonical argument payload, so an ordinary list
-  and a duplicate list hash differently and cannot share a lease. That is
-  correct, and it means the two are separate invocations rather than one cached
-  answer.
-- No live configured-runtime-model evidence. The deterministic contracts do not
-  depend on the provider, but the prompt half of this decision is unproven
-  against a real model: rules 17 through 19 are deterministic only in that they
-  exist, and whether the configured model acts on them is a provider-behaviour
-  question. A live behavioural eval against the configured NVIDIA runtime model
-  has not been run, because this environment carries no runtime credential or
-  model configuration. Whoever runs it must record the exact `MODEL_ID` actually
-  exercised rather than the model anyone expected.
-
-  This entry deliberately names no specific model. `docs/DECISIONS.md` D-63 is
-  the source of truth for the runtime model and currently declares
-  `z-ai/glm-5.2` the sole one. If production has moved, that is an append-only
-  decision superseding D-63, not something an implementation note may settle by
-  mentioning a different name in passing. A failure in that eval would be a
-  provider-compatibility finding, not authority to weaken the deterministic
-  contracts.
-- This entry records author-run verification only; neutral review is pending.
-
-## D-78: deterministic single-task note append
-
-**Local role:** `update_task` gains `append_notes`, carrying only new note text.
-`domain.merge_appended_notes` joins it to the authoritative current value behind
-the row lock the mutation already takes, and `domain._effective_update` turns the
-append request into an ordinary replacement before the guarded UPDATE sees it.
-The page header gains the browser agent's tool profile.
-
-**Whole-system role:** it removes one place where the model was the temporary
-owner of authoritative state. Honouring "add a note" previously required the
-model to read the current notes, join them from memory, and send the whole value
-back, so anything that changed in between was overwritten by a write that reads
-in the audit log as a deliberate replacement. `expected_version` does not catch
-it: a stale note travels happily inside a call carrying a current version. This
-is the same class of defect as D-77, where a persisted pre-delete snapshot
-implied a task still existed, and the same shape of fix, which is to make
-deterministic code state the thing rather than letting a remembered value stand
-in for current truth.
-
-**Inputs and dependencies:** the D-74 `TASK_NOTES_MAX_CHARS` ceiling; the
-existing lock, guarded UPDATE, and idempotency lease; `_update_parameters` and
-its `model_fields_set` contract; `ALL_TOOLS` as the browser capability profile.
-
-**Outputs and consumers:** `append_notes` on `UpdateTaskArgs` only;
-`merge_appended_notes` as the single separator rule;
-`frontend/lib/agentTools.ts` as the one display list, consumed by the page
-header and by the cross-boundary test. A future bulk-append decision would
-consume the merge rule but owes per-row merging, per-row final-size validation,
-and set-based semantics.
-
-**Verification:**
-
-```text
-ruff check .                                clean
-pytest tests/test_d78_note_append.py        43 passed
-pytest -m "not network"                     436 passed, 13 deselected
-npm run test:tools                          6 passed
-npm run build                               compiled, 3 static pages
-```
-
-Author mutation audit, 21 mutations. 19 caught, 1 equivalent, 1 caught
-by a neighbouring suite:
-
-```text
-M5  separator removed                       15 tests fail
-M6  trailing newline stops separating        2 tests fail
-M7  caller newline normalized away           SURVIVED, then fixed
-M8  fragment sized instead of merged value   2 tests fail
-M9  model_copy replaced by model_validate   13 tests fail
-M10 append moved onto MutableTaskFields      1 test fails
-M11 mutual-exclusion validator removed       2 tests fail
-M12 prompt ambiguity restored                1 test fails
-M13 tool description weakened                1 test fails
-M14 field description dropped                1 test fails
-M15 ALL_TOOLS narrower than ToolName         1 test fails
-M16 rule 9 manual-join instruction restored  1 test fails
-M17 inaccurate rule 9 consequence restored   1 test fails
-M18 schema names the wrong consequence       1 test fails
-M19 early version check removed              2 tests fail
-M20 check also fires for absent rows         EQUIVALENT, see below
-M21 SQL version guard removed                caught by the D-76 suite
-M1  a ninth backend tool lands               2 tests fail
-M2  a header label dropped                   3 tests fail
-M3  a snake_case wire name displayed         3 tests fail
-M4  a header label renamed                   2 tests fail
-```
-
-**M20 is an equivalent mutant and is recorded as one rather than papered over.**
-Widening the guard from `before is not None and ...` to `before is None or ...`
-changes nothing observable: an absent row raises `VersionConflictError` early
-under the mutant and raises the identical error via the guarded UPDATE without
-it. No test can distinguish them because there is nothing to distinguish. The
-narrow form is kept because it says what it means, not because a test forces it.
-
-**M21 is caught, but not by this suite.** Removing
-`AND version = %(expected_version)s` from `UPDATE_TASK_GUARDED` leaves all 43
-D-78 tests passing, because the new Python comparison catches staleness first on
-this path. It fails `test_a_stale_pre_delete_version_stays_invalid_after_restore`
-in the D-76 suite, which is what proves the SQL predicate is still load-bearing
-for the other callers of that statement. Worth stating plainly: the D-78 suite
-alone would not have noticed the fail-closed database invariant disappearing.
-
-**This table and the counts above went stale three times before a blind review
-caught it.** The note was written once at the first complete commit and then not
-revisited across three further commits that added tests and mutations, so it
-recorded 31 / 424 and eleven mutations while the suite actually had 34 / 427 and
-fifteen. Each commit message was accurate; the durable record was not, and the
-durable record is the one a future reader trusts. Update this block in the same
-commit that changes what it describes, not afterwards.
-
-**M7 is the one worth recording.** Stripping a caller-supplied leading newline
-inside `_effective_update` passed all 29 tests as originally written. The
-parametrized cases exercise `merge_appended_notes` directly, so a mutation to
-its *caller* left the merge rule provably correct while still editing the user's
-text on the way to PostgreSQL. Two database-level regressions now cover it. The
-general lesson is that a unit test of a pure helper does not protect the path
-that calls it, and mutation testing is what surfaces the difference.
-
-Two earlier mutation attempts, run through a shell heredoc, silently failed to
-apply because the heredoc mangled the backslash escapes, and reported as
-survivors. They were re-run from a script file. A mutation that does not apply
-looks exactly like a mutation the tests caught, so a mutation harness has to
-assert that its target was found; the script does.
-
-**Limitations and review status:**
-
-- Bulk append is not authorized and is structurally prevented rather than
-  merely undocumented: `append_notes` is on `UpdateTaskArgs`, a CI gate asserts
-  it is absent from `MutableTaskFields` and `BulkUpdateTasksArgs`, and a test
-  proves the bulk schema rejects it.
-- No live provider evidence. Whether the configured runtime model reliably
-  routes "add a note" to `append_notes` rather than reconstructing the whole
-  value is a compatibility question, not a correctness one; the typed backend
-  owns the semantics either way. A failing eval would be a prompt finding.
-- The header tool list is written out rather than derived at runtime, because
-  the authoritative profile is server-side and the browser is deliberately not
-  told what exists. The staleness that buys is covered by the cross-boundary
-  test, not by discipline.
-- The final-size check is a merged-length invariant, `len(merged) >
-  TASK_NOTES_MAX_CHARS`, not full Pydantic revalidation of `TaskNotes`. It is
-  exactly equivalent today, because `TaskNotes` carries only that one
-  constraint. It would stop being equivalent the moment `TaskNotes` grows a
-  second constraint, and nothing currently notices that drift. Stated as a
-  length invariant rather than as validation so the record does not claim more
-  than the code does.
-- The cross-boundary tool gate parses the `ToolName` enum text rather than
-  importing `agent.ALL_TOOLS`, and the parser had to be taught to normalize
-  CRLF, which is the kind of brittleness that argues for executing a value
-  rather than reading its source. The gap that mattered is now closed from the
-  backend side instead of by rewriting the parser. The chain is asserted end to
-  end:
-
-  ```text
-  header labels  <-> ToolName          frontend cross-boundary test
-  ToolName       <-> ALL_TOOLS         backend assertion
-  ALL_TOOLS      <-> function_tools    the model-facing schema
-  ```
-
-  A refactor making `ALL_TOOLS` narrower than `ToolName` now fails CI rather
-  than leaving the header advertising capabilities the browser agent no longer
-  has. Mutation M15 is exactly that refactor and is caught.
-- Review history, and why the current SHA is unreviewed. Three neutral blind
-  reviews have run against this branch, each against an immutable SHA, and each
-  found exactly one real defect:
-
-  ```text
-  89e3dad   MAJOR  rule 9 still told the model to join notes itself,
-                   plus 2 MINOR stale counts in this file
-  692bd1a   fix    rule 9's consequence named the wrong failure mode:
-                   existing text inside append_notes duplicates rather
-                   than replaces
-  a80c9cb   MINOR  a stale expected_version plus an overflowing append
-                   refused as VALIDATION_ERROR rather than VERSION_CONFLICT
-  ```
-
-  Each fix created a new SHA and voided the review that preceded it, which is
-  the intended loop rather than a sign of churn. The current candidate is
-  unreviewed and a fresh review is owed against it.
-
-  Worth recording for whoever reviews next: every defect found so far has been
-  in the model-facing text or in this file, never in the mechanism. The merge,
-  the ceiling, `model_fields_set`, the bulk exclusion, replay, and the version
-  and event bookkeeping have survived independent probing three times.
-
-  The earlier plan to defer this review so that one review covered both D-78 and
-  D-79 was abandoned. D-79 is a separate session and a separate PR, which lets
-  the D-78 versus bulk concurrency tests run against merged D-78 code rather
-  than a review-only integration tree.
-
-## D-79: one guarded set-based UPDATE for a whole bulk call
-
-**Local role:** `bulk_update_tasks` replaces its per-task `UPDATE_TASK_GUARDED`
-loop with a single `BULK_UPDATE_TASKS_GUARDED` statement that carries the
-expected versions as a relation. It owns the construction of that relation, the
-check that the returned rows cover every expected target, and the replay of the
-caller-visible order from the request. `BulkUpdateTasksArgs` gains a lower bound
-on `task_ids` and a validator refusing a patch that cannot change anything, and
-the tool is registered as a Pydantic AI sequential barrier.
-
-**Whole-system role:** This is the first decision to change the physical shape of
-a kernel mutation rather than its semantics, so its whole value depends on the
-guards surviving the rewrite unchanged, which is what most of its verification
-is about. It controls three risks. The mutation cost of one model request no
-longer grows with the number of tasks the model names, so a fifty-task request
-is one statement rather than fifty. The model is told which of two legitimate
-routings to use, so a same-patch request stops arriving as N single calls, which
-was the real reason the loop was being exercised at scale. And the tool that
-holds locks on a caller-chosen set can no longer overlap a sibling tool call
-scheduled out of the same model response. For the demo it makes bulk operations
-visibly one authoritative transaction, which is the claim the tool always made.
-
-**Inputs and dependencies:** D-12 conditional approval and the tool body order,
-D-17 blast-radius counting over raw ids, D-39/D-41 audit and undo expectations of
-`task_events`, D-74 request ceilings, and D-78, whose single-task append is the
-other side of the concurrency interaction proven here. It depends on PostgreSQL
-`UPDATE ... FROM`, `unnest` over parallel arrays, and `READ COMMITTED` semantics
-for `SELECT ... FOR UPDATE`, and on `pydantic-ai` 2.27.0 exposing `sequential` on
-`Agent.tool`. Both facts are probed rather than assumed: the installed signature
-is checked, and the deterministic gate asserts the isolation level.
-
-**Outputs and consumers:** `sql.BULK_UPDATE_TASKS_GUARDED`,
-`domain._expected_relation`, `domain._bulk_update_parameters`, and
-`domain._mutable_field_parameters`, which the single-task and bulk paths now
-share so their omitted-versus-null handling cannot drift apart. The tool result
-shape, the event shape, and the error vocabulary are unchanged, so every existing
-consumer, including undo and the audit reads, sees exactly what it saw before.
-
-**Verification:** `cd backend && ruff check .` clean;
-`cd backend && pytest -m "not network"` 436 passed before the new suite;
-`pytest tests/test_d79_bulk_update.py` 55 passed. `cd frontend && npm run build`
-succeeds and all five frontend suites pass (2, 4, 9, 8, 6 tests).
-
-Mutation audit, 17 of 17 killed, with every source file's SHA-256 recorded before
-mutation and proven byte-identical after restore. The mutations covered:
-restoring the per-task loop, removing `sequential=True`, removing the owner
-predicate, removing the version predicate, letting partial `RETURNING` coverage
-commit, dropping an expected version, skipping the pair-length invariant, feeding
-duplicate ids into the relation, trusting `RETURNING` order, dropping
-`set_due_date` and `set_blocked_by`, re-accepting an empty target list,
-re-accepting an ineffective patch, corrupting `event.before` and `event.after`,
-deduplicating before the blast-radius count, and removing the canonical lock
-order.
-
-The audit's first run killed only 13 of 17 and the four gaps were real test
-defects, not code defects: the owner predicate, the coverage check, and the
-pair-length invariant were all unreachable through the ordinary path because an
-earlier guard fires first, and the blast-radius test called the domain directly
-where the count it claimed to protect lives in the tool. All four now have tests
-that reach the code under test, which is why the relation builder was extracted
-into `_expected_relation` in the first place.
-
-Benchmark at the implementing SHA, PostgreSQL 16.12, `read committed`, 30
-iterations per cell, domain transaction only with no model latency:
+`cd backend && pytest -m "not network"` 498 passed, 13 deselected, of which 62
+are the D-79 suite. `cd frontend && npm run build` succeeds and all five
+frontend suites pass (2, 4, 9, 8, 6 tests). Both inline CI gate scripts were
+executed locally, not merely parsed.
+
+Mutation audit, 27 of 27 killed across two harnesses, 20 for the set-based
+mutation and 7 for the model-boundary failure mapping. A kill is defined
+strictly, because both halves of the definition have already failed once here:
+the mutation must be observed as applied by a changed digest, the intended tests
+must have collected and run, at least one failure must be attributable to the
+mutation, and the source must be byte-identical after restore. Beyond the mutants
+listed under the original implementation, the hardening pass adds three: removing
+the final SQL-binding cardinality guard, removing `sequential=True` from the
+framework barrier probe, and dropping the cross-field rule from the tool
+description.
+
+Two things about the audit are worth recording, because both were defects in the
+verification rather than in the code, and both would have produced a green board
+that meant less than it appeared to.
+
+The first audit run killed only 13 of 17. All four gaps were test defects: the
+owner predicate, the returned-coverage check, and the pair-length invariant were
+unreachable through the ordinary path because an earlier guard fires first, and
+the blast-radius test called the domain directly while the count it protected
+lives in the tool body. That is why `_expected_relation` was extracted at all.
+
+The second run reported two **false kills**. The harness treated pytest's
+nonzero exit as a kill, and pytest also exits nonzero when it collected nothing,
+which is exactly what two mis-split parametrized test ids produced. Two mutations
+were therefore recorded as caught by tests that never executed. The harness now
+requires an observed failure and a nonzero collection count, and reports
+`NO TESTS RAN` as its own verdict. This is the mirror image of the D-78 failure
+where a mutation silently did not apply: there the mutation was absent, here the
+test was, and in both cases the report was confident and wrong.
+
+Benchmark, PostgreSQL 16.12, `read committed`, 30 iterations per cell, domain
+transaction only, no model latency. Both variants run in one process against the
+same rows with the same surrounding pipeline; only the statement shape differs.
+Measured on the exact tree that became the hardening commit:
 
   ```text
    N   variant     median ms   p95 ms   taskUPD   events   coreSQL
-   1   loop             7.31    12.51         1        1         3
-   1   set              7.36    10.53         1        1         3
-   3   loop            12.49    19.62         3        3         7
-   3   set             10.48    16.66         1        3         5
-  10   loop            32.31    56.43        10       10        21
-  10   set             20.70    33.62         1       10        12
-  25   loop            66.02    80.97        25       25        51
-  25   set             43.63    80.62         1       25        27
-  50   loop           153.21   217.04        50       50       101
-  50   set             90.56   127.82         1       50        52
+   1   loop            15.84    22.40         1        1         3
+   1   set             16.69    20.46         1        1         3
+   3   loop            21.69    35.27         3        3         7
+   3   set             22.87    28.26         1        3         5
+  10   loop            71.14    82.83        10       10        21
+  10   set             46.44    60.58         1       10        12
+  25   loop           117.25   174.77        25       25        51
+  25   set             94.90   107.41         1       25        27
+  50   loop           261.32   450.29        50       50       101
+  50   set            153.47   189.37         1       50        52
   ```
 
-The structural result is exact and is the claim: at fifty targets, one task
-UPDATE instead of fifty, and 52 core SQL statements instead of 101. The timing
-result is environment-specific and is reported as measured, 1.69x median at
-fifty targets and no gain at one.
+The structural result is the claim and it is exact: at fifty targets, one task
+UPDATE command instead of fifty, and 52 application-issued core SQL statements
+instead of 101. "Core SQL" counts application-issued statements only and excludes
+PostgreSQL's internal work, per-row processing, trigger execution, and planner
+and executor cost.
 
-**Limitations and review status:** Audit inserts remain O(N) by decision; any
-batching needs its own decision and its own measurement. The canonical lock order
-is pinned only by a structural assertion, because deleting `ORDER BY id` leaves
-the competing-callers test green: PostgreSQL reaches these rows by primary key
-and returns them in id order anyway. That was verified deliberately rather than
-assumed, and the rejected alternative, forcing the planner off the index, would
-tie a regression test to settings the application never sets. The frontend change
-in this decision is presentation only: `--thread-max-width` becomes
+The absolute timings are higher than the run at `1caf13a` across every cell,
+including the unchanged loop baseline. That is consistent with environmental and
+runtime variability rather than with a cost introduced by the hardening, because
+the baseline that rose alongside the candidate was not modified; the benchmark
+does not establish the exact cause and none is claimed. What reproduces is the
+fifty-target ratio, 1.69x then 1.70x, and the statement counts. Timings belong to
+the run that produced them and are not carried between SHAs.
+
+**Limitations and review status:** Audit inserts remain one per task by decision,
+not by necessity: PostgreSQL can insert several rows in one `INSERT` and
+`RETURNING` information for all of them, so batching is deferred rather than
+impossible, and would need its own decision proving per-task snapshot fidelity,
+event identity, correlation, ordering, trigger and failure behaviour, and a
+measured benefit.
+
+The canonical lock order is pinned only by a structural assertion, because
+deleting `ORDER BY id` leaves the competing-callers test green: PostgreSQL
+reaches these rows by primary key and returns them in id order anyway. That was
+verified deliberately, 3 of 3, rather than assumed. Forcing the planner off the
+index would close it and was rejected, because it would tie a regression test to
+settings the application never configures.
+
+Three guards are defence in depth and unreachable through the tool path, so they
+are tested directly: the owner predicate, the returned-coverage check, and the
+pair-length invariant. The `_bulk_update_parameters` cardinality guard is
+reachable by construction and has its own regression.
+
+The D-78 interaction tests exercise both commit orderings under the asserted
+`read committed` isolation. They do not observe the lock-wait state at a
+particular instant and do not claim to.
+
+The frontend change is presentation only: `--thread-max-width` becomes
 `calc(44rem + 15px)`, verified in a browser at 704 to 719 px with the composer
 tracking the message column and no horizontal overflow at 375, 768, or desktop
-width. This work is unreviewed and a neutral blind review is owed at the final
-SHA.
+width.
+
+`prompts.py` was deliberately not edited in the hardening pass. The system prompt
+already states "OMIT every optional field that is unchanged" and forbids the
+string "null", so the global ambiguity was already closed; only the tool
+description needed the cross-field rule, and the narrower change was preferred.
+
+This work is unreviewed. A neutral blind review is owed at the final SHA.
+
+## D-79 hardening: expected refusals stay inside the Pydantic tool protocol
+
+**Local role:** `agent.py` gains `_model_facing_refusals`, a context manager
+applied at all eight model-facing tool wrappers. It translates exactly three
+Trellis refusals into Pydantic AI tool outcomes and lets everything else
+propagate. `prompts.py` gains one rule stating that an `expected_version` is an
+ephemeral token rather than a remembered fact.
+
+**Whole-system role:** Trellis measures a model operating a typed API, and a
+model driving a mutating API will sometimes send a stale concurrency token or an
+unusable reference. Those refusals are the trust boundary working. Before this,
+they left Pydantic AI's tool protocol entirely and aborted the run, so a correct
+refusal destroyed the turn and the response stream instead of being corrected.
+This makes the refusal legible to the model without weakening it, which is the
+whole premise: deterministic code decides, and the model gets a truthful,
+actionable answer.
+
+**Inputs and dependencies:** Pydantic AI 2.27.0, whose `ModelRetry` and
+`ToolFailed` were both confirmed present in the pinned install rather than
+assumed from documentation. D-27's `EXTERNAL_DIVERGENCE`, D-12's tool body
+order, and the shared out-of-scope refusal whose non-enumeration property this
+must not break.
+
+**Outputs and consumers:** `agent._model_facing_refusals`. No change to
+`domain`, `tools`, `policy`, `errors`, `sql`, the database, or the frontend.
+Direct deterministic callers continue to see `VersionConflictError`,
+`ExternalDivergenceError`, and `OutOfScopeError` unchanged.
+
+**Verification:** `ruff` clean; `pytest -m "not network"` 510 passed, 13
+deselected, of which 11 are the new mapping suite. The defect was reproduced
+deterministically before the fix, with the real agent aborting on the first model
+turn, and the same probe afterwards shows the run reaching a second turn with a
+retry prompt. The full refresh-and-retry loop is driven end to end: stale call,
+refusal, authoritative resolve, corrected call, exactly one commit and one event.
+
+Mutation audit for this mapping, 7 of 7 killed under the same strict definition
+of a kill: removing the version translation, swapping it to `ToolFailed`,
+swapping divergence to `ModelRetry`, swapping out-of-scope to `ModelRetry`,
+letting the out-of-scope message enumerate, broadening the catch to every
+`PolicyError`, and dropping the prompt rule. Digests restored byte-identical.
+
+**Limitations and review status:** The persisted failed invocation from the
+original manual session was gone before it could be inspected, because the
+deterministic fixtures truncate `tool_invocations` and `agent_runs`. The
+deterministic reproduction stands in for it.
+
+Only three refusals are translated. Others still abort the run, which is
+intended for genuinely unexpected failures but means any future refusal whose
+next action is knowable needs its own decision rather than an automatic
+inclusion.
+
+The observed browser symptom, an AG-UI `TEXT_MESSAGE_CONTENT` arriving with no
+preceding `TEXT_MESSAGE_START`, is consistent with a stream aborted mid-message.
+This work removes the failure class that aborted the run but does not claim to
+have root-caused that console error, and no AG-UI event-lifecycle regression was
+added: the existing transport tests were left as they are, and proving the
+frontend symptom would need its own adapter-level test.
+
+Unreviewed. The neutral blind review is owed at the final SHA and covers this
+alongside the rest of D-79.

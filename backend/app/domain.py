@@ -305,13 +305,20 @@ def bulk_update_tasks(
     guarded UPDATE over the whole set. The guards did not change: the same owner
     predicate and the same per-row version predicate decide every row, and a row
     whose version moved still matches nothing. What changed is that the
-    expectations travel as a relation rather than as N separate statements, so
-    the count of task UPDATE statements no longer grows with the target count.
+    expectations travel as a relation rather than as N separate statements.
 
-    The events are still written one row at a time by ``write_events``, so this
-    is not an O(1) transaction. It is an O(1) task-update transaction with O(N)
-    audit inserts, and the audit rows are deliberately left alone: each one
-    carries its own exact before and after snapshot.
+    State the improvement narrowly, because it is narrow. The number of task
+    UPDATE statements this module issues is constant with the target count,
+    N to 1. PostgreSQL still processes N target rows, and ``write_events``
+    still issues one audit INSERT per physical task, so the work the database
+    does has not become constant and this transaction has not become O(1) in
+    any sense worth claiming.
+
+    The audit rows are deliberately left alone rather than left alone because
+    they must be. PostgreSQL can insert many rows in one INSERT and RETURN
+    information for all of them, so batching them is possible; it is simply not
+    what this decision does, and it would have to prove per-task snapshot
+    fidelity and its own measured benefit first.
     """
     task_ids = _unique_ids(arguments.task_ids)
     if not task_ids:
@@ -752,9 +759,16 @@ def _expected_relation(
     arrives disguised as a target-coverage conflict, which describes the wrong
     problem and sends the reader to the wrong place.
 
-    Deriving both arrays from one tuple makes the drift impossible to write.
-    The checks below then cover what deriving them cannot: that nothing
-    upstream handed this function a malformed target set. They are
+    Deriving both arrays from one canonical relation prevents ordinary
+    construction drift here. It does not make drift unwritable, because the two
+    arrays are separate values from the moment this function returns them, and
+    `_bulk_update_parameters` accepts them as independent arguments. So that
+    function reasserts equal cardinality on the values actually crossing into
+    SQL, and this one validates the construction. Two boundaries, two different
+    failures.
+
+    The checks below cover what deriving the arrays together cannot: that
+    nothing upstream handed this function a malformed target set. They are
     defence in depth and are expected to be unreachable through
     `bulk_update_tasks`, where `_unique_ids` and `_require_all_targets` have
     already run. `RuntimeError` rather than a domain error is deliberate: a
@@ -772,9 +786,11 @@ def _expected_relation(
     ):
         raise RuntimeError("bulk update built an expected relation of the wrong size")
     if len(set(update_ids)) != len(update_ids):
-        # PostgreSQL requires an UPDATE ... FROM join to match at most one
-        # source row per target row. With more, one arbitrary source wins and
-        # the rest are silently discarded.
+        # Trellis must ensure at most one expected source row joins each target
+        # row. PostgreSQL does not reject an UPDATE ... FROM whose join matches
+        # several source rows: it uses one of them, and which one is not
+        # predictable. So the uniqueness is this module's obligation, not
+        # something the database will refuse on our behalf.
         raise RuntimeError("bulk update built a duplicated expected target")
     if any(task_id is None for task_id in update_ids):
         raise RuntimeError("bulk update built a null expected target")
@@ -797,7 +813,17 @@ def _bulk_update_parameters(
     omitted-versus-null contract would clear due dates nobody mentioned while
     every single-task test stayed green. One builder makes that impossible to
     do by halves.
+
+    This is also the last boundary before the arrays become SQL parameters, and
+    it is the only place that sees the exact values being bound. `unnest` over
+    two arrays NULL-pads the shorter one instead of rejecting it, so unequal
+    lengths would execute and fail closed somewhere else, described as
+    something else. `_expected_relation` validates its own construction; this
+    validates what is actually crossing the boundary, whoever built it.
     """
+    if len(task_ids) != len(expected_versions):
+        raise RuntimeError("bulk update id/version relation length mismatch")
+
     return {
         "owner_id": owner_id,
         "task_ids": list(task_ids),

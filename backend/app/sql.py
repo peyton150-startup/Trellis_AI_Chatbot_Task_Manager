@@ -243,10 +243,11 @@ RETURNING *;
 # domain checks the arrays are the same length before the statement runs, so
 # the failure is reported where it happens.
 #
-# PostgreSQL requires that an UPDATE ... FROM join match at most one source row
-# per target row; with more, the outcome is one arbitrary source and the others
-# are silently discarded. The ids are deduplicated before they reach here, so
-# the CTE holds exactly one row per distinct task, and domain asserts that too.
+# Trellis must ensure the UPDATE ... FROM join matches at most one source row
+# per target row. PostgreSQL will not refuse a join that matches several: it
+# uses one of them, and which one is not predictable. So this is the caller's
+# obligation. The ids are deduplicated before they reach here, the CTE
+# therefore holds exactly one row per distinct task, and domain asserts it.
 #
 # There is no ORDER BY and none is possible: an UPDATE has no result ordering to
 # specify. The canonical lock order that prevents deadlock is established by

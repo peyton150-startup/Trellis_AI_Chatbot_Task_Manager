@@ -8,9 +8,11 @@ the set the model happened to name.
 
 D-79 changes the statement shape and nothing else. The expectations travel to
 PostgreSQL as a relation, one guarded UPDATE applies them all, and the same
-owner and version predicates decide every row exactly as before. The audit
-inserts stay one per task on purpose: each carries its own before and after
-snapshot, and there is nothing to batch away without losing that.
+owner and version predicates decide every row exactly as before. What becomes
+constant is the number of task UPDATE statements this module issues, N to 1.
+PostgreSQL still processes N rows, and the audit inserts stay one per task on
+purpose, each carrying its own before and after snapshot. Batching those is
+possible and simply is not what this decision does.
 
 Two things bracket the SQL change. Above it, the model has to actually route a
 same-patch request to this tool rather than to N single updates, and the tool
@@ -36,6 +38,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
+    RetryPromptPart,
     TextPart,
     ToolCallPart,
 )
@@ -167,15 +170,36 @@ def test_the_upper_bound_on_targets_survives():
         )
 
 
-def test_a_bulk_call_that_cannot_change_anything_is_refused():
-    """Naming targets is not enough; the patch has to do something.
+def test_a_bulk_call_with_no_effective_operation_is_refused():
+    """Naming targets is not enough; the patch needs an operation.
 
-    Such a call used to lock every target, increment every version, and write an
-    event per task whose before and after are identical.
+    Structural, not semantic: this refuses a patch that cannot write any column,
+    never a patch whose values happen to match what is already stored. Such a
+    call used to lock every target, increment every version, and write an event
+    per task whose before and after are identical.
     """
     with pytest.raises(ValidationError) as raised:
         BulkUpdateTasksArgs(task_ids=[uuid4()])
-    assert "at least one field that changes" in str(raised.value)
+    assert "at least one field to change" in str(raised.value)
+
+
+def test_a_patch_matching_current_state_is_still_structurally_effective(db):
+    """The rule is about the operation, not about whether the value differs.
+
+    Setting priority to high on an already-high task is a legitimate request for
+    a state, and it stays valid. A validator that tried to prove the stored value
+    would differ would have to read the rows, which is a different and much
+    stronger claim than the one made here.
+    """
+    run_id = _run()
+    task = _task(db, run_id, priority="high")
+
+    mutation = _bulk(db, [task.id], priority="high")
+    db.commit()
+
+    assert len(mutation.tasks) == 1
+    assert _row(db, task.id)["priority"] == "high"
+    assert _row(db, task.id)["version"] == task.version + 1
 
 
 @pytest.mark.parametrize("field", ["title", "notes", "priority", "status"])
@@ -624,6 +648,42 @@ def test_the_relation_builder_refuses_a_null_expected_version(db):
         domain._expected_relation([task.id], {task.id: broken})
 
 
+def test_the_sql_binder_refuses_unequal_arrays_whoever_built_them(db):
+    """The last boundary before the values become SQL parameters.
+
+    `_expected_relation` validates its own construction, but the two arrays are
+    separate values the moment it returns them, and `_bulk_update_parameters`
+    takes them as independent arguments. So a drop that happens after
+    construction, or a future second caller that assembles the arrays itself,
+    would sail past the earlier checks. `unnest` NULL-pads rather than rejects,
+    so that reaches PostgreSQL, fails closed, and reports a coverage conflict
+    instead of the construction bug it is.
+    """
+    run_id = _run()
+    tasks = _tasks(db, run_id, 3)
+    locked = {task.id: task for task in tasks}
+    ids = [task.id for task in tasks]
+
+    update_ids, expected_versions = domain._expected_relation(ids, locked)
+    assert len(update_ids) == len(expected_versions) == 3
+
+    with pytest.raises(RuntimeError, match="length mismatch"):
+        domain._bulk_update_parameters(
+            ACTOR_ID,
+            update_ids,
+            expected_versions[:-1],
+            BulkUpdateTasksArgs(task_ids=ids, priority="high"),
+        )
+
+    with pytest.raises(RuntimeError, match="length mismatch"):
+        domain._bulk_update_parameters(
+            ACTOR_ID,
+            update_ids[:-1],
+            expected_versions,
+            BulkUpdateTasksArgs(task_ids=ids, priority="high"),
+        )
+
+
 def test_the_lock_keeps_its_canonical_order(db):
     """A set-based UPDATE does not remove the need for the ordered lock.
 
@@ -745,7 +805,14 @@ def test_the_probed_isolation_is_the_one_these_expectations_assume(db):
 
 
 def test_a_bulk_update_that_wins_leaves_a_stale_append_refused(db):
-    """Case A. The append carries a caller-supplied expected_version and loses.
+    """Case A of two commit orderings, under the isolation asserted above.
+
+    This exercises the ordering with real transactions on two connections. It
+    does not observe the lock-wait state at a particular instant, and does not
+    claim to: the barrier plus the held transaction make the ordering reliable,
+    and the assertions are about the committed outcome.
+
+    The append carries a caller-supplied expected_version and loses.
 
     The patch deliberately does not touch notes: a bulk call that replaced notes
     could legitimately overwrite an append, and then the test would pass for a
@@ -815,7 +882,9 @@ def test_a_bulk_update_that_wins_leaves_a_stale_append_refused(db):
 
 
 def test_an_append_that_wins_survives_the_bulk_update_behind_it(db):
-    """Case B. The bulk call has no caller expected_version, so it does not lose.
+    """Case B, the opposite ordering, same caveat about what it observes.
+
+    The bulk call has no caller expected_version, so it does not lose.
 
     It reads each version from the row it locked, and at READ COMMITTED a waiter
     is handed the row as the winner left it. So the append commits, the bulk
@@ -947,6 +1016,28 @@ def test_the_bulk_description_tells_the_model_when_to_prefer_one_call():
     assert "append" in lowered, "bulk cannot append, and the model must know"
 
 
+def test_the_bulk_description_carries_the_rules_the_schema_cannot():
+    """The cross-field rule is invisible in JSON Schema, so it must be in words.
+
+    `minItems` reaches the model through the generated schema. The
+    structurally-effective-operation rule cannot: it is a validator that runs
+    after parsing. If the description stops stating it, the model has no way to
+    learn it except by failing, and the only thing still protecting it is a
+    retry loop. Asserting the schema alone would not notice that.
+    """
+    description = _definitions()[ToolName.BULK_UPDATE_TASKS.value].description
+    lowered = description.lower()
+
+    assert "at least one field" in lowered, (
+        "the description no longer tells the model a patch needs an operation"
+    )
+    assert "omit" in lowered, "the description no longer says to omit unchanged fields"
+    assert "null" in lowered, "the description no longer explains what null means"
+    assert "due_date" in lowered and "blocked_by" in lowered, (
+        "the description no longer names the two fields null can legitimately clear"
+    )
+
+
 def test_the_bulk_schema_the_model_sees_carries_the_bound_and_no_append():
     schema = _definitions()[ToolName.BULK_UPDATE_TASKS.value].parameters_json_schema
     assert "append_notes" not in schema["properties"]
@@ -954,55 +1045,53 @@ def test_the_bulk_schema_the_model_sees_carries_the_bound_and_no_append():
     assert schema["properties"]["task_ids"]["minItems"] == 1
 
 
-def test_the_barrier_actually_keeps_the_bulk_tool_from_overlapping(db):
-    """Behavioural half. Remove `sequential=True` and this must fail.
+def test_a_sequential_tool_does_not_overlap_a_sibling_in_the_same_response():
+    """Pydantic AI framework behaviour, proven by synchronisation rather than timing.
 
-    Trellis tools are synchronous, so Pydantic AI runs them on worker threads;
-    two calls in one response would otherwise overlap in real time. The probe
-    records entry and exit rather than timing anything, so there is no sleep
-    race to lose.
+    This is a claim about the framework, not about Trellis registration: it
+    establishes what `sequential=True` buys, using a throwaway agent. That the
+    real bulk tool carries the flag is a separate proof, above.
+
+    The barrier tool asks, with a bounded wait, whether its sibling has started.
+    Under the barrier the sibling cannot have started, so the wait times out and
+    the answer is "isolated". Without the barrier the sibling is scheduled
+    alongside it on a worker thread, sets the event, and the wait returns early
+    with "overlap". Nothing here infers concurrency from elapsed time, so there
+    is no race to lose and no sleep to tune: the only timeout is the bound that
+    stops a regression from hanging the suite.
     """
-    run_id = _run()
-    tasks = _tasks(db, run_id, 2)
-
-    timeline: list[str] = []
+    sibling_started = threading.Event()
+    observed: list[str] = []
     guard = threading.Lock()
-    inside = threading.Event()
 
     def note(event: str):
         with guard:
-            timeline.append(event)
+            observed.append(event)
 
-    agent = Agent(
-        FunctionModel(_two_calls_then_stop(tasks)),
-        output_type=str,
-    )
+    agent = Agent(FunctionModel(_two_calls_then_stop()), output_type=str)
 
     @agent.tool_plain(sequential=True)
     def bulk_like(marker: str) -> str:
         note(f"bulk-enter:{marker}")
-        inside.set()
-        time.sleep(0.3)
-        note(f"bulk-exit:{marker}")
+        overlapped = sibling_started.wait(timeout=1)
+        note("overlap" if overlapped else "isolated")
         return "ok"
 
     @agent.tool_plain
-    def other(marker: str) -> str:
-        # If the barrier is absent, this is scheduled alongside the bulk call
-        # and its entry lands between the bulk enter and exit.
-        note(f"other-enter:{marker}")
-        note(f"other-exit:{marker}")
+    def sibling(marker: str) -> str:
+        sibling_started.set()
+        note(f"sibling:{marker}")
         return "ok"
 
     agent.run_sync("go")
 
-    bulk_enter = timeline.index("bulk-enter:a")
-    bulk_exit = timeline.index("bulk-exit:a")
-    between = timeline[bulk_enter + 1 : bulk_exit]
-    assert between == [], f"a sibling call ran inside the barrier: {timeline}"
+    assert "isolated" in observed, f"the sibling ran inside the barrier: {observed}"
+    assert "overlap" not in observed, observed
+    assert observed.index("bulk-enter:a") < observed.index("sibling:b"), observed
 
 
-def _two_calls_then_stop(tasks):
+def _two_calls_then_stop():
+    """One response carrying two tool calls, then a plain reply."""
     state = {"called": False}
 
     async def model(messages: list[ModelMessage], info: AgentInfo):
@@ -1012,7 +1101,7 @@ def _two_calls_then_stop(tasks):
         return ModelResponse(
             parts=[
                 ToolCallPart("bulk_like", {"marker": "a"}),
-                ToolCallPart("other", {"marker": "b"}),
+                ToolCallPart("sibling", {"marker": "b"}),
             ]
         )
 
@@ -1027,6 +1116,151 @@ def test_the_prompt_routes_a_same_patch_request_to_one_bulk_call():
     assert "bulk_update_tasks" in text
     assert "same change" in text or "same patch" in text
     assert "update_task call per task" in text or "single calls" in text
+
+
+def _retry_parts(messages):
+    """Every RetryPromptPart Pydantic AI has sent back to the model so far."""
+    return [
+        part
+        for message in messages
+        for part in getattr(message, "parts", [])
+        if isinstance(part, RetryPromptPart)
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid, expected_signal",
+    [
+        ({"task_ids": [], "priority": "high"}, "at least 1 item"),
+        ({"task_ids": ["<id>"]}, "at least one field to change"),
+        ({"task_ids": ["<id>"], "priority": None}, "at least one field to change"),
+    ],
+)
+def test_an_invalid_bulk_call_is_retried_before_it_can_mutate(
+    db, monkeypatch, invalid, expected_signal
+):
+    """The model-boundary half of D-79's two new refusals.
+
+    The `task_ids` bound is visible in the JSON schema, but the
+    structurally-effective-operation rule is a cross-field validator that runs
+    after parsing, so the model cannot read it off the schema and will
+    sometimes emit a call that breaks it. What has to be true then is the
+    lifecycle Pydantic AI documents: arguments are validated before the tool
+    runs, a `ValidationError` becomes a `RetryPromptPart` carrying the details,
+    and the tool body never executes.
+
+    Proving "the schema says minItems 1" does not prove any of that. This drives
+    a real invalid call through the real agent seam and watches where it stops.
+    """
+    run_id = _run()
+    task = _task(db, run_id)
+
+    arguments = dict(invalid)
+    if arguments["task_ids"] == ["<id>"]:
+        arguments["task_ids"] = [str(task.id)]
+
+    entered: list[str] = []
+    real_tool = tools.bulk_update_tasks
+
+    def spy(ctx, args):
+        entered.append("body")
+        return real_tool(ctx, args)
+
+    monkeypatch.setattr(tools, "bulk_update_tasks", spy)
+
+    seen: dict[str, object] = {}
+    state = {"turn": 0}
+
+    async def model(messages: list[ModelMessage], info: AgentInfo):
+        state["turn"] += 1
+        if state["turn"] == 1:
+            return ModelResponse(
+                parts=[ToolCallPart(ToolName.BULK_UPDATE_TASKS.value, arguments)]
+            )
+        if state["turn"] == 2:
+            # The invalid call must have come back as a retry, and it must not
+            # have reached the tool body on its way.
+            seen["retries"] = _retry_parts(messages)
+            seen["entered_before_retry"] = list(entered)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        ToolName.BULK_UPDATE_TASKS.value,
+                        {"task_ids": [str(task.id)], "priority": "high"},
+                    )
+                ]
+            )
+        return ModelResponse(parts=[TextPart("done")])
+
+    built = agent_module.build_agent(FunctionModel(model))
+    built.run_sync(
+        "set them to high priority",
+        deps=agent_module.TrellisDeps(actor_id=ACTOR_ID, run_id=run_id),
+    )
+
+    retries = seen["retries"]
+    assert retries, "the invalid call produced no retry prompt"
+    assert any(
+        part.tool_name == ToolName.BULK_UPDATE_TASKS.value for part in retries
+    ), retries
+    detail = " ".join(str(part.content) for part in retries)
+    assert expected_signal in detail, detail
+
+    assert seen["entered_before_retry"] == [], (
+        "the invalid call reached the tool body before validation refused it"
+    )
+
+    # The corrected call went through the ordinary path exactly once.
+    assert entered == ["body"], entered
+    row = _row(db, task.id)
+    assert row["priority"] == "high"
+    assert row["version"] == task.version + 1
+    assert len(_events_for(db, task.id)) == 2
+
+
+@pytest.mark.parametrize("field", ["due_date", "blocked_by"])
+def test_an_explicit_null_clear_is_not_treated_as_an_invalid_call(db, field):
+    """The refusal must not catch the two fields whose null is a real value.
+
+    Guards the obvious overcorrection: a validator that rejected every null
+    would also reject the only way to clear a due date or a blocker in bulk.
+    """
+    run_id = _run()
+    blocker = _task(db, run_id, title="Blocker")
+    task = _task(
+        db,
+        run_id,
+        title="Target",
+        due_date=date(2026, 9, 1),
+        blocked_by=blocker.id,
+    )
+
+    entered: list[str] = []
+    real_tool = tools.bulk_update_tasks
+
+    async def model(messages: list[ModelMessage], info: AgentInfo):
+        if entered:
+            return ModelResponse(parts=[TextPart("done")])
+        entered.append("called")
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    ToolName.BULK_UPDATE_TASKS.value,
+                    {"task_ids": [str(task.id)], field: None},
+                )
+            ]
+        )
+
+    built = agent_module.build_agent(FunctionModel(model))
+    built.run_sync(
+        f"clear the {field}",
+        deps=agent_module.TrellisDeps(actor_id=ACTOR_ID, run_id=run_id),
+    )
+    assert real_tool is tools.bulk_update_tasks
+
+    row = _row(db, task.id)
+    assert row[field] is None, f"{field} was not cleared"
+    assert row["version"] == task.version + 1
 
 
 def test_a_model_emitted_bulk_call_reaches_the_database(db):

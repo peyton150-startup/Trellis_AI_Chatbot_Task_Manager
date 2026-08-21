@@ -491,21 +491,35 @@ class BulkUpdateTasksArgs(MutableTaskFields):
     task_ids: list[UUID] = Field(min_length=1, max_length=BULK_TASK_IDS_MAX)
 
     @model_validator(mode="after")
-    def _patch_changes_something(self) -> "BulkUpdateTasksArgs":
-        """Refuse a call that names targets but cannot change any of them.
+    def _requires_a_structurally_effective_operation(self) -> "BulkUpdateTasksArgs":
+        """Refuse a call carrying no operation that can reach the SET list.
 
-        Presence is not effect, so `model_fields_set` alone is the wrong test.
+        Be exact about the claim. This is a structural test, not a semantic one:
+        it establishes that the patch contains at least one operation capable of
+        writing a column, never that the stored value will end up different.
+        Setting priority to high on a task that is already high is structurally
+        effective and stays valid, as it should, because the caller asked for a
+        state and the row will be in it.
+
+        What it rejects is the patch that cannot write anything at all.
         `UPDATE_TASK_GUARDED` and its bulk counterpart apply `title`, `notes`,
         `priority`, and `status` through COALESCE, where an explicit null is
-        indistinguishable from an omission and changes nothing. `due_date` and
-        `blocked_by` are the two fields whose null is a value, carried by a set
-        flag, so naming either of them is always effective. `notes=""` is a real
-        clear and stays valid.
+        indistinguishable from an omission, so a patch of only those nulls
+        reaches the SET list and leaves every column as it found it. `due_date`
+        and `blocked_by` are the two fields whose null is a value, carried by a
+        set flag, so naming either of them is always an operation, including as
+        a clear. `notes=""` is a real clear and stays valid.
 
         Without this, such a call still locked every target, still incremented
-        every version, and still wrote an event per task recording a mutation
-        in which nothing differs between before and after. Refusing costs the
-        model one corrected retry and keeps the audit log honest.
+        every version, and still wrote an event per task in which before and
+        after are identical. That is a version increment and an audit row
+        recording a mutation that did not happen.
+
+        This is a cross-field rule, so it lives after validation rather than in
+        the JSON schema, which means the model cannot infer it from the schema
+        the way it infers the `task_ids` bounds. The tool description carries it
+        in words for that reason, and an invalid call is corrected through
+        Pydantic AI's retry channel rather than reaching the tool body.
         """
         effective = (
             self.title is not None
@@ -517,9 +531,11 @@ class BulkUpdateTasksArgs(MutableTaskFields):
         )
         if not effective:
             raise ValueError(
-                "bulk_update_tasks needs at least one field that changes the "
-                "named tasks; send a value, or send due_date or blocked_by as "
-                "null to clear them"
+                "bulk_update_tasks needs at least one field to change: send a "
+                "value for title, notes, priority, or status, or send due_date "
+                "or blocked_by (null clears them). Omit fields you are not "
+                "changing; a null title, notes, priority, or status is read as "
+                "omitted and changes nothing"
             )
         return self
 

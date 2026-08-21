@@ -4108,30 +4108,78 @@ change what the tool means, what it guards, or how many tools exist.
    `version = expected_version` predicate decide every row, and a row whose
    version moved still matches nothing and still refuses the whole call.
 
-   Measured at the implementing SHA against PostgreSQL 16.12: at fifty targets,
-   task UPDATE statements go from 50 to 1 and core SQL statements from 101 to
-   52, with median wall time 153.21 ms to 90.56 ms over thirty iterations. At a
-   single target there is no gain and none is claimed.
+   State the improvement narrowly. What becomes constant with the target count
+   is the number of task UPDATE statements the application issues, N to 1.
+   PostgreSQL still processes N target rows, and D-79 still issues one audit
+   INSERT per physical task, so this is not an O(1) transaction and the phrase
+   is not used. "Core SQL" in the benchmark below counts application-issued
+   statements only; it excludes PostgreSQL's internal work, per-row processing,
+   trigger execution, and planner and executor cost.
 
-3. **Audit rows stay one per task.** `write_events` remains an N-insert loop, so
-   this is an O(1) task-update transaction with O(N) audit inserts, not an O(1)
-   transaction. Each event carries its own exact `before`, the row this
-   transaction locked, and its own exact `after`, the row the statement
-   returned. There is nothing to batch away there without losing the property
-   that makes the log able to say what each task was. Batching the inserts is
-   not authorized by this decision and would need its own, justified by its own
-   measurement.
+   Structural result, exact and durable:
 
-4. **The expected relation is built once and cannot drift.** `unnest` over two
+   ```text
+   50 targets: task UPDATE statements  50 -> 1
+   ```
+
+   Environment-specific results, PostgreSQL 16.12, `read committed`, thirty
+   iterations, fifty targets, loop against set-based:
+
+   ```text
+                          core SQL     median              p95
+   at 1caf13a             101 -> 52    153.21 -> 90.56 ms  217.04 -> 127.82 ms
+   at the hardening SHA   101 -> 52    261.32 -> 153.47 ms 450.29 -> 189.37 ms
+   ```
+
+   Both runs are reported rather than one, because the second is the honest
+   picture. Every absolute figure rose between them, the unchanged loop baseline
+   included. That is consistent with environmental and runtime variability
+   rather than with a cost introduced by the hardening, since the baseline that
+   rose alongside it was not modified at all; the benchmark does not establish
+   the exact cause and none is claimed. What reproduces is the ratio, 1.69x and
+   then 1.70x at fifty targets, and the statement counts, which are identical.
+
+   Read the absolute numbers as belonging to the run that produced them and to
+   nothing else. The durable claim is the statement count; the timing is
+   evidence that it matters on one machine, not a specification. At a single
+   target there is no gain and none is claimed.
+
+3. **Audit rows stay one per task, by choice rather than by necessity.**
+   `write_events` remains an N-insert loop, and each event carries its own exact
+   `before`, the row this transaction locked, and its own exact `after`, the row
+   the statement returned.
+
+   The earlier phrasing here claimed there was nothing to batch without losing
+   that fidelity. That was wrong and is corrected: PostgreSQL can insert several
+   rows in one `INSERT` and can `RETURNING` information for all of them, so
+   distinct per-task snapshots do not inherently require N commands. Batching is
+   therefore deferred, not impossible. A separate optimization would have to
+   prove the exact per-task `before` and `after`, event identity, actor, tool
+   and run correlation, any ordering consumers rely on, trigger behaviour,
+   atomic failure behaviour, and a measured benefit. None of that is in scope
+   here.
+
+4. **The expected relation is guarded at two boundaries.** `unnest` over two
    arrays does not reject unequal lengths; it NULL-pads the shorter one, and
    `version = NULL` matches no row. A dropped expectation therefore fails closed
    but arrives disguised as a target-coverage conflict, which describes the
-   wrong problem. So both arrays are unzipped from one tuple of pairs, and
-   `_expected_relation` refuses a malformed set, a duplicated target, or a null
-   member with `RuntimeError` before the statement runs. `UPDATE ... FROM`
-   additionally requires at most one source row per target row, or one arbitrary
-   source silently wins, which is why the duplicate check is a correctness
-   invariant rather than tidiness.
+   wrong problem.
+
+   Deriving both arrays from one tuple of pairs prevents ordinary construction
+   drift, and `_expected_relation` refuses a malformed set, a duplicated target,
+   or a null member with `RuntimeError`. That is not sufficient on its own: the
+   two arrays are separate values from the moment that function returns, and
+   `_bulk_update_parameters` accepts them as independent arguments, so a later
+   drop or a second caller assembling them itself would pass the construction
+   check. `_bulk_update_parameters` therefore reasserts equal cardinality on the
+   exact values crossing into SQL. Construction is validated where it happens;
+   binding is validated where it happens.
+
+   `UPDATE ... FROM` additionally needs at most one source row per target row,
+   and this is Trellis's obligation rather than a refusal PostgreSQL will make:
+   the database does not reject a join matching several source rows, it uses one
+   of them, and which one is not predictable. That is why the duplicate check is
+   a correctness invariant rather than tidiness.
 
 5. **Returned coverage is checked, and partial success is impossible.**
    `RETURNING` has no ordering to rely on, so rows are keyed by id and the
@@ -4153,14 +4201,32 @@ change what the tool means, what it guards, or how many tools exist.
 
 8. **Two accidental contracts are closed.** `task_ids` gains `min_length=1`: a
    call naming no targets used to validate and return an empty success, which
-   reads to the model as a completed bulk update. And a call whose patch cannot
-   change anything is refused, because `title`, `notes`, `priority`, and
-   `status` reach SQL through `COALESCE`, where an explicit null is
-   indistinguishable from an omission. Such a call used to lock every target,
-   increment every version, and write an event per task in which nothing
-   differs. `due_date` and `blocked_by` carry a set flag, so naming either of
-   them, including as null, remains an effective clear, and `notes=""` remains a
-   real clear.
+   reads to the model as a completed bulk update. And a call carrying no
+   structurally effective operation is refused, because `title`, `notes`,
+   `priority`, and `status` reach SQL through `COALESCE`, where an explicit null
+   is indistinguishable from an omission. Such a call used to lock every target,
+   increment every version, and write an event per task in which before and
+   after are identical. `due_date` and `blocked_by` carry a set flag, so naming
+   either of them, including as null, is always an operation, and `notes=""`
+   remains a real clear.
+
+   The term is deliberate. This is a structural test, establishing that the
+   patch contains an operation capable of writing a column. It does not claim
+   the stored value will differ: setting priority to high on an already-high
+   task is structurally effective and stays valid, because the caller asked for
+   a state and the row will be in it. A rule that tried to prove a difference
+   would have to read the rows first, which is a much stronger claim than the
+   one made here.
+
+   `min_length` appears in the JSON schema the model sees. The effective-
+   operation rule cannot, because it is a cross-field validator that runs after
+   parsing, so the model cannot infer it from the schema and will sometimes
+   break it. The tool description therefore states it in words, and an invalid
+   call is corrected through Pydantic AI's documented lifecycle: arguments are
+   validated before the tool runs, a `ValidationError` becomes a
+   `RetryPromptPart` carrying the detail, and the tool body never executes.
+   That lifecycle is proven for both refusals rather than assumed, including
+   that the body was not entered and that a corrected call then commits once.
 
 9. **`bulk_update_tasks` is a Pydantic AI sequential barrier.** `max_concurrency`
    bounds concurrent agent runs and says nothing about several tool calls
@@ -4202,3 +4268,99 @@ This decision authorizes no migration, table, column, endpoint, status value,
 error code, dependency, or tool. It adds one SQL constant and one CI gate. It
 changes no approval, idempotency, or undo semantics, it does not alter the D-74
 ceilings, and it adds no bulk append.
+
+### D-79 hardening: expected refusals stay inside the Pydantic tool protocol
+
+Found by a live dependency-chain test during manual verification, not by any
+gate. The model built a blocking chain, reused an `expected_version` it
+remembered from earlier in the same turn, and `update_task` refused it. The
+refusal was correct. Where it ended up was not.
+
+Pydantic AI recognises exactly two application-level outcomes from a tool body.
+`ModelRetry` returns a retry prompt so the model can correct the call, and
+`ToolFailed` returns a definitively failed result the model can adapt to without
+spending retry budget. Anything else is not a tool outcome at all: it leaves the
+protocol and aborts the run. Trellis raised ordinary application exceptions for
+refusals that are a normal part of a model driving a mutating API, so a stale
+version ended the turn and took the response stream with it.
+
+This was reproduced deterministically before it was fixed. Driving the real
+agent with a `FunctionModel` emitting a stale `expected_version` aborted
+`run_sync` on the first model turn with `VersionConflictError`. The same probe
+showed `OutOfScopeError` escaping identically, and showed that an oversized
+`append_notes` did **not** escape, because Pydantic validates it against the
+schema before the tool body runs and returns a retry on its own.
+
+The persisted failed invocation from the original manual session was not
+available: the deterministic test fixtures truncate `tool_invocations` and
+`agent_runs`, so that evidence had already been cleared. The reproduction stands
+in for it and is stronger, because it is repeatable.
+
+1. **The refusals themselves are unchanged.** `domain.update_task` still compares
+   the locked version and still raises. `policy` still raises the same shared
+   refusal for a missing and a foreign task. `UPDATE_TASK_GUARDED` keeps its
+   version predicate. Every deterministic caller, undo included, still reads the
+   Trellis exception contract exactly as before. Weakening the guard to avoid
+   retries would have been the wrong fix for a correct refusal.
+
+2. **The translation lives at the model-facing adapter.** `agent.py` is the one
+   layer that knows its caller is a model, and `_model_facing_refusals` is a
+   context manager applied at all eight tool wrappers rather than at one. Every
+   tool reaches `policy.check`, so every tool can be refused this way, and a
+   translation present on only `update_task` would leave the same aborted stream
+   reachable through the other seven.
+
+3. **Three refusals are translated, and the outcome is chosen per refusal.**
+
+   ```text
+   VERSION_CONFLICT     ModelRetry   the request may still be valid and only the
+                                     token is stale, so the next action is known
+   EXTERNAL_DIVERGENCE  ToolFailed   the disagreement is with Linear, not with
+                                     the arguments, so a retry earns the same
+                                     refusal
+   OUT_OF_SCOPE         ToolFailed   the reference cannot be used, and retrying
+                                     the same identifier cannot change that
+   ```
+
+   Schema validation and approval already have framework paths and are left
+   alone.
+
+4. **Nothing else is translated.** A blanket `except PolicyError` or
+   `except Exception` would convert bugs, outages, and serialization failures
+   into a polite suggestion that the model try again, hiding the failures most
+   worth seeing and inviting a loop on them. A refusal earns a translation only
+   when its next action is known. A test asserts the caught set by parsing the
+   handler, so broadening it is a failing test rather than a silent change.
+
+5. **The out-of-scope message does not enumerate.** A missing task and another
+   actor's task are deliberately the same refusal, and `policy` raises it before
+   the divergence check to keep them indistinguishable. The model-facing text
+   says only that the reference is not available for this operation. Saying "no
+   such task" or "not yours" would make the model an oracle for which task ids
+   exist, undoing that boundary. A test drives both cases and asserts the model
+   was told the identical thing.
+
+6. **No new version travels in the retry.** Handing the current version back in
+   the message would make an exception payload a second source of task state,
+   competing with the resolver, and it would be wrong anyway if the row had been
+   deleted rather than updated. The model is told to resolve the reference again
+   and use what that returns.
+
+7. **The original cause is preserved.** Every translation uses `raise ... from
+   exc`, so logs keep the actual Trellis reason while the model sees only the
+   chosen sentence. Asserted by parsing the handlers rather than by reading them.
+
+8. **One prompt rule was added, narrowly.** The prompt already required
+   `expected_version` to come from the authoritative lookup, but never said when
+   that lookup had to have happened, so a version read earlier in the same turn
+   satisfied it as written, which is exactly what the observed trace did. The
+   rule now states that an expected version is an ephemeral concurrency token
+   rather than a remembered fact. No other prompt text changed.
+
+This hardening authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It changes no policy, approval, idempotency,
+undo, or database semantics, and it makes no frontend change. The observed
+browser symptom, an AG-UI `TEXT_MESSAGE_CONTENT` without a preceding
+`TEXT_MESSAGE_START`, is consistent with a stream aborted mid-message, but this
+decision does not claim to have root-caused that console error, only to have
+removed the failure class that aborted the run.
