@@ -3198,5 +3198,30 @@ assert that its target was found; the script does.
   A refactor making `ALL_TOOLS` narrower than `ToolName` now fails CI rather
   than leaving the header advertising capabilities the browser agent no longer
   has. Mutation M15 is exactly that refactor and is caught.
-- Neutral blind review not yet run. Deferred by the user so that one review
-  covers this PR and the D-79 PR together.
+- Review history, and why the current SHA is unreviewed. Three neutral blind
+  reviews have run against this branch, each against an immutable SHA, and each
+  found exactly one real defect:
+
+  ```text
+  89e3dad   MAJOR  rule 9 still told the model to join notes itself,
+                   plus 2 MINOR stale counts in this file
+  692bd1a   fix    rule 9's consequence named the wrong failure mode:
+                   existing text inside append_notes duplicates rather
+                   than replaces
+  a80c9cb   MINOR  a stale expected_version plus an overflowing append
+                   refused as VALIDATION_ERROR rather than VERSION_CONFLICT
+  ```
+
+  Each fix created a new SHA and voided the review that preceded it, which is
+  the intended loop rather than a sign of churn. The current candidate is
+  unreviewed and a fresh review is owed against it.
+
+  Worth recording for whoever reviews next: every defect found so far has been
+  in the model-facing text or in this file, never in the mechanism. The merge,
+  the ceiling, `model_fields_set`, the bulk exclusion, replay, and the version
+  and event bookkeeping have survived independent probing three times.
+
+  The earlier plan to defer this review so that one review covered both D-78 and
+  D-79 was abandoned. D-79 is a separate session and a separate PR, which lets
+  the D-78 versus bulk concurrency tests run against merged D-78 code rather
+  than a review-only integration tree.
