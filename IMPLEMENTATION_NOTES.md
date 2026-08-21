@@ -3091,13 +3091,13 @@ and set-based semantics.
 
 ```text
 ruff check .                                clean
-pytest tests/test_d78_note_append.py        35 passed
-pytest -m "not network"                     428 passed, 13 deselected
+pytest tests/test_d78_note_append.py        37 passed
+pytest -m "not network"                     430 passed, 13 deselected
 npm run test:tools                          6 passed
 npm run build                               compiled, 3 static pages
 ```
 
-Author mutation audit, 16 mutations, all caught after two fixes:
+Author mutation audit, 18 mutations, all caught after two fixes:
 
 ```text
 M5  separator removed                       15 tests fail
@@ -3112,6 +3112,8 @@ M13 tool description weakened                1 test fails
 M14 field description dropped                1 test fails
 M15 ALL_TOOLS narrower than ToolName         1 test fails
 M16 rule 9 manual-join instruction restored  1 test fails
+M17 inaccurate rule 9 consequence restored   1 test fails
+M18 schema names the wrong consequence       1 test fails
 M1  a ninth backend tool lands               2 tests fail
 M2  a header label dropped                   3 tests fail
 M3  a snake_case wire name displayed         3 tests fail

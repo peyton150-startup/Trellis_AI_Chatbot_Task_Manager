@@ -140,7 +140,8 @@ AppendedTaskNotes = Annotated[
         description=(
             "Only the new note text to append. "
             "Do not include the task's existing notes. "
-            "The server preserves the existing notes and appends this fragment."
+            "The server preserves the existing notes and appends this fragment. "
+            "Including existing note text would duplicate it."
         ),
     ),
 ]

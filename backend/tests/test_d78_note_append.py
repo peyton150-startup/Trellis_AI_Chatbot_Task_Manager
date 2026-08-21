@@ -237,6 +237,69 @@ def test_no_rule_anywhere_tells_the_model_to_join_notes_itself():
     )
 
 
+def test_the_prompt_names_the_two_wrong_calls_by_their_real_consequence():
+    """Duplication and replacement are different failures, and saying the wrong
+    one teaches the wrong lesson.
+
+    An earlier revision of rule 9 said that resending existing text inside
+    `append_notes` "would replace the notes rather than extend them". That is
+    not what happens. The server appends whatever fragment it is given, so
+    including the existing text duplicates it:
+
+        merge_appended_notes("buy bananas", "buy bananas\\nbuy apples")
+            -> "buy bananas\\nbuy bananas\\nbuy apples"
+
+    Replacement is the consequence of the other wrong call, reconstructing the
+    whole value and sending it through `notes`. A model told that the first
+    mistake causes the second has no way to reason about either.
+    """
+    from app.prompts import SYSTEM_PROMPT
+
+    # Existing text inside the fragment duplicates.
+    assert "doing so would duplicate existing text" in SYSTEM_PROMPT
+
+    # A reconstructed whole value through `notes` replaces.
+    assert "reconstruct the complete note and send it through notes" in SYSTEM_PROMPT
+
+    # And the inaccurate consequence must not come back.
+    assert "resending it would replace the notes rather than extend them" not in (
+        SYSTEM_PROMPT
+    )
+
+
+def test_the_duplication_consequence_reaches_the_model_facing_schema():
+    """The precise consequence belongs in the generated schema, not only prose.
+
+    The parameter description is part of what Pydantic AI sends to the provider,
+    so a model reading the schema alone still learns what including existing
+    text would cost it.
+    """
+    from pydantic_ai.models.test import TestModel
+
+    from app import agent as agent_module
+
+    test_model = TestModel(call_tools=[])
+    built = agent_module.build_agent(test_model)
+    built.run_sync(
+        "hello",
+        deps=agent_module.TrellisDeps(actor_id=ACTOR_ID, run_id=uuid4()),
+    )
+
+    update = next(
+        tool
+        for tool in test_model.last_model_request_parameters.function_tools
+        if tool.name == "update_task"
+    )
+    append_schema = update.parameters_json_schema["properties"]["append_notes"]
+    constraint = next(
+        option for option in append_schema["anyOf"] if option.get("type") == "string"
+    )
+
+    assert "Including existing note text would duplicate it." in (
+        constraint["description"]
+    )
+
+
 def test_the_model_facing_schema_carries_the_append_contract():
     """Assert the definition the model is actually sent, not just the class.
 

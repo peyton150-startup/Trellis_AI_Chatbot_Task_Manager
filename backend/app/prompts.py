@@ -177,8 +177,10 @@ EXECUTION RULES
        buy apples
        buy pears
 
-   You send only the two new lines. The first line is already there, and
-   resending it would replace the notes rather than extend them.
+   You send only the two new lines. The first line is already stored. Do not
+   include it in append_notes; doing so would duplicate existing text. Do not
+   reconstruct the complete note and send it through notes; that would replace
+   the authoritative current value with a model-assembled value.
 
    Never one line reading "buy bananas buy apples buy pears", and never one line
    reading "buy bananas, buy apples, buy pears".
