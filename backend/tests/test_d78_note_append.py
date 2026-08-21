@@ -849,12 +849,26 @@ def test_a_missing_or_foreign_target_still_refuses_identically(db):
 
 
 def test_the_comparison_reads_the_locked_version_not_a_pre_lock_read(db):
-    """Prove the precedence rests on the PostgreSQL lock, not on timing.
+    """Exercise the contended path: current at start, stale by the time it locks.
 
-    A transaction that has to wait on `FOR UPDATE` is handed the row as the
-    winning transaction left it. So a caller that was current when it started,
-    and stale by the time it acquired the lock, must still refuse as a version
-    conflict rather than validating an append against the state it remembers.
+    A transaction that waits on `FOR UPDATE` is handed the row as the winning
+    transaction left it. So a caller that was current when it started, and stale
+    by the time it acquired the lock, must still refuse as a version conflict
+    rather than validating its append against the state it remembers.
+
+    Be precise about what this harness establishes. The barrier guarantees the
+    loser cannot begin before the winner has updated the row and is holding the
+    transaction open; the sleep then widens the contention window. Neither
+    guarantees the operating system scheduled the loser all the way into
+    PostgreSQL's lock wait before that window closed. So this exercises the
+    contended path and would catch a regression that made the comparison read
+    pre-lock state, but it is not a formal proof that a wait state was observed.
+
+    Wait-state introspection through `pg_locks` would close that gap and was
+    considered. It was not adopted: it couples a regression test to database
+    internals, and the mutation it would additionally catch has not been
+    demonstrated. If someone later shows a mutation surviving because the loser
+    missed the window, that is the evidence that would justify the complexity.
     """
     run_id = _run()
     task = _task(db, run_id, notes="x" * (TASK_NOTES_MAX_CHARS - 1))
@@ -874,8 +888,9 @@ def test_the_comparison_reads_the_locked_version_not_a_pre_lock_read(db):
                 conn=conn,
             )
             started.wait(timeout=30)
-            # Hold the row briefly so the loser is forced to wait on the lock
-            # rather than racing past it.
+            # Hold the row to widen the contention window. This makes the
+            # contended path overwhelmingly likely, not certain; see the
+            # docstring for what that does and does not establish.
             time.sleep(0.5)
             conn.commit()
             with guard:
