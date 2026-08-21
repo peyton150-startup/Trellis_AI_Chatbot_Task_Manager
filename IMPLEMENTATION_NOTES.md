@@ -3056,3 +3056,172 @@ reforms under the original id with a forward version) is a single test.
   provider-compatibility finding, not authority to weaken the deterministic
   contracts.
 - This entry records author-run verification only; neutral review is pending.
+
+## D-78: deterministic single-task note append
+
+**Local role:** `update_task` gains `append_notes`, carrying only new note text.
+`domain.merge_appended_notes` joins it to the authoritative current value behind
+the row lock the mutation already takes, and `domain._effective_update` turns the
+append request into an ordinary replacement before the guarded UPDATE sees it.
+The page header gains the browser agent's tool profile.
+
+**Whole-system role:** it removes one place where the model was the temporary
+owner of authoritative state. Honouring "add a note" previously required the
+model to read the current notes, join them from memory, and send the whole value
+back, so anything that changed in between was overwritten by a write that reads
+in the audit log as a deliberate replacement. `expected_version` does not catch
+it: a stale note travels happily inside a call carrying a current version. This
+is the same class of defect as D-77, where a persisted pre-delete snapshot
+implied a task still existed, and the same shape of fix, which is to make
+deterministic code state the thing rather than letting a remembered value stand
+in for current truth.
+
+**Inputs and dependencies:** the D-74 `TASK_NOTES_MAX_CHARS` ceiling; the
+existing lock, guarded UPDATE, and idempotency lease; `_update_parameters` and
+its `model_fields_set` contract; `ALL_TOOLS` as the browser capability profile.
+
+**Outputs and consumers:** `append_notes` on `UpdateTaskArgs` only;
+`merge_appended_notes` as the single separator rule;
+`frontend/lib/agentTools.ts` as the one display list, consumed by the page
+header and by the cross-boundary test. A future bulk-append decision would
+consume the merge rule but owes per-row merging, per-row final-size validation,
+and set-based semantics.
+
+**Verification:**
+
+```text
+ruff check .                                clean
+pytest tests/test_d78_note_append.py        43 passed
+pytest -m "not network"                     436 passed, 13 deselected
+npm run test:tools                          6 passed
+npm run build                               compiled, 3 static pages
+```
+
+Author mutation audit, 21 mutations. 19 caught, 1 equivalent, 1 caught
+by a neighbouring suite:
+
+```text
+M5  separator removed                       15 tests fail
+M6  trailing newline stops separating        2 tests fail
+M7  caller newline normalized away           SURVIVED, then fixed
+M8  fragment sized instead of merged value   2 tests fail
+M9  model_copy replaced by model_validate   13 tests fail
+M10 append moved onto MutableTaskFields      1 test fails
+M11 mutual-exclusion validator removed       2 tests fail
+M12 prompt ambiguity restored                1 test fails
+M13 tool description weakened                1 test fails
+M14 field description dropped                1 test fails
+M15 ALL_TOOLS narrower than ToolName         1 test fails
+M16 rule 9 manual-join instruction restored  1 test fails
+M17 inaccurate rule 9 consequence restored   1 test fails
+M18 schema names the wrong consequence       1 test fails
+M19 early version check removed              2 tests fail
+M20 check also fires for absent rows         EQUIVALENT, see below
+M21 SQL version guard removed                caught by the D-76 suite
+M1  a ninth backend tool lands               2 tests fail
+M2  a header label dropped                   3 tests fail
+M3  a snake_case wire name displayed         3 tests fail
+M4  a header label renamed                   2 tests fail
+```
+
+**M20 is an equivalent mutant and is recorded as one rather than papered over.**
+Widening the guard from `before is not None and ...` to `before is None or ...`
+changes nothing observable: an absent row raises `VersionConflictError` early
+under the mutant and raises the identical error via the guarded UPDATE without
+it. No test can distinguish them because there is nothing to distinguish. The
+narrow form is kept because it says what it means, not because a test forces it.
+
+**M21 is caught, but not by this suite.** Removing
+`AND version = %(expected_version)s` from `UPDATE_TASK_GUARDED` leaves all 43
+D-78 tests passing, because the new Python comparison catches staleness first on
+this path. It fails `test_a_stale_pre_delete_version_stays_invalid_after_restore`
+in the D-76 suite, which is what proves the SQL predicate is still load-bearing
+for the other callers of that statement. Worth stating plainly: the D-78 suite
+alone would not have noticed the fail-closed database invariant disappearing.
+
+**This table and the counts above went stale three times before a blind review
+caught it.** The note was written once at the first complete commit and then not
+revisited across three further commits that added tests and mutations, so it
+recorded 31 / 424 and eleven mutations while the suite actually had 34 / 427 and
+fifteen. Each commit message was accurate; the durable record was not, and the
+durable record is the one a future reader trusts. Update this block in the same
+commit that changes what it describes, not afterwards.
+
+**M7 is the one worth recording.** Stripping a caller-supplied leading newline
+inside `_effective_update` passed all 29 tests as originally written. The
+parametrized cases exercise `merge_appended_notes` directly, so a mutation to
+its *caller* left the merge rule provably correct while still editing the user's
+text on the way to PostgreSQL. Two database-level regressions now cover it. The
+general lesson is that a unit test of a pure helper does not protect the path
+that calls it, and mutation testing is what surfaces the difference.
+
+Two earlier mutation attempts, run through a shell heredoc, silently failed to
+apply because the heredoc mangled the backslash escapes, and reported as
+survivors. They were re-run from a script file. A mutation that does not apply
+looks exactly like a mutation the tests caught, so a mutation harness has to
+assert that its target was found; the script does.
+
+**Limitations and review status:**
+
+- Bulk append is not authorized and is structurally prevented rather than
+  merely undocumented: `append_notes` is on `UpdateTaskArgs`, a CI gate asserts
+  it is absent from `MutableTaskFields` and `BulkUpdateTasksArgs`, and a test
+  proves the bulk schema rejects it.
+- No live provider evidence. Whether the configured runtime model reliably
+  routes "add a note" to `append_notes` rather than reconstructing the whole
+  value is a compatibility question, not a correctness one; the typed backend
+  owns the semantics either way. A failing eval would be a prompt finding.
+- The header tool list is written out rather than derived at runtime, because
+  the authoritative profile is server-side and the browser is deliberately not
+  told what exists. The staleness that buys is covered by the cross-boundary
+  test, not by discipline.
+- The final-size check is a merged-length invariant, `len(merged) >
+  TASK_NOTES_MAX_CHARS`, not full Pydantic revalidation of `TaskNotes`. It is
+  exactly equivalent today, because `TaskNotes` carries only that one
+  constraint. It would stop being equivalent the moment `TaskNotes` grows a
+  second constraint, and nothing currently notices that drift. Stated as a
+  length invariant rather than as validation so the record does not claim more
+  than the code does.
+- The cross-boundary tool gate parses the `ToolName` enum text rather than
+  importing `agent.ALL_TOOLS`, and the parser had to be taught to normalize
+  CRLF, which is the kind of brittleness that argues for executing a value
+  rather than reading its source. The gap that mattered is now closed from the
+  backend side instead of by rewriting the parser. The chain is asserted end to
+  end:
+
+  ```text
+  header labels  <-> ToolName          frontend cross-boundary test
+  ToolName       <-> ALL_TOOLS         backend assertion
+  ALL_TOOLS      <-> function_tools    the model-facing schema
+  ```
+
+  A refactor making `ALL_TOOLS` narrower than `ToolName` now fails CI rather
+  than leaving the header advertising capabilities the browser agent no longer
+  has. Mutation M15 is exactly that refactor and is caught.
+- Review history, and why the current SHA is unreviewed. Three neutral blind
+  reviews have run against this branch, each against an immutable SHA, and each
+  found exactly one real defect:
+
+  ```text
+  89e3dad   MAJOR  rule 9 still told the model to join notes itself,
+                   plus 2 MINOR stale counts in this file
+  692bd1a   fix    rule 9's consequence named the wrong failure mode:
+                   existing text inside append_notes duplicates rather
+                   than replaces
+  a80c9cb   MINOR  a stale expected_version plus an overflowing append
+                   refused as VALIDATION_ERROR rather than VERSION_CONFLICT
+  ```
+
+  Each fix created a new SHA and voided the review that preceded it, which is
+  the intended loop rather than a sign of churn. The current candidate is
+  unreviewed and a fresh review is owed against it.
+
+  Worth recording for whoever reviews next: every defect found so far has been
+  in the model-facing text or in this file, never in the mechanism. The merge,
+  the ceiling, `model_fields_set`, the bulk exclusion, replay, and the version
+  and event bookkeeping have survived independent probing three times.
+
+  The earlier plan to defer this review so that one review covered both D-78 and
+  D-79 was abandoned. D-79 is a separate session and a separate PR, which lets
+  the D-78 versus bulk concurrency tests run against merged D-78 code rather
+  than a review-only integration tree.

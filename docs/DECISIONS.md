@@ -3953,3 +3953,130 @@ This decision authorizes no migration, table, column, endpoint, status value,
 error code, dependency, or tool. It changes no policy, approval, idempotency, or
 undo semantics, and it does not alter D-71 authorization, D-73 resolution, the
 D-74 ceilings, or the D-75 data-movement contract.
+
+### D-78: deterministic single-task note append
+
+Natural language distinguishes replacing notes from adding to them. The typed
+mutation contract did not. `update_task.notes` has always been a whole-value
+replacement, so the only way to honour "add a note to that task" was for the
+model to read the current notes, join them from memory, and send the entire
+value back.
+
+That is the model temporarily owning authoritative state, which is the thing
+this system exists not to do. The value it echoes back is one it read at some
+earlier point in the turn, and anything that changed in between is silently
+overwritten by a write that looks, in the audit log, exactly like a deliberate
+replacement. The optimistic-concurrency token does not save it either: a stale
+note can travel inside a call carrying a perfectly current `expected_version`.
+
+So the join moves into deterministic code, behind the row lock the mutation
+already takes.
+
+1. **One tool, one new optional field.** No ninth tool, no migration, no column.
+   `update_task` gains `append_notes`, which carries only the new fragment.
+
+   ```text
+   notes         replaces the whole value; "" clears
+   append_notes  only the new text; the server supplies the rest
+   ```
+
+   A call carrying both is refused rather than resolved by a precedence rule,
+   because a combined request has no obvious meaning and a rule nobody can read
+   off the schema is worse than a refusal. An empty `append_notes` is refused by
+   `min_length`: a call that asks for nothing must not produce a version
+   increment and an event recording a mutation that did not happen.
+
+2. **The field lives on `UpdateTaskArgs` and never on `MutableTaskFields`.**
+   `BulkUpdateTasksArgs` inherits that base, so a field added there would put a
+   bulk append in front of the model with none of what bulk append would need:
+   per-row merge against per-row current state, per-row final-size validation,
+   and set-based semantics. Bulk append is not authorized by this decision. A
+   later decision may authorize it, and would owe all three.
+
+3. **The merge reads locked state, not a caller snapshot.** `_effective_update`
+   runs after `_locked_tasks` and before the guarded UPDATE, so the value
+   appended to is the row this transaction already holds a lock on. No earlier
+   read by the model can be stale by the time the join happens.
+
+4. **One separator, and only when needed.**
+
+   ```text
+   alpha    + beta         -> alpha\nbeta
+   ""       + beta         -> beta
+   alpha\n  + beta         -> alpha\nbeta
+   alpha    + beta\ngamma  -> alpha\nbeta\ngamma
+   alpha    + \nbeta       -> alpha\n\nbeta
+   ```
+
+   The fragment is otherwise preserved byte for byte. No bullet, numbering,
+   punctuation, or blank line is invented, because the caller asked to add
+   their text and not to have it formatted. The last row is the one that needs
+   stating: a leading newline the caller actually supplied is a deliberate
+   blank line and is theirs to keep. Normalizing it would be the code silently
+   editing a user's words.
+
+5. **The merged value is what gets validated.** A fragment can be legal while
+   the merged note is not, so the ceiling is checked after the join and never
+   on the fragment alone. Overflow refuses and never truncates: truncation
+   would discard the caller's text and still commit a version increment and an
+   event, producing a record that does not say what happened. The refusal is
+   over the limit, not at it.
+
+6. **The transformation must not disturb the omitted-versus-null contract.**
+   `_update_parameters` decides whether to clear `due_date` and `blocked_by`
+   from `model_fields_set`. Rebuilding the arguments through
+   `model_validate(model_dump())` marks every field as set, after which an
+   append that never mentioned `due_date` clears it. `model_copy` preserves the
+   existing set and adds only `notes`. `model_copy` does not validate, so the
+   order is fixed: merge, validate the merged value, then copy.
+
+7. **A completed replay must not append twice.** This is the failure an append
+   makes possible that a replacement does not. Replaying a replacement writes
+   the same value; replaying an append would grow the notes on every attempt.
+   The existing idempotency lease already returns the stored result, and this
+   decision adds the regression that proves it.
+
+8. **The prompt is a backstop, not the mechanism.** `prompts.py` gains the
+   verb-to-field mapping and a worked example that shows not reading the notes
+   back. Deterministic code owns the semantics; the prompt only helps the model
+   pick the right field.
+
+9. **The browser agent's tool profile is displayed in the page header.** Ruled
+   in scope for D-78 rather than split into its own decision. The list is the
+   eight tools of `ALL_TOOLS`, which is every `ToolName`, in a presentation
+   order chosen for legibility rather than the enum's declaration order. It is
+   never read from client-supplied AG-UI `tools`, which Trellis deliberately
+   rebuilds empty, because sourcing the display from there would let a client
+   claim about capabilities become the thing Trellis displays as fact.
+
+   The gate for it is cross-boundary on purpose. A frontend-only assertion that
+   eight hardcoded labels equal eight hardcoded labels stays green forever,
+   including on the day a ninth tool lands in the backend and the header
+   quietly starts lying. The test parses the backend `ToolName` enum and fails
+   when the two disagree.
+
+10. **A stale version is refused before validation that depends on current
+    state.** Once an owned row is locked, `update_task` compares the locked
+    `version` with the caller's `expected_version` and refuses before
+    `_effective_update` runs.
+
+    The order matters because the two refusals ask for different next actions.
+    A merged-size failure says shorten the text; a version conflict says
+    refresh and look again. A caller whose version has moved is not entitled to
+    mutate the locked row at all, so measuring its append against notes it has
+    not seen sends it to fix the wrong thing. The lock is what makes the early
+    comparison honest: `FOR UPDATE` blocks other writers until the transaction
+    ends, and a caller that waited is handed the row as the winner left it.
+
+    This does not replace optimistic concurrency. `UPDATE_TASK_GUARDED` keeps
+    its `version = expected_version` predicate as the fail-closed database
+    invariant. The comparison only decides which truthful refusal comes first.
+
+    A missing row and another actor's row are both absent from the owner-scoped
+    lock, so neither reaches the comparison and both keep refusing exactly as
+    before. The precedence rule discloses nothing new.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It changes no policy, approval, idempotency, or
+undo semantics. It does not alter the D-74 ceilings, and it adds no bulk
+capability: `bulk_update_tasks` is untouched.

@@ -14,7 +14,8 @@
     "test:ingress": "node --test tests/ngrok-demo-ingress.test.mjs",
     "test:notes": "node --test tests/task-card-notes.test.mjs",
     "test:transport": "node --test tests/trellis-forwarded-props.test.mjs",
-    "test:continuity": "node --test tests/continuity-binding.test.mjs"
+    "test:continuity": "node --test tests/continuity-binding.test.mjs",
+    "test:tools": "node --test tests/agent-tool-labels.test.mjs"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.57",

@@ -185,11 +185,39 @@ main {
   margin: 0;
 }
 
+.page-header__aside {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
 .page-header__note {
   color: var(--muted);
   line-height: 1.45;
   margin: 0;
   max-width: 52ch;
+}
+
+/* D-78. The browser agent's capability profile, stated where the trust
+   boundary is stated. Secondary to the title and to the note above it: this
+   is a legend for what the model may do, not a control. */
+.page-header__tools {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  margin: 0;
+  max-width: 52ch;
+  overflow-wrap: anywhere;
+}
+
+.page-header__tools-label {
+  color: var(--focus);
+  font-family: "Courier New", Courier, monospace;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .board__toolbar {

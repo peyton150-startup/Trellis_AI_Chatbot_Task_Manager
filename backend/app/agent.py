@@ -458,7 +458,19 @@ def build_agent(
     def update_task(
         ctx: RunContext[TrellisDeps], arguments: UpdateTaskArgs
     ) -> list[domain.TaskSnapshot]:
-        """Update one task using its identifier and expected version."""
+        """Update one task using its identifier and expected version.
+
+        Two ways to change notes, and they are not interchangeable:
+
+            notes         replaces the whole note value. Send "" to clear.
+            append_notes  contains ONLY the new text. The server reads the
+                          current notes and appends to them.
+
+        To add to a task's notes, send append_notes with just the new content.
+        Do not read the existing notes in order to concatenate them yourself,
+        and do not repeat existing notes inside append_notes. Sending both
+        fields in one call is refused.
+        """
         result = tools.update_task(_tool_context(ctx), arguments)
         ctx.deps.effects.mutation_committed = True
         return result

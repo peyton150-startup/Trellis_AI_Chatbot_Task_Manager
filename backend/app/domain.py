@@ -43,7 +43,8 @@ from psycopg.types.json import Json
 from pydantic import JsonValue
 
 from . import sql
-from .errors import OutOfScopeError, VersionConflictError
+from .errors import OutOfScopeError, ValidationFailedError, VersionConflictError
+from .limits import TASK_NOTES_MAX_CHARS
 from .models import (
     BulkUpdateTasksArgs,
     CreateTaskArgs,
@@ -238,9 +239,37 @@ def update_task(
     *,
     conn: Connection,
 ) -> MutationResult:
-    """Guard one update by its expected version and capture both full rows."""
+    """Guard one update by its expected version and capture both full rows.
+
+    Staleness is decided before any validation that depends on current state,
+    and the order is the point rather than an optimisation. `_effective_update`
+    measures an append against the notes this transaction just locked, so a
+    caller holding a stale version could be told its addition is too long when
+    the fact it actually needs is that its version moved. Those two refusals
+    ask for different next actions: shorten the text, versus refresh and look
+    again. Once the lock has succeeded, the row already says which one is true.
+
+    The `FOR UPDATE` above is what makes the early comparison safe. It blocks
+    other writers on this row until the transaction ends, and a caller that had
+    to wait for a competing transaction is handed the row as that transaction
+    left it, so `before.version` is current rather than a pre-lock guess.
+
+    This does not replace optimistic concurrency. `UPDATE_TASK_GUARDED` keeps
+    its own `version = expected_version` predicate as the fail-closed database
+    invariant; this comparison only decides which truthful refusal the caller
+    hears first.
+    """
     locked = _locked_tasks(owner_id, (arguments.task_id,), conn=conn)
     before = locked.get(arguments.task_id)
+
+    # A missing row and another actor's row are both `None` here, and they stay
+    # indistinguishable. Only an owned, locked row can be compared, so the two
+    # out-of-scope cases fall through to the guarded UPDATE and refuse exactly
+    # as they did before, disclosing nothing new.
+    if before is not None and before.version != arguments.expected_version:
+        raise VersionConflictError()
+
+    effective = _effective_update(arguments, before)
 
     row = conn.execute(
         sql.UPDATE_TASK_GUARDED,
@@ -248,7 +277,7 @@ def update_task(
             owner_id,
             arguments.task_id,
             arguments.expected_version,
-            arguments,
+            effective,
         ),
     ).fetchone()
     if row is None or before is None:
@@ -697,6 +726,69 @@ def _update_parameters(
         "blocked_by": arguments.blocked_by,
         "set_blocked_by": "blocked_by" in fields,
     }
+
+
+def merge_appended_notes(existing: str, addition: str) -> str:
+    """Join an appended fragment to the notes already stored.
+
+    One newline separates two notes, and only when one is needed. Existing text
+    that already ends in a newline supplies its own separator, and empty notes
+    need none at all.
+
+    The fragment is otherwise preserved byte for byte. No bullet, no numbering,
+    no punctuation, and no blank line is invented, because the caller asked to
+    add their text rather than to have it formatted. A leading newline the
+    caller actually supplied is theirs and survives: "alpha" plus "\\nbeta" is
+    "alpha\\n\\nbeta", a deliberate blank line, not a separator to collapse.
+    """
+    if existing == "":
+        return addition
+    if existing.endswith("\n"):
+        return existing + addition
+    return existing + "\n" + addition
+
+
+def _effective_update(
+    arguments: UpdateTaskArgs,
+    before: Task | None,
+) -> UpdateTaskArgs:
+    """Resolve an append request against locked state into a plain replacement.
+
+    D-78 moves note appending out of the model and into deterministic code. The
+    model sends only its new fragment; the authoritative current value comes
+    from the row this transaction already holds a lock on, so no read the model
+    performed earlier can be stale by the time the merge happens.
+
+    The transformation must not disturb the omitted-versus-null contract that
+    `_update_parameters` reads from `model_fields_set`. Rebuilding the model
+    through `model_validate(model_dump())` would mark every field as set, after
+    which a request that never mentioned `due_date` would clear it. `model_copy`
+    preserves the existing set and adds only the key supplied here.
+
+    `model_copy` does not validate, so the merged value is validated first and
+    the copy carries an already-checked string. Validating the fragment alone
+    would not do: the fragment can be legal while the merged note is not.
+    """
+    if arguments.append_notes is None:
+        return arguments
+
+    # No locked row means the target is missing or foreign. Leave the arguments
+    # alone and let the guarded UPDATE produce the ordinary conflict, so an
+    # append cannot be told apart from a replacement by its failure.
+    if before is None:
+        return arguments
+
+    merged = merge_appended_notes(before.notes, arguments.append_notes)
+    if len(merged) > TASK_NOTES_MAX_CHARS:
+        # Refuse rather than truncate. Truncation would silently discard the
+        # caller's text and still commit a version increment and an event,
+        # recording a mutation that does not say what happened.
+        raise ValidationFailedError(
+            f"appending would make notes {len(merged)} characters, over the "
+            f"{TASK_NOTES_MAX_CHARS} limit"
+        )
+
+    return arguments.model_copy(update={"notes": merged})
 
 
 def _updated_event(before: Task, after: Task) -> PendingTaskEvent:

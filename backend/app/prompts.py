@@ -18,7 +18,9 @@ Available Trellis capabilities may include:
 - get_task_history: Read the authoritative recorded history for one task.
 - resolve_task_reference: Deterministically resolve one current or historical task reference to an authoritative task.
 - create_task: Create one task with typed title, notes, due date, priority, and dependency fields.
-- update_task: Update one task using its identifier and expected version.
+- update_task: Update one task using its identifier and expected version. Use
+  notes to replace the whole note value, or append_notes to add only new text
+  to whatever the task already has.
 - bulk_update_tasks: Apply the same typed changes to a list of task identifiers.
 - delete_tasks: Delete a list of tasks through the required approval path.
 - propose_plan: Return a summary and ordered steps for display without changing task state.
@@ -86,13 +88,33 @@ EXECUTION RULES
 
    OMIT every optional field that is unchanged.
 
-   If the user asks only to change notes, send only:
+   If the user asks only to REPLACE the notes, send only:
    - task_id;
    - expected_version;
    - notes.
 
+   If the user asks only to ADD to the notes, send only:
+   - task_id;
+   - expected_version;
+   - append_notes.
+
+   Rule 5a decides which of those two a request is. Do not treat "change the
+   notes" as always meaning replacement.
+
    Do not resend title, status, priority, due_date, dependencies, or other
    unchanged fields merely to preserve them.
+
+5a. Replacing notes and adding to notes are different requests.
+
+   set, replace, overwrite, rewrite   -> notes, carrying the whole new value
+   clear, empty, remove the notes     -> notes: ""
+   add, append, add to, add a note    -> append_notes, carrying ONLY the new text
+
+   append_notes contains the new content by itself. The server reads the task's
+   current notes and appends to them, so you must not read the existing notes in
+   order to join them yourself, and you must not repeat any existing note text
+   inside append_notes. Send one field or the other; a call carrying both is
+   refused.
 
 6. Never send the string "null".
    The text value "null" is not JSON null.
@@ -130,10 +152,12 @@ EXECUTION RULES
    If the user says "set" or "replace" notes, replace the notes with exactly the
    requested content.
 
-   If the user says "add", "append", "add to", or "add in", preserve the existing
-   notes and append the requested content.
+   If the user says "add", "append", "add to", or "add in", send append_notes
+   carrying only the new content. The server will preserve the existing notes
+   and append your fragment to them, as rule 5a describes.
 
-   If appending requires knowing the current notes, use authoritative tool data.
+   Never read the current notes in order to join them yourself. You do not need
+   to know them, and a value you read earlier in the turn may already be stale.
 
    Requested line breaks are part of the requested content. If the user says
    "on the next line", "on a new line", "directly below", "under it", or "each
@@ -143,11 +167,20 @@ EXECUTION RULES
    Existing notes of:
        buy bananas
 
-   plus "add buy apples and buy pears, each on its own line" produces notes of
-   exactly three lines:
+   plus "add buy apples and buy pears, each on its own line" is an append_notes
+   of exactly two lines:
+       buy apples
+       buy pears
+
+   and the stored notes then read exactly three lines:
        buy bananas
        buy apples
        buy pears
+
+   You send only the two new lines. The first line is already stored. Do not
+   include it in append_notes; doing so would duplicate existing text. Do not
+   reconstruct the complete note and send it through notes; that would replace
+   the authoritative current value with a model-assembled value.
 
    Never one line reading "buy bananas buy apples buy pears", and never one line
    reading "buy bananas, buy apples, buy pears".
@@ -389,6 +422,25 @@ Do NOT add:
 }
 
 unless the user explicitly requested those fields to change.
+
+Example: user asks to ADD a note rather than replace one.
+
+Correct update_task arguments:
+
+{
+  "task_id": "<resolved.task_id returned by resolve_task_reference>",
+  "expected_version": <resolved.current_version returned by resolve_task_reference>,
+  "append_notes": "Check the chicken coop."
+}
+
+Do NOT read the current notes and send:
+
+{
+  "notes": "Feed the cows.\nCheck the chicken coop."
+}
+
+The server already holds the authoritative current notes and joins them for
+you. Reconstructing them yourself risks writing back a stale value.
 
 Create:
 
