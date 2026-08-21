@@ -4080,3 +4080,125 @@ This decision authorizes no migration, table, column, endpoint, status value,
 error code, dependency, or tool. It changes no policy, approval, idempotency, or
 undo semantics. It does not alter the D-74 ceilings, and it adds no bulk
 capability: `bulk_update_tasks` is untouched.
+
+### D-79: one guarded set-based UPDATE for a whole bulk call
+
+`bulk_update_tasks` presents itself to the model as one operation, and underneath
+it was a loop. It locked the whole target set in one statement, then issued one
+`UPDATE_TASK_GUARDED` per task. Fifty targets meant fifty task UPDATE statements
+plus fifty audit inserts, so the cost of the mutation grew with the size of the
+set the model happened to name, for a request the model expressed once.
+
+D-79 changes the statement shape and the routing that leads to it. It does not
+change what the tool means, what it guards, or how many tools exist.
+
+1. **No new tool.** The model-facing surface is the same eight tools it was
+   before. A `bulk_update_tasks_v2` would have made the model choose between two
+   spellings of one capability, which is a routing problem dressed as a
+   performance fix. What was actually wrong was that a same-patch request over
+   several tasks reads just as naturally as several `update_task` calls, so the
+   tool description and the system prompt now say which one to send: two or more
+   tasks receiving the *same* change is one bulk call; different values per task
+   is not a bulk update at all.
+
+2. **`BULK_UPDATE_TASKS_GUARDED` replaces the loop.** The expected versions
+   travel as a relation, rebuilt inside the statement by `unnest` over two
+   parallel arrays, and one `UPDATE ... FROM` applies them. The guards are
+   unchanged: the same owner predicate and the same per-row
+   `version = expected_version` predicate decide every row, and a row whose
+   version moved still matches nothing and still refuses the whole call.
+
+   Measured at the implementing SHA against PostgreSQL 16.12: at fifty targets,
+   task UPDATE statements go from 50 to 1 and core SQL statements from 101 to
+   52, with median wall time 153.21 ms to 90.56 ms over thirty iterations. At a
+   single target there is no gain and none is claimed.
+
+3. **Audit rows stay one per task.** `write_events` remains an N-insert loop, so
+   this is an O(1) task-update transaction with O(N) audit inserts, not an O(1)
+   transaction. Each event carries its own exact `before`, the row this
+   transaction locked, and its own exact `after`, the row the statement
+   returned. There is nothing to batch away there without losing the property
+   that makes the log able to say what each task was. Batching the inserts is
+   not authorized by this decision and would need its own, justified by its own
+   measurement.
+
+4. **The expected relation is built once and cannot drift.** `unnest` over two
+   arrays does not reject unequal lengths; it NULL-pads the shorter one, and
+   `version = NULL` matches no row. A dropped expectation therefore fails closed
+   but arrives disguised as a target-coverage conflict, which describes the
+   wrong problem. So both arrays are unzipped from one tuple of pairs, and
+   `_expected_relation` refuses a malformed set, a duplicated target, or a null
+   member with `RuntimeError` before the statement runs. `UPDATE ... FROM`
+   additionally requires at most one source row per target row, or one arbitrary
+   source silently wins, which is why the duplicate check is a correctness
+   invariant rather than tidiness.
+
+5. **Returned coverage is checked, and partial success is impossible.**
+   `RETURNING` has no ordering to rely on, so rows are keyed by id and the
+   caller-visible order is replayed from the request. If the returned ids are
+   not exactly the expected ids, the call raises `VERSION_CONFLICT` and the
+   caller's transaction rolls back. This replaces the loop's per-statement
+   `row is None` check.
+
+6. **The canonical lock order stays.** `SELECT_TASKS_BY_IDS_FOR_UPDATE` keeps
+   `ORDER BY id` and `FOR UPDATE`. A set-based UPDATE does not remove the
+   deadlock that two callers naming the same tasks in opposite orders would
+   otherwise produce, and an UPDATE has no result order to specify in its place.
+
+7. **Duplicate ids keep their two different counts.** `[A, A, A, A]` is still
+   four references for the blast radius under D-17 and one physical row for the
+   write. Deduplication happens for the update only, never before policy
+   classification, because moving it earlier would shrink the blast radius below
+   the approval threshold.
+
+8. **Two accidental contracts are closed.** `task_ids` gains `min_length=1`: a
+   call naming no targets used to validate and return an empty success, which
+   reads to the model as a completed bulk update. And a call whose patch cannot
+   change anything is refused, because `title`, `notes`, `priority`, and
+   `status` reach SQL through `COALESCE`, where an explicit null is
+   indistinguishable from an omission. Such a call used to lock every target,
+   increment every version, and write an event per task in which nothing
+   differs. `due_date` and `blocked_by` carry a set flag, so naming either of
+   them, including as null, remains an effective clear, and `notes=""` remains a
+   real clear.
+
+9. **`bulk_update_tasks` is a Pydantic AI sequential barrier.** `max_concurrency`
+   bounds concurrent agent runs and says nothing about several tool calls
+   arriving in one model response, which the framework schedules concurrently by
+   default and which run on worker threads because Trellis tools are
+   synchronous. This tool holds row locks on a caller-chosen set for its whole
+   transaction, so it must not overlap a sibling call in that response.
+   `sequential=True` is scoped to this one tool. It does not serialize separate
+   HTTP requests, separate `agent.run()` calls, or separate workers; their
+   correctness remains PostgreSQL's, through the canonical lock order and the
+   version predicates.
+
+10. **The isolation level is probed, not assumed.** The pool sets none, so the
+    server default decides, and the D-78 interaction behaves differently at
+    stricter levels. At the probed `read committed` on PostgreSQL 16.12: a bulk
+    update that commits first leaves a concurrent single-task append refused
+    with `VERSION_CONFLICT`, because the append carries a caller-supplied
+    `expected_version`; and an append that commits first survives the bulk
+    update behind it, because the bulk call has no caller expected version and
+    reads each version from the row it locked, which a waiter is handed as the
+    winner left it. Both orderings are proven, and the deterministic gate
+    asserts the isolation level rather than trusting it.
+
+11. **D-78's boundary is untouched.** `append_notes` remains absent from
+    `MutableTaskFields` and therefore from `BulkUpdateTasksArgs`. A set-based
+    statement makes per-row merging look cheaper than it is: it would still need
+    the merged value computed per task and its own final-size check per task,
+    which is exactly the work D-78 declined to specify for bulk.
+
+**Known limitation.** The canonical lock order is pinned by a structural
+assertion on the SQL text, not by a behavioural test. Deleting `ORDER BY id`
+leaves the competing-callers test passing repeatedly, because PostgreSQL reaches
+these rows by primary key and returns them in id order regardless. Forcing the
+planner off that index would close the gap and was rejected: it would make a
+regression test depend on planner settings the application never sets. This is
+recorded rather than hidden behind a test that cannot see the difference.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It adds one SQL constant and one CI gate. It
+changes no approval, idempotency, or undo semantics, it does not alter the D-74
+ceilings, and it adds no bulk append.

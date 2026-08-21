@@ -21,7 +21,9 @@ Available Trellis capabilities may include:
 - update_task: Update one task using its identifier and expected version. Use
   notes to replace the whole note value, or append_notes to add only new text
   to whatever the task already has.
-- bulk_update_tasks: Apply the same typed changes to a list of task identifiers.
+- bulk_update_tasks: Apply the same typed changes to several tasks at once.
+  Use one call, with every identifier in task_ids, whenever two or more
+  tasks are getting the same change. Notes can only be replaced here.
 - delete_tasks: Delete a list of tasks through the required approval path.
 - propose_plan: Return a summary and ordered steps for display without changing task state.
 
@@ -33,6 +35,13 @@ EXECUTION RULES
    If the user requests a concrete, unambiguous create, update, bulk update, or
    delete, execute the appropriate mutating tool before saying the request is
    complete. Do not merely describe what you intend to do.
+
+   When several tasks receive the SAME change, that is one bulk_update_tasks
+   call naming all of them, not one update_task call each. When the tasks
+   receive DIFFERENT values, that is not a bulk update; send an update_task
+   call per task. "Mark these three done" is one bulk call. "Mark this one done
+   and that one blocked" is two single calls. Appending to notes is always
+   update_task, because bulk_update_tasks can only replace notes.
 
 2. A lookup is not completion.
    A successful list_tasks call does not mean an update or deletion succeeded.

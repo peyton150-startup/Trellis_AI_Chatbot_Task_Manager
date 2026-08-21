@@ -475,11 +475,34 @@ def build_agent(
         ctx.deps.effects.mutation_committed = True
         return result
 
-    @_tool(ToolName.BULK_UPDATE_TASKS.value)
+    # `sequential=True` under D-79. `max_concurrency=1` above bounds concurrent
+    # agent runs; it does not stop Pydantic AI from scheduling several tool
+    # calls out of one model response concurrently, and Trellis tools are
+    # synchronous, so those run on worker threads. This tool takes row locks on
+    # a caller-chosen set and holds them for its whole transaction, so it is the
+    # one that must not overlap a sibling call in the same response.
+    #
+    # The scope is exactly that and no wider. Separate HTTP requests, separate
+    # `agent.run()` calls, and separate workers are unaffected: their
+    # correctness is PostgreSQL's, through the canonical lock order and the
+    # version predicates, and it stays PostgreSQL's.
+    @_tool(ToolName.BULK_UPDATE_TASKS.value, sequential=True)
     def bulk_update_tasks(
         ctx: RunContext[TrellisDeps], arguments: BulkUpdateTasksArgs
     ) -> list[domain.TaskSnapshot]:
-        """Apply the same typed changes to a list of task identifiers."""
+        """Apply the same typed changes to several tasks in one transaction.
+
+        Prefer this over repeated update_task calls whenever two or more tasks
+        receive the SAME patch: one call, every identifier in task_ids.
+
+            "set A, B and C to high priority"  -> ONE bulk_update_tasks call
+            "set A high and B low"             -> separate update_task calls
+
+        Every named task gets the identical change, so a request that gives
+        different values to different tasks is not a bulk update. There is no
+        expected_version field: the server reads each task's current version
+        under lock. Notes can only be replaced here, not appended.
+        """
         result = tools.bulk_update_tasks(_tool_context(ctx), arguments)
         ctx.deps.effects.mutation_committed = True
         return result

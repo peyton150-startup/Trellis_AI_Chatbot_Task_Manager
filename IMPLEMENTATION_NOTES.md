@@ -3225,3 +3225,100 @@ assert that its target was found; the script does.
   D-79 was abandoned. D-79 is a separate session and a separate PR, which lets
   the D-78 versus bulk concurrency tests run against merged D-78 code rather
   than a review-only integration tree.
+
+## D-79: one guarded set-based UPDATE for a whole bulk call
+
+**Local role:** `bulk_update_tasks` replaces its per-task `UPDATE_TASK_GUARDED`
+loop with a single `BULK_UPDATE_TASKS_GUARDED` statement that carries the
+expected versions as a relation. It owns the construction of that relation, the
+check that the returned rows cover every expected target, and the replay of the
+caller-visible order from the request. `BulkUpdateTasksArgs` gains a lower bound
+on `task_ids` and a validator refusing a patch that cannot change anything, and
+the tool is registered as a Pydantic AI sequential barrier.
+
+**Whole-system role:** This is the first decision to change the physical shape of
+a kernel mutation rather than its semantics, so its whole value depends on the
+guards surviving the rewrite unchanged, which is what most of its verification
+is about. It controls three risks. The mutation cost of one model request no
+longer grows with the number of tasks the model names, so a fifty-task request
+is one statement rather than fifty. The model is told which of two legitimate
+routings to use, so a same-patch request stops arriving as N single calls, which
+was the real reason the loop was being exercised at scale. And the tool that
+holds locks on a caller-chosen set can no longer overlap a sibling tool call
+scheduled out of the same model response. For the demo it makes bulk operations
+visibly one authoritative transaction, which is the claim the tool always made.
+
+**Inputs and dependencies:** D-12 conditional approval and the tool body order,
+D-17 blast-radius counting over raw ids, D-39/D-41 audit and undo expectations of
+`task_events`, D-74 request ceilings, and D-78, whose single-task append is the
+other side of the concurrency interaction proven here. It depends on PostgreSQL
+`UPDATE ... FROM`, `unnest` over parallel arrays, and `READ COMMITTED` semantics
+for `SELECT ... FOR UPDATE`, and on `pydantic-ai` 2.27.0 exposing `sequential` on
+`Agent.tool`. Both facts are probed rather than assumed: the installed signature
+is checked, and the deterministic gate asserts the isolation level.
+
+**Outputs and consumers:** `sql.BULK_UPDATE_TASKS_GUARDED`,
+`domain._expected_relation`, `domain._bulk_update_parameters`, and
+`domain._mutable_field_parameters`, which the single-task and bulk paths now
+share so their omitted-versus-null handling cannot drift apart. The tool result
+shape, the event shape, and the error vocabulary are unchanged, so every existing
+consumer, including undo and the audit reads, sees exactly what it saw before.
+
+**Verification:** `cd backend && ruff check .` clean;
+`cd backend && pytest -m "not network"` 436 passed before the new suite;
+`pytest tests/test_d79_bulk_update.py` 55 passed. `cd frontend && npm run build`
+succeeds and all five frontend suites pass (2, 4, 9, 8, 6 tests).
+
+Mutation audit, 17 of 17 killed, with every source file's SHA-256 recorded before
+mutation and proven byte-identical after restore. The mutations covered:
+restoring the per-task loop, removing `sequential=True`, removing the owner
+predicate, removing the version predicate, letting partial `RETURNING` coverage
+commit, dropping an expected version, skipping the pair-length invariant, feeding
+duplicate ids into the relation, trusting `RETURNING` order, dropping
+`set_due_date` and `set_blocked_by`, re-accepting an empty target list,
+re-accepting an ineffective patch, corrupting `event.before` and `event.after`,
+deduplicating before the blast-radius count, and removing the canonical lock
+order.
+
+The audit's first run killed only 13 of 17 and the four gaps were real test
+defects, not code defects: the owner predicate, the coverage check, and the
+pair-length invariant were all unreachable through the ordinary path because an
+earlier guard fires first, and the blast-radius test called the domain directly
+where the count it claimed to protect lives in the tool. All four now have tests
+that reach the code under test, which is why the relation builder was extracted
+into `_expected_relation` in the first place.
+
+Benchmark at the implementing SHA, PostgreSQL 16.12, `read committed`, 30
+iterations per cell, domain transaction only with no model latency:
+
+  ```text
+   N   variant     median ms   p95 ms   taskUPD   events   coreSQL
+   1   loop             7.31    12.51         1        1         3
+   1   set              7.36    10.53         1        1         3
+   3   loop            12.49    19.62         3        3         7
+   3   set             10.48    16.66         1        3         5
+  10   loop            32.31    56.43        10       10        21
+  10   set             20.70    33.62         1       10        12
+  25   loop            66.02    80.97        25       25        51
+  25   set             43.63    80.62         1       25        27
+  50   loop           153.21   217.04        50       50       101
+  50   set             90.56   127.82         1       50        52
+  ```
+
+The structural result is exact and is the claim: at fifty targets, one task
+UPDATE instead of fifty, and 52 core SQL statements instead of 101. The timing
+result is environment-specific and is reported as measured, 1.69x median at
+fifty targets and no gain at one.
+
+**Limitations and review status:** Audit inserts remain O(N) by decision; any
+batching needs its own decision and its own measurement. The canonical lock order
+is pinned only by a structural assertion, because deleting `ORDER BY id` leaves
+the competing-callers test green: PostgreSQL reaches these rows by primary key
+and returns them in id order anyway. That was verified deliberately rather than
+assumed, and the rejected alternative, forcing the planner off the index, would
+tie a regression test to settings the application never sets. The frontend change
+in this decision is presentation only: `--thread-max-width` becomes
+`calc(44rem + 15px)`, verified in a browser at 704 to 719 px with the composer
+tracking the message column and no horizontal overflow at 375, 768, or desktop
+width. This work is unreviewed and a neutral blind review is owed at the final
+SHA.

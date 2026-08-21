@@ -298,8 +298,20 @@ def bulk_update_tasks(
 
     ``BulkUpdateTasksArgs`` has no expected-version field. The locked current
     version becomes each guarded UPDATE's expected version. Duplicate ids still
-    count at the policy layer under D-17, while SQL ``ANY`` semantics mutate one
+    count at the policy layer under D-17, while set membership mutates one
     physical row once.
+
+    D-79 replaced a loop that issued one guarded UPDATE per target with one
+    guarded UPDATE over the whole set. The guards did not change: the same owner
+    predicate and the same per-row version predicate decide every row, and a row
+    whose version moved still matches nothing. What changed is that the
+    expectations travel as a relation rather than as N separate statements, so
+    the count of task UPDATE statements no longer grows with the target count.
+
+    The events are still written one row at a time by ``write_events``, so this
+    is not an O(1) transaction. It is an O(1) task-update transaction with O(N)
+    audit inserts, and the audit rows are deliberately left alone: each one
+    carries its own exact before and after snapshot.
     """
     task_ids = _unique_ids(arguments.task_ids)
     if not task_ids:
@@ -308,21 +320,27 @@ def bulk_update_tasks(
     locked = _locked_tasks(owner_id, task_ids, conn=conn)
     _require_all_targets(task_ids, locked)
 
-    updated: list[Task] = []
-    events: list[PendingTaskEvent] = []
-    for task_id in task_ids:
-        before = locked[task_id]
-        row = conn.execute(
-            sql.UPDATE_TASK_GUARDED,
-            _update_parameters(owner_id, task_id, before.version, arguments),
-        ).fetchone()
-        if row is None:
-            raise VersionConflictError()
-        after = _task(row)
-        updated.append(after)
-        events.append(_updated_event(before, after))
+    update_ids, expected_versions = _expected_relation(task_ids, locked)
 
-    return MutationResult(tasks=tuple(updated), events=tuple(events))
+    rows = conn.execute(
+        sql.BULK_UPDATE_TASKS_GUARDED,
+        _bulk_update_parameters(owner_id, update_ids, expected_versions, arguments),
+    ).fetchall()
+
+    # RETURNING has no ordering to rely on, so the rows are keyed by id and the
+    # caller-visible order is rebuilt from the request. Coverage is the guard
+    # that replaces the old loop's per-statement `row is None`: anything short
+    # of every expected target means a row moved under the lock, and the caller
+    # transaction rolls back rather than committing a partial set.
+    updated_by_id = {task.id: task for task in (_task(row) for row in rows)}
+    if set(updated_by_id) != set(update_ids):
+        raise VersionConflictError()
+
+    updated = tuple(updated_by_id[task_id] for task_id in task_ids)
+    events = tuple(
+        _updated_event(locked[task_id], updated_by_id[task_id]) for task_id in task_ids
+    )
+    return MutationResult(tasks=updated, events=events)
 
 
 def delete_tasks(
@@ -712,11 +730,87 @@ def _update_parameters(
     # after which an update that never mentioned due_date clears it. Undo is the
     # one caller that legitimately sets every field, because restoring a complete
     # before snapshot is exactly what section 8 asks it to do.
-    fields = arguments.model_fields_set
     return {
         "id": task_id,
         "owner_id": owner_id,
         "expected_version": expected_version,
+        **_mutable_field_parameters(arguments),
+    }
+
+
+def _expected_relation(
+    task_ids: Sequence[UUID],
+    locked: dict[UUID, Task],
+) -> tuple[list[UUID], list[int]]:
+    """Build the id and expected-version arrays the bulk statement joins on.
+
+    One relation, unzipped, rather than two lists assembled side by side. The
+    arrays reach SQL as an expected-version lookup keyed by id, and if they ever
+    disagreed on length or order the statement would still run. `unnest` over
+    two arrays NULL-pads the shorter one rather than rejecting it, and
+    `version = NULL` matches no row, so a dropped expectation fails closed but
+    arrives disguised as a target-coverage conflict, which describes the wrong
+    problem and sends the reader to the wrong place.
+
+    Deriving both arrays from one tuple makes the drift impossible to write.
+    The checks below then cover what deriving them cannot: that nothing
+    upstream handed this function a malformed target set. They are
+    defence in depth and are expected to be unreachable through
+    `bulk_update_tasks`, where `_unique_ids` and `_require_all_targets` have
+    already run. `RuntimeError` rather than a domain error is deliberate: a
+    failure here is a bug in this module, not a refusal the caller can act on.
+    """
+    expected_pairs = tuple((task_id, locked[task_id].version) for task_id in task_ids)
+    update_ids = [task_id for task_id, _ in expected_pairs]
+    expected_versions = [version for _, version in expected_pairs]
+
+    if not (
+        len(expected_pairs)
+        == len(update_ids)
+        == len(expected_versions)
+        == len(task_ids)
+    ):
+        raise RuntimeError("bulk update built an expected relation of the wrong size")
+    if len(set(update_ids)) != len(update_ids):
+        # PostgreSQL requires an UPDATE ... FROM join to match at most one
+        # source row per target row. With more, one arbitrary source wins and
+        # the rest are silently discarded.
+        raise RuntimeError("bulk update built a duplicated expected target")
+    if any(task_id is None for task_id in update_ids):
+        raise RuntimeError("bulk update built a null expected target")
+    if any(version is None for version in expected_versions):
+        raise RuntimeError("bulk update built a null expected version")
+
+    return update_ids, expected_versions
+
+
+def _bulk_update_parameters(
+    owner_id: UUID,
+    task_ids: Sequence[UUID],
+    expected_versions: Sequence[int],
+    arguments: BulkUpdateTasksArgs,
+) -> dict[str, object]:
+    """Bind one bulk statement, sharing the field rules with the single update.
+
+    The SET list is the only thing the two statements have in common that could
+    drift, and drift here is invisible: a bulk call that stopped honouring the
+    omitted-versus-null contract would clear due dates nobody mentioned while
+    every single-task test stayed green. One builder makes that impossible to
+    do by halves.
+    """
+    return {
+        "owner_id": owner_id,
+        "task_ids": list(task_ids),
+        "expected_versions": list(expected_versions),
+        **_mutable_field_parameters(arguments),
+    }
+
+
+def _mutable_field_parameters(
+    arguments: UpdateTaskArgs | BulkUpdateTasksArgs,
+) -> dict[str, object]:
+    fields = arguments.model_fields_set
+    return {
         "title": arguments.title if "title" in fields else None,
         "notes": arguments.notes if "notes" in fields else None,
         "due_date": arguments.due_date,

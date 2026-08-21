@@ -230,6 +230,56 @@ UPDATE tasks
 RETURNING *;
 """
 
+# D-79. One guarded UPDATE for every distinct target of one bulk call, in place
+# of the per-task loop that issued UPDATE_TASK_GUARDED once per row. The SET
+# list, the owner predicate, and the version predicate are the same three
+# guards the single-task statement carries; only their arity changes.
+#
+# The expected relation arrives as two parallel arrays and is rebuilt by
+# unnest. That is the part to read carefully. unnest over two arrays does not
+# reject unequal lengths, it pads the shorter one with NULL, and `t.version =
+# NULL` matches no row. A construction bug would therefore fail closed but
+# would surface as a target-coverage conflict, describing the wrong problem.
+# domain checks the arrays are the same length before the statement runs, so
+# the failure is reported where it happens.
+#
+# PostgreSQL requires that an UPDATE ... FROM join match at most one source row
+# per target row; with more, the outcome is one arbitrary source and the others
+# are silently discarded. The ids are deduplicated before they reach here, so
+# the CTE holds exactly one row per distinct task, and domain asserts that too.
+#
+# There is no ORDER BY and none is possible: an UPDATE has no result ordering to
+# specify. The canonical lock order that prevents deadlock is established by
+# SELECT_TASKS_BY_IDS_FOR_UPDATE, which has already run and already holds every
+# row this statement touches. Callers must key RETURNING by id rather than
+# reading its order.
+BULK_UPDATE_TASKS_GUARDED = """
+WITH expected AS (
+  SELECT *
+    FROM unnest(
+           %(task_ids)s::uuid[],
+           %(expected_versions)s::integer[]
+         ) AS x(id, expected_version)
+)
+UPDATE tasks AS t
+   SET title = COALESCE(%(title)s, t.title),
+       notes = COALESCE(%(notes)s, t.notes),
+       due_date = CASE WHEN %(set_due_date)s THEN %(due_date)s ELSE t.due_date END,
+       priority = COALESCE(%(priority)s, t.priority),
+       status = COALESCE(%(status)s, t.status),
+       blocked_by = CASE
+                      WHEN %(set_blocked_by)s THEN %(blocked_by)s
+                      ELSE t.blocked_by
+                    END,
+       version = t.version + 1,
+       updated_at = now()
+  FROM expected AS x
+ WHERE t.id = x.id
+   AND t.owner_id = %(owner_id)s
+   AND t.version = x.expected_version
+RETURNING t.*;
+"""
+
 DELETE_TASKS_BY_IDS = """
 DELETE FROM tasks
  WHERE owner_id = %(owner_id)s

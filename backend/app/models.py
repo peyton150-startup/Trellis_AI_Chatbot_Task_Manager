@@ -482,7 +482,46 @@ class UpdateTaskArgs(MutableTaskFields):
 class BulkUpdateTasksArgs(MutableTaskFields):
     # One accepted call may not name more than this many targets. It does not
     # bound how many such calls a run may make; that is a separate dimension.
-    task_ids: list[UUID] = Field(max_length=BULK_TASK_IDS_MAX)
+    #
+    # D-79 added the lower bound. Before it, a call naming no targets validated
+    # and returned an empty success, which reads to the model as "the bulk
+    # update worked" when nothing was asked for and nothing happened. There is
+    # no request that legitimately means "change these zero tasks", so it is a
+    # malformed call and now says so.
+    task_ids: list[UUID] = Field(min_length=1, max_length=BULK_TASK_IDS_MAX)
+
+    @model_validator(mode="after")
+    def _patch_changes_something(self) -> "BulkUpdateTasksArgs":
+        """Refuse a call that names targets but cannot change any of them.
+
+        Presence is not effect, so `model_fields_set` alone is the wrong test.
+        `UPDATE_TASK_GUARDED` and its bulk counterpart apply `title`, `notes`,
+        `priority`, and `status` through COALESCE, where an explicit null is
+        indistinguishable from an omission and changes nothing. `due_date` and
+        `blocked_by` are the two fields whose null is a value, carried by a set
+        flag, so naming either of them is always effective. `notes=""` is a real
+        clear and stays valid.
+
+        Without this, such a call still locked every target, still incremented
+        every version, and still wrote an event per task recording a mutation
+        in which nothing differs between before and after. Refusing costs the
+        model one corrected retry and keeps the audit log honest.
+        """
+        effective = (
+            self.title is not None
+            or self.notes is not None
+            or self.priority is not None
+            or self.status is not None
+            or "due_date" in self.model_fields_set
+            or "blocked_by" in self.model_fields_set
+        )
+        if not effective:
+            raise ValueError(
+                "bulk_update_tasks needs at least one field that changes the "
+                "named tasks; send a value, or send due_date or blocked_by as "
+                "null to clear them"
+            )
+        return self
 
 
 class DeleteTasksArgs(TrellisModel):
