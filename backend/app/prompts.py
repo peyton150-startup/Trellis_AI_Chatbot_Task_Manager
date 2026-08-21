@@ -88,10 +88,18 @@ EXECUTION RULES
 
    OMIT every optional field that is unchanged.
 
-   If the user asks only to change notes, send only:
+   If the user asks only to REPLACE the notes, send only:
    - task_id;
    - expected_version;
    - notes.
+
+   If the user asks only to ADD to the notes, send only:
+   - task_id;
+   - expected_version;
+   - append_notes.
+
+   Rule 5a decides which of those two a request is. Do not treat "change the
+   notes" as always meaning replacement.
 
    Do not resend title, status, priority, due_date, dependencies, or other
    unchanged fields merely to preserve them.

@@ -182,6 +182,88 @@ def test_replacement_and_clearing_are_unchanged(db):
     assert cleared.tasks[0].notes == ""
 
 
+def test_the_prompt_routes_replace_and_append_without_contradiction():
+    """Two rules must not both claim the same request.
+
+    Rule 5 originally said "if the user asks only to change notes, send notes".
+    "Change" covers appending, so it contradicted rule 5a, which routes
+    add/append to `append_notes`. The backend is correct either way, but an
+    ambiguous instruction is how a model picks the wrong valid field, and the
+    wrong valid field here silently replaces a note the user meant to extend.
+    """
+    from app.prompts import SYSTEM_PROMPT
+
+    assert "asks only to change notes" not in SYSTEM_PROMPT
+    assert "asks only to REPLACE the notes" in SYSTEM_PROMPT
+    assert "asks only to ADD to the notes" in SYSTEM_PROMPT
+
+    # Both verbs map to a field, and the mapping appears before the worked
+    # example that shows not reading the notes back.
+    assert "add, append, add to, add a note    -> append_notes" in SYSTEM_PROMPT
+    assert "set, replace, overwrite, rewrite   -> notes" in SYSTEM_PROMPT
+
+
+def test_the_model_facing_schema_carries_the_append_contract():
+    """Assert the definition the model is actually sent, not just the class.
+
+    `UpdateTaskArgs.model_fields` proves what Python holds. It does not prove
+    what Pydantic AI generates and hands to the provider, and those are the two
+    places this contract has to agree. A field present on the class but absent
+    from the generated schema would leave the model unable to name it while
+    every class-level assertion stayed green.
+
+    `TestModel(call_tools=[])` drives one agent construction with no provider
+    request and no tool execution, so this needs neither a credential nor a
+    database. `conftest` additionally sets `ALLOW_MODEL_REQUESTS` False for any
+    test without the `network` marker, so a live request cannot happen here.
+    """
+    from pydantic_ai import models as pydantic_ai_models
+    from pydantic_ai.models.test import TestModel
+
+    from app import agent as agent_module
+
+    assert pydantic_ai_models.ALLOW_MODEL_REQUESTS is False
+
+    test_model = TestModel(call_tools=[])
+    built = agent_module.build_agent(test_model)
+    built.run_sync(
+        "hello",
+        deps=agent_module.TrellisDeps(actor_id=ACTOR_ID, run_id=uuid4()),
+    )
+
+    definitions = {
+        tool.name: tool
+        for tool in test_model.last_model_request_parameters.function_tools
+    }
+
+    update = definitions["update_task"]
+    update_properties = update.parameters_json_schema["properties"]
+    assert "append_notes" in update_properties
+    assert "notes" in update_properties
+
+    # The distinction is carried by the tool description, because the generated
+    # JSON schema for the field holds its constraints rather than its meaning.
+    description = update.description or ""
+    assert "append_notes" in description
+    assert "replaces the whole note value" in description
+    assert "ONLY the new text" in description
+
+    # The bulk tool must not have inherited an append.
+    bulk = definitions["bulk_update_tasks"]
+    assert "append_notes" not in bulk.parameters_json_schema["properties"]
+
+    # And the fragment keeps its bounds on the way to the model, so an empty
+    # append is refused by the schema rather than by a later check.
+    append_schema = update_properties["append_notes"]
+    constraint = next(
+        option
+        for option in append_schema["anyOf"]
+        if option.get("type") == "string"
+    )
+    assert constraint["minLength"] == 1
+    assert constraint["maxLength"] == TASK_NOTES_MAX_CHARS
+
+
 # ------------------------------------------------- what the merge produces
 
 
