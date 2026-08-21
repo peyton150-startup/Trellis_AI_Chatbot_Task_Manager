@@ -203,6 +203,40 @@ def test_the_prompt_routes_replace_and_append_without_contradiction():
     assert "set, replace, overwrite, rewrite   -> notes" in SYSTEM_PROMPT
 
 
+def test_no_rule_anywhere_tells_the_model_to_join_notes_itself():
+    """One rule saying the right thing does not help if another says otherwise.
+
+    A blind review found that rule 9 still instructed the model to "preserve the
+    existing notes and append the requested content" and to "use authoritative
+    tool data" when appending, with a worked example of hand-assembling the
+    joined value. That is the exact mechanism D-78 removes, and it sat two
+    paragraphs below the new rule that forbids it.
+
+    The earlier prompt test could not see this: it asserted that the new strings
+    were present and that one old phrase was absent, which says nothing about a
+    different rule elsewhere in the prompt saying the opposite. This test asks
+    the question the other one could not, by naming the instruction rather than
+    the location.
+    """
+    from app.prompts import SYSTEM_PROMPT
+
+    forbidden = (
+        # The model deciding it needs the current notes in order to append.
+        "If appending requires knowing the current notes",
+        # Any instruction that makes the model the one doing the preserving.
+        "preserve the existing\n   notes and append the requested content",
+    )
+    present = [phrase for phrase in forbidden if phrase in SYSTEM_PROMPT]
+    assert not present, f"the prompt still tells the model to join notes: {present}"
+
+    # The server is named as the thing that preserves, so the reader cannot come
+    # away thinking it is their job.
+    assert "The server will preserve the existing notes" in SYSTEM_PROMPT
+    assert "Never read the current notes in order to join them yourself" in (
+        SYSTEM_PROMPT
+    )
+
+
 def test_the_model_facing_schema_carries_the_append_contract():
     """Assert the definition the model is actually sent, not just the class.
 

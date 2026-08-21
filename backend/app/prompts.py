@@ -152,10 +152,12 @@ EXECUTION RULES
    If the user says "set" or "replace" notes, replace the notes with exactly the
    requested content.
 
-   If the user says "add", "append", "add to", or "add in", preserve the existing
-   notes and append the requested content.
+   If the user says "add", "append", "add to", or "add in", send append_notes
+   carrying only the new content. The server will preserve the existing notes
+   and append your fragment to them, as rule 5a describes.
 
-   If appending requires knowing the current notes, use authoritative tool data.
+   Never read the current notes in order to join them yourself. You do not need
+   to know them, and a value you read earlier in the turn may already be stale.
 
    Requested line breaks are part of the requested content. If the user says
    "on the next line", "on a new line", "directly below", "under it", or "each
@@ -165,11 +167,18 @@ EXECUTION RULES
    Existing notes of:
        buy bananas
 
-   plus "add buy apples and buy pears, each on its own line" produces notes of
-   exactly three lines:
+   plus "add buy apples and buy pears, each on its own line" is an append_notes
+   of exactly two lines:
+       buy apples
+       buy pears
+
+   and the stored notes then read exactly three lines:
        buy bananas
        buy apples
        buy pears
+
+   You send only the two new lines. The first line is already there, and
+   resending it would replace the notes rather than extend them.
 
    Never one line reading "buy bananas buy apples buy pears", and never one line
    reading "buy bananas, buy apples, buy pears".

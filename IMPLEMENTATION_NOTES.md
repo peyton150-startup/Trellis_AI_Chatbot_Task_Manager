@@ -3091,13 +3091,13 @@ and set-based semantics.
 
 ```text
 ruff check .                                clean
-pytest tests/test_d78_note_append.py        31 passed
-pytest -m "not network"                     424 passed, 13 deselected
+pytest tests/test_d78_note_append.py        35 passed
+pytest -m "not network"                     428 passed, 13 deselected
 npm run test:tools                          6 passed
 npm run build                               compiled, 3 static pages
 ```
 
-Author mutation audit, 11 mutations, all caught after one fix:
+Author mutation audit, 16 mutations, all caught after two fixes:
 
 ```text
 M5  separator removed                       15 tests fail
@@ -3107,11 +3107,24 @@ M8  fragment sized instead of merged value   2 tests fail
 M9  model_copy replaced by model_validate   13 tests fail
 M10 append moved onto MutableTaskFields      1 test fails
 M11 mutual-exclusion validator removed       2 tests fail
+M12 prompt ambiguity restored                1 test fails
+M13 tool description weakened                1 test fails
+M14 field description dropped                1 test fails
+M15 ALL_TOOLS narrower than ToolName         1 test fails
+M16 rule 9 manual-join instruction restored  1 test fails
 M1  a ninth backend tool lands               2 tests fail
 M2  a header label dropped                   3 tests fail
 M3  a snake_case wire name displayed         3 tests fail
 M4  a header label renamed                   2 tests fail
 ```
+
+**This table and the counts above went stale three times before a blind review
+caught it.** The note was written once at the first complete commit and then not
+revisited across three further commits that added tests and mutations, so it
+recorded 31 / 424 and eleven mutations while the suite actually had 34 / 427 and
+fifteen. Each commit message was accurate; the durable record was not, and the
+durable record is the one a future reader trusts. Update this block in the same
+commit that changes what it describes, not afterwards.
 
 **M7 is the one worth recording.** Stripping a caller-supplied leading newline
 inside `_effective_update` passed all 29 tests as originally written. The
