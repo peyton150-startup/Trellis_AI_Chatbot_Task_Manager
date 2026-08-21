@@ -4055,6 +4055,27 @@ already takes.
    quietly starts lying. The test parses the backend `ToolName` enum and fails
    when the two disagree.
 
+10. **A stale version is refused before validation that depends on current
+    state.** Once an owned row is locked, `update_task` compares the locked
+    `version` with the caller's `expected_version` and refuses before
+    `_effective_update` runs.
+
+    The order matters because the two refusals ask for different next actions.
+    A merged-size failure says shorten the text; a version conflict says
+    refresh and look again. A caller whose version has moved is not entitled to
+    mutate the locked row at all, so measuring its append against notes it has
+    not seen sends it to fix the wrong thing. The lock is what makes the early
+    comparison honest: `FOR UPDATE` blocks other writers until the transaction
+    ends, and a caller that waited is handed the row as the winner left it.
+
+    This does not replace optimistic concurrency. `UPDATE_TASK_GUARDED` keeps
+    its `version = expected_version` predicate as the fail-closed database
+    invariant. The comparison only decides which truthful refusal comes first.
+
+    A missing row and another actor's row are both absent from the owner-scoped
+    lock, so neither reaches the comparison and both keep refusing exactly as
+    before. The precedence rule discloses nothing new.
+
 This decision authorizes no migration, table, column, endpoint, status value,
 error code, dependency, or tool. It changes no policy, approval, idempotency, or
 undo semantics. It does not alter the D-74 ceilings, and it adds no bulk

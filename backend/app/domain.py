@@ -239,9 +239,35 @@ def update_task(
     *,
     conn: Connection,
 ) -> MutationResult:
-    """Guard one update by its expected version and capture both full rows."""
+    """Guard one update by its expected version and capture both full rows.
+
+    Staleness is decided before any validation that depends on current state,
+    and the order is the point rather than an optimisation. `_effective_update`
+    measures an append against the notes this transaction just locked, so a
+    caller holding a stale version could be told its addition is too long when
+    the fact it actually needs is that its version moved. Those two refusals
+    ask for different next actions: shorten the text, versus refresh and look
+    again. Once the lock has succeeded, the row already says which one is true.
+
+    The `FOR UPDATE` above is what makes the early comparison safe. It blocks
+    other writers on this row until the transaction ends, and a caller that had
+    to wait for a competing transaction is handed the row as that transaction
+    left it, so `before.version` is current rather than a pre-lock guess.
+
+    This does not replace optimistic concurrency. `UPDATE_TASK_GUARDED` keeps
+    its own `version = expected_version` predicate as the fail-closed database
+    invariant; this comparison only decides which truthful refusal the caller
+    hears first.
+    """
     locked = _locked_tasks(owner_id, (arguments.task_id,), conn=conn)
     before = locked.get(arguments.task_id)
+
+    # A missing row and another actor's row are both `None` here, and they stay
+    # indistinguishable. Only an owned, locked row can be compared, so the two
+    # out-of-scope cases fall through to the guarded UPDATE and refuse exactly
+    # as they did before, disclosing nothing new.
+    if before is not None and before.version != arguments.expected_version:
+        raise VersionConflictError()
 
     effective = _effective_update(arguments, before)
 

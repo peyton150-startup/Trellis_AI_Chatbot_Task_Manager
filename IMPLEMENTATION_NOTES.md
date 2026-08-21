@@ -3091,13 +3091,14 @@ and set-based semantics.
 
 ```text
 ruff check .                                clean
-pytest tests/test_d78_note_append.py        37 passed
-pytest -m "not network"                     430 passed, 13 deselected
+pytest tests/test_d78_note_append.py        43 passed
+pytest -m "not network"                     436 passed, 13 deselected
 npm run test:tools                          6 passed
 npm run build                               compiled, 3 static pages
 ```
 
-Author mutation audit, 18 mutations, all caught after two fixes:
+Author mutation audit, 21 mutations. 19 caught, 1 equivalent, 1 caught
+by a neighbouring suite:
 
 ```text
 M5  separator removed                       15 tests fail
@@ -3114,11 +3115,29 @@ M15 ALL_TOOLS narrower than ToolName         1 test fails
 M16 rule 9 manual-join instruction restored  1 test fails
 M17 inaccurate rule 9 consequence restored   1 test fails
 M18 schema names the wrong consequence       1 test fails
+M19 early version check removed              2 tests fail
+M20 check also fires for absent rows         EQUIVALENT, see below
+M21 SQL version guard removed                caught by the D-76 suite
 M1  a ninth backend tool lands               2 tests fail
 M2  a header label dropped                   3 tests fail
 M3  a snake_case wire name displayed         3 tests fail
 M4  a header label renamed                   2 tests fail
 ```
+
+**M20 is an equivalent mutant and is recorded as one rather than papered over.**
+Widening the guard from `before is not None and ...` to `before is None or ...`
+changes nothing observable: an absent row raises `VersionConflictError` early
+under the mutant and raises the identical error via the guarded UPDATE without
+it. No test can distinguish them because there is nothing to distinguish. The
+narrow form is kept because it says what it means, not because a test forces it.
+
+**M21 is caught, but not by this suite.** Removing
+`AND version = %(expected_version)s` from `UPDATE_TASK_GUARDED` leaves all 43
+D-78 tests passing, because the new Python comparison catches staleness first on
+this path. It fails `test_a_stale_pre_delete_version_stays_invalid_after_restore`
+in the D-76 suite, which is what proves the SQL predicate is still load-bearing
+for the other callers of that statement. Worth stating plainly: the D-78 suite
+alone would not have noticed the fail-closed database invariant disappearing.
 
 **This table and the counts above went stale three times before a blind review
 caught it.** The note was written once at the first complete commit and then not

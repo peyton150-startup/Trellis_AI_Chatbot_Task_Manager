@@ -17,6 +17,8 @@ replay must not do twice.
 """
 
 import sys
+import threading
+import time
 from datetime import date
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -712,6 +714,203 @@ def test_another_actors_task_is_untouched_by_an_append(db):
 
     db.rollback()
     assert _notes(db, foreign.id) == "theirs"
+
+
+# ------------------------------------- staleness precedes state validation
+
+
+def _quadrant(db, *, stale: bool, overflowing: bool):
+    """One cell of the version-versus-size matrix. Returns the raised error."""
+    run_id = _run()
+    notes = "x" * (TASK_NOTES_MAX_CHARS - 1) if overflowing else "alpha"
+    task = _task(db, run_id, notes=notes)
+
+    version = task.version
+    if stale:
+        # Move the row on with an unrelated field, so the notes stay whatever
+        # the case needs while the caller's remembered version goes stale. The
+        # event is written too, so the later count means "the append added
+        # nothing" rather than "nobody recorded anything".
+        moved = domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(
+                task_id=task.id, expected_version=task.version, priority="high"
+            ),
+            conn=db,
+        )
+        domain.write_events(run_id, ACTOR_ID, moved.events, conn=db)
+        db.commit()
+
+    fragment = "yy" if overflowing else "beta"
+    try:
+        result = domain.update_task(
+            ACTOR_ID,
+            UpdateTaskArgs(
+                task_id=task.id, expected_version=version, append_notes=fragment
+            ),
+            conn=db,
+        )
+    except Exception as raised:  # noqa: BLE001 - the matrix asserts the type
+        db.rollback()
+        return task, version, raised
+    return task, version, result
+
+
+def _unchanged_since(db, task, *, expected_version):
+    row = db.execute(
+        "SELECT notes, version FROM tasks WHERE id = %(id)s", {"id": task.id}
+    ).fetchone()
+    assert row["version"] == expected_version
+    events = db.execute(
+        "SELECT count(*) AS n FROM task_events "
+        " WHERE task_id = %(id)s AND operation = 'updated'",
+        {"id": task.id},
+    ).fetchone()
+    return row, events["n"]
+
+
+def test_current_version_and_a_fitting_append_succeeds(db):
+    task, _, result = _quadrant(db, stale=False, overflowing=False)
+    assert not isinstance(result, Exception)
+    assert result.tasks[0].notes == "alpha\nbeta"
+    assert result.tasks[0].version == task.version + 1
+
+
+def test_current_version_and_an_overflowing_append_is_a_validation_error(db):
+    """Size is still the right answer when the caller's version is current."""
+    task, _, raised = _quadrant(db, stale=True is False, overflowing=True)
+    assert isinstance(raised, ValidationFailedError)
+    row, updates = _unchanged_since(db, task, expected_version=task.version)
+    assert len(row["notes"]) == TASK_NOTES_MAX_CHARS - 1
+    assert updates == 0
+
+
+def test_stale_version_and_a_fitting_append_is_a_version_conflict(db):
+    task, _, raised = _quadrant(db, stale=True, overflowing=False)
+    assert isinstance(raised, VersionConflictError)
+    _, updates = _unchanged_since(db, task, expected_version=task.version + 1)
+    assert updates == 1  # the unrelated priority move only
+
+
+def test_stale_version_beats_an_overflowing_append(db):
+    """The review finding. Staleness is the fact the caller actually needs.
+
+    Both refusals are true of this call, and they ask for different next
+    actions: shorten the text, or refresh and look again. A caller whose
+    version has moved is not entitled to mutate the locked row at all, so
+    telling it the merge is too long sends it to fix the wrong thing. The row
+    is already locked by this point, so the transaction knows which is true.
+    """
+    task, _, raised = _quadrant(db, stale=True, overflowing=True)
+
+    assert isinstance(raised, VersionConflictError), type(raised).__name__
+    assert not isinstance(raised, ValidationFailedError)
+
+    row, updates = _unchanged_since(db, task, expected_version=task.version + 1)
+    assert len(row["notes"]) == TASK_NOTES_MAX_CHARS - 1
+    assert updates == 1  # the unrelated priority move only
+
+
+def test_a_missing_or_foreign_target_still_refuses_identically(db):
+    """The early comparison must not become a way to enumerate rows.
+
+    `_locked_tasks` is owner scoped, so a missing row and another actor's row
+    are both absent here. Neither may reach the new comparison, and both must
+    keep producing the same refusal they produced before it existed.
+    """
+    run_id = _run()
+    foreign = _task(db, run_id, title="Theirs", actor_id=OTHER_ACTOR_ID, notes="t")
+    absent = domain.Task(
+        id=uuid4(),
+        owner_id=ACTOR_ID,
+        title="gone",
+        version=1,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+
+    for target in (foreign, absent):
+        with pytest.raises(VersionConflictError):
+            _append(db, target, "mine")
+        db.rollback()
+
+    # And an absurd expected_version does not change the answer either, so the
+    # refusal never reveals whether the row exists.
+    for target in (foreign, absent):
+        with pytest.raises(VersionConflictError):
+            domain.update_task(
+                ACTOR_ID,
+                UpdateTaskArgs(
+                    task_id=target.id, expected_version=999, append_notes="mine"
+                ),
+                conn=db,
+            )
+        db.rollback()
+
+
+def test_the_comparison_reads_the_locked_version_not_a_pre_lock_read(db):
+    """Prove the precedence rests on the PostgreSQL lock, not on timing.
+
+    A transaction that has to wait on `FOR UPDATE` is handed the row as the
+    winning transaction left it. So a caller that was current when it started,
+    and stale by the time it acquired the lock, must still refuse as a version
+    conflict rather than validating an append against the state it remembers.
+    """
+    run_id = _run()
+    task = _task(db, run_id, notes="x" * (TASK_NOTES_MAX_CHARS - 1))
+    db.commit()
+
+    started = threading.Barrier(2)
+    outcomes: list[object] = []
+    guard = threading.Lock()
+
+    def winner():
+        with pool.connection() as conn:
+            locked = domain.update_task(
+                ACTOR_ID,
+                UpdateTaskArgs(
+                    task_id=task.id, expected_version=task.version, priority="high"
+                ),
+                conn=conn,
+            )
+            started.wait(timeout=30)
+            # Hold the row briefly so the loser is forced to wait on the lock
+            # rather than racing past it.
+            time.sleep(0.5)
+            conn.commit()
+            with guard:
+                outcomes.append(("winner", locked.tasks[0].version))
+
+    def loser():
+        started.wait(timeout=30)
+        with pool.connection() as conn:
+            try:
+                domain.update_task(
+                    ACTOR_ID,
+                    UpdateTaskArgs(
+                        task_id=task.id,
+                        expected_version=task.version,
+                        append_notes="yy",
+                    ),
+                    conn=conn,
+                )
+                with guard:
+                    outcomes.append(("loser", "no error"))
+            except Exception as raised:  # noqa: BLE001
+                conn.rollback()
+                with guard:
+                    outcomes.append(("loser", type(raised).__name__))
+
+    threads = [threading.Thread(target=winner), threading.Thread(target=loser)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+        assert not thread.is_alive(), "a concurrent update never returned"
+
+    results = dict(outcomes)
+    assert results["winner"] == task.version + 1
+    assert results["loser"] == "VersionConflictError", results
 
 
 # ----------------------------------------------------------------- replay

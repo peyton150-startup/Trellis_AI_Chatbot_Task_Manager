@@ -98,7 +98,13 @@ class LeaseInFlightError(PolicyError):
 
 
 class VersionConflictError(PolicyError):
-    """Guarded update returned zero rows."""
+    """The mutation could not satisfy its version guard.
+
+    Usually the guarded statement returned zero rows. Since D-78 an owned,
+    locked row whose version already disagrees also raises this before any
+    state-dependent validation runs, so the description is the condition rather
+    than the one statement that used to detect it.
+    """
 
     code = "VERSION_CONFLICT"
     http_status = 409
