@@ -116,6 +116,8 @@ from starlette.concurrency import run_in_threadpool
 from . import domain, limits, policy, prompts, runs, tools
 from .config import settings
 from .errors import (
+    AppendNotesLimitError,
+    BulkTargetCoverageError,
     ExternalDivergenceError,
     OutOfScopeError,
     ValidationFailedError,
@@ -515,7 +517,21 @@ def build_agent(
         Every named task gets the identical change, so a request that gives
         different values to different tasks is not a bulk update. There is no
         expected_version field: the server reads each task's current version
-        under lock. Notes can only be replaced here, not appended.
+        under lock.
+
+        Notes can be replaced or appended, and the two are separate modes:
+
+            notes         replaces the whole note value on every named task.
+            append_notes  contains ONLY the new text. The server reads each
+                          task's current notes and appends to them, so different
+                          tasks keep their different existing notes.
+
+        To add the same line to several tasks, send ONE call with every id in
+        task_ids and the new text in append_notes. Do not read the notes and
+        concatenate them yourself, and do not send one update_task per task.
+        append_notes cannot be combined with any other field in the same call;
+        send the append by itself. Either the whole set is appended or none of
+        it is.
 
         Two rules the schema cannot express, so read them here:
 
@@ -1395,6 +1411,38 @@ def _model_facing_refusals():
     """
     try:
         yield
+    except AppendNotesLimitError as exc:
+        # D-80, and it must be caught before VersionConflictError's sibling
+        # handlers for the obvious reason that ordering decides which one wins;
+        # it is unrelated to them, but it is a subclass of ValidationFailedError
+        # and the narrower type has to be named first.
+        #
+        # Terminal rather than retryable. The model cannot correct this without
+        # editing the user's text: truncating, summarising, or dropping part of
+        # it would all "succeed" while storing something the user did not ask
+        # for. An oversized fragment is a different case and Pydantic already
+        # rejects that against the schema before this code runs.
+        raise ToolFailed(
+            "The note text cannot be added because the resulting note would "
+            "exceed the maximum length. Nothing was changed. Do not shorten, "
+            "summarise, or rewrite the user's text to make it fit; tell them the "
+            "note is too long and let them decide."
+        ) from exc
+    except BulkTargetCoverageError as exc:
+        # D-80, and likewise before VersionConflictError, which it subclasses.
+        #
+        # The generic version-conflict advice is wrong here. That advice tells
+        # the caller to resolve the task and retry with a fresh current_version,
+        # which is exactly right for `update_task`, whose caller supplied one.
+        # A bulk call supplies none: the server reads each version after locking
+        # the row. Repeating that advice would ask the model to manufacture a
+        # value it never sent.
+        raise ToolFailed(
+            "The bulk operation could not safely cover its whole target set, so "
+            "no partial change was committed. Do not invent expected versions "
+            "and do not retry blindly. Look up the current tasks again if the "
+            "user still wants this change."
+        ) from exc
     except VersionConflictError as exc:
         # No new version travels in this message. Handing one back would make an
         # exception payload a second source of task state competing with the

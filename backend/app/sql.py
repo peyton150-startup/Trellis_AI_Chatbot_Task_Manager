@@ -281,6 +281,45 @@ UPDATE tasks AS t
 RETURNING t.*;
 """
 
+# D-80. Bulk note append. A separate statement rather than a generalisation of
+# BULK_UPDATE_TASKS_GUARDED, because the two differ in the one way that matters:
+# replacement binds a single shared value for every target, while append binds a
+# different, already-merged value per target. Making one statement serve both
+# would put a per-row column and a scalar in the same parameter slot, and the
+# D-79 path would be rewritten to gain nothing.
+#
+# The merge itself is not here. Every effective value is computed in Python from
+# the notes this transaction already holds a lock on, validated in full, and
+# only then bound. SQL applies what was decided; it does not decide.
+#
+# Three parallel arrays, with the same caution D-79 records for two: unnest does
+# not reject inputs of unequal length, it NULL-pads the shorter ones. A short
+# array would therefore execute and fail closed as a coverage miss rather than
+# as the construction bug it is, so domain builds one relation and checks its
+# cardinality before binding.
+#
+# The guards are D-79's, unchanged: the owner predicate, the per-row version
+# predicate, and RETURNING keyed by id rather than by position.
+BULK_APPEND_NOTES_GUARDED = """
+WITH expected AS (
+  SELECT *
+    FROM unnest(
+           %(task_ids)s::uuid[],
+           %(expected_versions)s::integer[],
+           %(effective_notes)s::text[]
+         ) AS x(id, expected_version, notes)
+)
+UPDATE tasks AS t
+   SET notes = x.notes,
+       version = t.version + 1,
+       updated_at = now()
+  FROM expected AS x
+ WHERE t.id = x.id
+   AND t.owner_id = %(owner_id)s
+   AND t.version = x.expected_version
+RETURNING t.*;
+"""
+
 DELETE_TASKS_BY_IDS = """
 DELETE FROM tasks
  WHERE owner_id = %(owner_id)s

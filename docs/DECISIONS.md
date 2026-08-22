@@ -4364,3 +4364,130 @@ browser symptom, an AG-UI `TEXT_MESSAGE_CONTENT` without a preceding
 `TEXT_MESSAGE_START`, is consistent with a stream aborted mid-message, but this
 decision does not claim to have root-caused that console error, only to have
 removed the failure class that aborted the run.
+
+### D-80: appending one line to many tasks, all of them or none
+
+The request was ordinary: add a line to the notes of the first ten tasks. The
+model did the only thing the tool surface allowed, ten single `update_task`
+calls, and the sixth hit a version conflict. Five tasks were already committed.
+The user was left with a half-applied edit, a failed run, and no single
+operation to point at or undo.
+
+That is not a model failure. `bulk_update_tasks` already means "the same change
+to several tasks", and appending the same line is exactly that. What the tool
+lacked was an execution mode: append needs a different final value per row,
+merged from that row's locked notes, where replacement needs one shared value.
+
+1. **No ninth tool.** The surface stays eight. D-79 established that a second
+   spelling of one capability is a routing problem dressed as a feature, and
+   nothing here changes that. Append is a mode inside the tool that already owns
+   multi-task changes.
+
+2. **`append_notes` is declared on `BulkUpdateTasksArgs`, still not on
+   `MutableTaskFields`.** D-78 kept it off the shared base so bulk could not
+   inherit an append nobody had specified: no per-row merge, no per-row
+   final-size check, no set-based semantics. D-80 specifies all three, so the
+   field is declared on the model that implements it. That reverses D-78's
+   conclusion, not its reasoning: the base is still shared, so a field added
+   there would still hand append semantics to anything else built on it, and the
+   gate still asserts the base is clean.
+
+3. **Append is append-only.** A call carrying `append_notes` may carry no other
+   mutable field. Replace-then-append and append-then-replace produce different
+   results and both are defensible, which is the reason to refuse rather than to
+   invent a precedence rule nobody can read off the schema. There are concrete
+   reasons beyond ambiguity: append is not idempotent while scalar replacement
+   is convergent, so mixing them puts two different retry stories in one call;
+   append needs a per-row effective value and replacement needs one shared
+   value, so they run different SQL; and the approval preview has to describe
+   one intent. A later decision may authorize a mixed mode.
+
+4. **The existing replacement path is untouched.** `BULK_UPDATE_TASKS_GUARDED`
+   is unchanged and still serves every call without `append_notes`. Append gets
+   `BULK_APPEND_NOTES_GUARDED`. Generalizing one statement to serve both would
+   have put a per-row column and a scalar in the same parameter slot and
+   rewritten the D-79 path to gain nothing.
+
+5. **Every value is merged and validated before anything is written.** The
+   ordering is the whole contract:
+
+   ```text
+   distinct targets -> canonical ORDER BY id FOR UPDATE -> full coverage
+   -> merge every row from its locked notes
+   -> validate every merged result
+   -> ONE guarded set-based UPDATE
+   -> exact returned coverage
+   -> one audit event per task -> lease completion -> one commit
+   ```
+
+   A set where nine merges fit and the tenth overflows commits nothing at all.
+   Merging and updating row by row would leave nine appended notes and a failed
+   run, which is the original failure wearing a new hat.
+
+6. **Existing notes come from the locked row, never from the model.** The model
+   sends only its fragment, exactly as D-78 established. `merge_appended_notes`
+   is reused rather than reimplemented, so the separator rule has one
+   definition: one newline, only when one is needed, and no reformatting of what
+   is already there.
+
+7. **Three parallel arrays, guarded like D-79's two.** `unnest` does not reject
+   inputs of unequal length, it NULL-pads the shorter ones, so a short array
+   would execute and fail closed as a coverage miss rather than as the
+   construction bug it is. One relation is built and its cardinality, uniqueness
+   and null-freedom checked before binding. `UPDATE ... FROM` also needs at most
+   one source row per target, and that remains Trellis's obligation because
+   PostgreSQL picks one unpredictably instead of refusing.
+
+8. **Two narrow error subtypes, and no fifteenth code.** `AppendNotesLimitError`
+   subclasses `ValidationFailedError` and keeps `VALIDATION_ERROR`/422;
+   `BulkTargetCoverageError` subclasses `VersionConflictError` and keeps
+   `VERSION_CONFLICT`/409. Neither is added to `ERRORS_BY_CODE`, so section 6's
+   table is still exactly fourteen entries, and the gate asserts that.
+
+   They exist because two refusals needed different model-facing advice than
+   their parents. A merged-note overflow is terminal, not retryable: the only
+   "correction" available to a model is to truncate, summarise, or rewrite text
+   the user asked to store verbatim, which is a silent change to the user's data
+   rather than a fix. And a bulk coverage failure must not repeat the
+   single-task advice to resolve the task and retry with a fresh
+   `current_version`, because a bulk caller supplies no expected version; the
+   server reads each one after locking the row.
+
+9. **The merged-overflow escape was a real gap, reproduced before it was
+   fixed.** Pydantic rejects an oversized *fragment* against the schema before
+   the tool body runs. It cannot see a legal fragment whose merge with locked
+   notes overflows. Driving the real agent with that case aborted `run_sync` on
+   the first model turn, exactly as the D-79 hardening's other escapes did.
+
+10. **The existing approval bridge covers append unchanged.** Ten targets
+    exceeds the blast-radius threshold of three, so the call defers through the
+    same server-owned approval row. `_payload` already dumps set fields, so the
+    fragment is part of the hashed arguments: approving "pull the turnips" does
+    not authorize "pull the carrots", and a different target set is a different
+    hash. `bulk_update_tasks` remains absent from the Linear profile, which has
+    no browser approval-continuation path.
+
+11. **The timeout fence was probed and is not needed.** The worry had a real
+    shape: a tool timeout becomes a retry prompt, and a worker thread already
+    running does not stop when the awaiting task is cancelled, so one logical
+    append could commit twice under two `tool_call_id`s. Measured against pinned
+    `pydantic-ai==2.27.0`, that does not arise, because `tool_timeout` does not
+    fire for synchronous tools at all: a sync body outran a 1.0 s timeout and
+    returned normally, while an async body in the same harness was cancelled on
+    time. Every Trellis tool is synchronous, so the retry that would be required
+    is never issued, and no second idempotency mechanism was built.
+
+    This is a version-pinned observation rather than a law, so it is a test. If
+    an upgrade starts enforcing the timeout for sync tools, that test fails and
+    the question reopens with evidence.
+
+**Known limitations.** Bulk append is append-only, so a caller wanting to append
+and change a priority sends two calls. The lock-order caveat D-79 records is
+unchanged. The three defence-in-depth guards on this path, the owner predicate,
+the returned-coverage check and the relation invariants, are unreachable through
+the tool because an earlier check fires first, so they are tested directly.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It adds one SQL constant, one model field, two
+error subtypes, and CI assertions replacing the D-79 gate that asserted bulk
+could not append.

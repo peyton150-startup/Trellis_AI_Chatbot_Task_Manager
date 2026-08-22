@@ -57,6 +57,7 @@ from app.limits import BULK_TASK_IDS_MAX
 from app.models import (
     BulkUpdateTasksArgs,
     CreateTaskArgs,
+    MutableTaskFields,
     ToolName,
     UpdateTaskArgs,
 )
@@ -233,16 +234,33 @@ def test_an_effective_patch_is_accepted(patch):
     BulkUpdateTasksArgs(task_ids=[uuid4()], **patch)
 
 
-def test_bulk_still_has_no_append(db):
-    """D-78's boundary is unchanged by D-79, and this is where it would erode.
+def test_the_replacement_path_never_carries_an_append(db):
+    """D-79's statement is for replacement, and D-80 gave append its own.
 
-    The set-based statement makes a per-row merge look cheaper than it is: it
-    would need the merged value computed per task and its own final-size check
-    per task, which is exactly the work D-78 declined to specify for bulk.
+    When D-79 shipped, this asserted bulk could not append at all. D-80 admitted
+    it, so the surviving invariant is narrower and more useful: an append never
+    travels through the replacement statement. The two are separate modes on
+    separate SQL, because replacement binds one shared value and append binds a
+    different merged value per row.
     """
-    assert "append_notes" not in BulkUpdateTasksArgs.model_fields
+    assert "append_notes" in BulkUpdateTasksArgs.model_fields
+    assert "append_notes" not in MutableTaskFields.model_fields
+
+    # Append is append-only, so it can never be mixed into a replacement call.
     with pytest.raises(ValidationError):
-        BulkUpdateTasksArgs(task_ids=[uuid4()], append_notes="nope")
+        BulkUpdateTasksArgs(task_ids=[uuid4()], append_notes="x", notes="y")
+
+    run_id = _run()
+    task = _task(db, run_id, notes="alpha")
+    counting = _CountingConnection(db)
+    domain.bulk_update_tasks(
+        ACTOR_ID,
+        BulkUpdateTasksArgs(task_ids=[task.id], append_notes="beta"),
+        conn=counting,
+    )
+    db.commit()
+    assert counting.count(sql.BULK_UPDATE_TASKS_GUARDED) == 0
+    assert counting.count(sql.BULK_APPEND_NOTES_GUARDED) == 1
 
 
 # ------------------------------------------------------ the statement shape
@@ -1040,9 +1058,11 @@ def test_the_bulk_description_carries_the_rules_the_schema_cannot():
 
 def test_the_bulk_schema_the_model_sees_carries_the_bound_and_no_append():
     schema = _definitions()[ToolName.BULK_UPDATE_TASKS.value].parameters_json_schema
-    assert "append_notes" not in schema["properties"]
     assert schema["properties"]["task_ids"]["maxItems"] == BULK_TASK_IDS_MAX
     assert schema["properties"]["task_ids"]["minItems"] == 1
+    # D-80 added append to this schema deliberately; the bounds are what this
+    # test exists to hold.
+    assert "append_notes" in schema["properties"]
 
 
 def test_a_sequential_tool_does_not_overlap_a_sibling_in_the_same_response():

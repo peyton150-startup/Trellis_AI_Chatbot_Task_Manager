@@ -131,6 +131,46 @@ class ValidationFailedError(PolicyError):
     http_status = 422
 
 
+class AppendNotesLimitError(ValidationFailedError):
+    """A note append whose merged result would exceed the note ceiling.
+
+    D-80. Not a fifteenth code: it keeps `VALIDATION_ERROR` and its 422, and it
+    is deliberately absent from `ERRORS_BY_CODE`, so section 6's table is still
+    exactly fourteen entries. The subclass exists only so one specific
+    validation failure can be recognised by type at the model adapter.
+
+    The distinction it carries is worth having. Pydantic rejects an oversized
+    *fragment* against the schema before the tool body runs, and the model can
+    fix that by sending less text. This is the other case: a legal fragment
+    whose merge with the task's locked notes would overflow. That one cannot be
+    reported as a retryable schema problem, because the only way for the model
+    to "correct" it would be to truncate, summarise, or rewrite text the user
+    asked to store verbatim, which is a silent change to the user's data rather
+    than a fix.
+
+    So the model adapter maps this to a terminal failure and every other
+    `ValidationFailedError` keeps its existing behaviour.
+    """
+
+
+class BulkTargetCoverageError(VersionConflictError):
+    """A bulk mutation that could not cover its whole locked target set.
+
+    D-80. Same arrangement as `AppendNotesLimitError`: it keeps
+    `VERSION_CONFLICT` and its 409 and stays out of `ERRORS_BY_CODE`, so no new
+    code is introduced.
+
+    It exists because the advice attached to a version conflict is wrong for a
+    bulk call. `update_task` carries a caller-supplied `expected_version`, so
+    telling the model to resolve the task and retry with a fresh version is
+    exactly right. `bulk_update_tasks` has no such field: the server reads each
+    version after locking the row. Telling that caller to obtain a current
+    version would ask it to manufacture something it never supplied, and the
+    only honest report is that the whole set could not be covered and nothing
+    was committed.
+    """
+
+
 class RunStateInvalidError(PolicyError):
     """A resolved, actor-owned run whose current status forbids the action.
 

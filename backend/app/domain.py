@@ -43,7 +43,12 @@ from psycopg.types.json import Json
 from pydantic import JsonValue
 
 from . import sql
-from .errors import OutOfScopeError, ValidationFailedError, VersionConflictError
+from .errors import (
+    AppendNotesLimitError,
+    BulkTargetCoverageError,
+    OutOfScopeError,
+    VersionConflictError,
+)
 from .limits import TASK_NOTES_MAX_CHARS
 from .models import (
     BulkUpdateTasksArgs,
@@ -326,6 +331,14 @@ def bulk_update_tasks(
 
     locked = _locked_tasks(owner_id, task_ids, conn=conn)
     _require_all_targets(task_ids, locked)
+
+    # D-80. Append is a different execution mode, not a different value passed
+    # to the same statement, so it branches here. Everything above is shared:
+    # the same deduplication, the same canonical lock, the same coverage
+    # requirement. Everything below differs, because append needs a per-target
+    # effective value merged from locked state.
+    if arguments.append_notes is not None:
+        return _bulk_append_notes(owner_id, task_ids, locked, arguments, conn=conn)
 
     update_ids, expected_versions = _expected_relation(task_ids, locked)
 
@@ -745,6 +758,101 @@ def _update_parameters(
     }
 
 
+def _bulk_append_notes(
+    owner_id: UUID,
+    task_ids: Sequence[UUID],
+    locked: dict[UUID, Task],
+    arguments: BulkUpdateTasksArgs,
+    *,
+    conn: Connection,
+) -> MutationResult:
+    """Append one fragment to every locked target, all of them or none.
+
+    The model sends only its new text, exactly as D-78 established for a single
+    task, and each existing value comes from the row this transaction holds a
+    lock on. Nothing the model read earlier can be stale by the time the merge
+    happens, and a note the model never saw is not overwritten.
+
+    The ordering below is the whole contract. Every merged value is computed and
+    validated for the entire target set *before* the mutating statement runs, so
+    a set where nine merges fit and the tenth overflows commits nothing at all.
+    Merging and updating target by target would leave nine appended notes and a
+    failed run, which is precisely the partial outcome this decision exists to
+    remove, and it is what the per-task loop produced in practice.
+
+    `merge_appended_notes` is reused rather than reimplemented. The separator
+    rule is D-78's and there must be exactly one of it.
+    """
+    relation = _bulk_append_relation(task_ids, locked, arguments.append_notes)
+
+    rows = conn.execute(
+        sql.BULK_APPEND_NOTES_GUARDED,
+        {
+            "owner_id": owner_id,
+            "task_ids": [task_id for task_id, _, _ in relation],
+            "expected_versions": [version for _, version, _ in relation],
+            "effective_notes": [notes for _, _, notes in relation],
+        },
+    ).fetchall()
+
+    updated_by_id = {task.id: task for task in (_task(row) for row in rows)}
+    if set(updated_by_id) != {task_id for task_id, _, _ in relation}:
+        # Same fail-closed rule as the replacement path, but reported as the
+        # bulk-specific subtype: this caller supplied no expected version, so
+        # advice to refresh one and retry would be advice it cannot act on.
+        raise BulkTargetCoverageError()
+
+    updated = tuple(updated_by_id[task_id] for task_id in task_ids)
+    events = tuple(
+        _updated_event(locked[task_id], updated_by_id[task_id]) for task_id in task_ids
+    )
+    return MutationResult(tasks=updated, events=events)
+
+
+def _bulk_append_relation(
+    task_ids: Sequence[UUID],
+    locked: dict[UUID, Task],
+    fragment: str,
+) -> tuple[tuple[UUID, int, str], ...]:
+    """Merge and validate every target before any of them is written.
+
+    Returns one triple per distinct target, built as a single relation for the
+    reason `_expected_relation` records at length: three parallel arrays that
+    are assembled separately can disagree, and `unnest` NULL-pads rather than
+    refusing, so the mistake would surface later wearing the wrong name.
+
+    The size check runs against the merged value rather than the fragment. A
+    legal fragment can still produce an illegal note, and that is exactly the
+    case the schema cannot see.
+    """
+    relation = tuple(
+        (task_id, locked[task_id].version, merge_appended_notes(locked[task_id].notes, fragment))
+        for task_id in task_ids
+    )
+
+    if len(relation) != len(task_ids):
+        raise RuntimeError("bulk append built a relation of the wrong size")
+    if len({task_id for task_id, _, _ in relation}) != len(relation):
+        raise RuntimeError("bulk append built a duplicated expected target")
+    if any(version is None for _, version, _ in relation):
+        raise RuntimeError("bulk append built a null expected version")
+    if any(notes is None for _, _, notes in relation):
+        raise RuntimeError("bulk append built a null effective note")
+
+    # Every target is checked, and the first failure refuses the whole call.
+    # Truncating instead would silently discard the caller's text while still
+    # committing a version increment and an event, recording a mutation that
+    # does not say what happened.
+    for task_id, _, notes in relation:
+        if len(notes) > TASK_NOTES_MAX_CHARS:
+            raise AppendNotesLimitError(
+                f"appending would make one task's notes {len(notes)} characters, "
+                f"over the {TASK_NOTES_MAX_CHARS} limit; no task was changed"
+            )
+
+    return relation
+
+
 def _expected_relation(
     task_ids: Sequence[UUID],
     locked: dict[UUID, Task],
@@ -903,7 +1011,13 @@ def _effective_update(
         # Refuse rather than truncate. Truncation would silently discard the
         # caller's text and still commit a version increment and an event,
         # recording a mutation that does not say what happened.
-        raise ValidationFailedError(
+        #
+        # D-80 narrowed the type. This is still a VALIDATION_ERROR with the same
+        # 422, so no code was added, but the single-task and bulk append paths
+        # now raise one recognisable class for the same condition, which is what
+        # lets the model adapter treat this one validation failure as terminal
+        # without treating every validation failure that way.
+        raise AppendNotesLimitError(
             f"appending would make notes {len(merged)} characters, over the "
             f"{TASK_NOTES_MAX_CHARS} limit"
         )

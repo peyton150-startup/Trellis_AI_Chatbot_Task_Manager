@@ -6370,9 +6370,22 @@ jobs:
               sys.exit("FAIL update_task lost append_notes")
           if "append_notes" in MutableTaskFields.model_fields:
               sys.exit("FAIL append_notes is on the shared base and leaks to bulk")
-          if "append_notes" in BulkUpdateTasksArgs.model_fields:
-              sys.exit("FAIL bulk update exposes an unauthorized append")
-          print("PASS append is single-task only")
+          # D-80 gave bulk an append of its own, declared on its own model. The
+          # boundary that survives is the shared base staying clean, checked
+          # above, plus append remaining a mode rather than a loose field.
+          if "append_notes" not in BulkUpdateTasksArgs.model_fields:
+              sys.exit("FAIL bulk update lost the D-80 append")
+          try:
+              BulkUpdateTasksArgs(
+                  task_ids=["00000000-0000-0000-0000-000000000001"],
+                  append_notes="x",
+                  priority="high",
+              )
+          except Exception:
+              pass
+          else:
+              sys.exit("FAIL bulk append can be combined with another field")
+          print("PASS append never travels through the shared base")
           PY
 
           cd ..
@@ -6627,6 +6640,136 @@ jobs:
           DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
         run: pytest tests/test_d79_tool_failure_mapping.py -v
 
+      # D-80. The contract is all-or-nothing: the partial edit that started this
+      # is the thing that must not be reachable.
+      - name: Prove bulk note append is atomic
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check tests/test_d80_bulk_append.py
+          pytest tests/test_d80_bulk_append.py -v
+
+      - name: Prove ten appends are one statement and an overflow commits nothing
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYGATE'
+          import sys
+          from uuid import UUID
+
+          sys.path.insert(0, ".")
+          from app import domain, runs, sql
+          from app.db import pool
+          from app.errors import AppendNotesLimitError
+          from app.limits import TASK_NOTES_MAX_CHARS
+          from app.models import BulkUpdateTasksArgs, CreateTaskArgs
+
+          ACTOR = UUID("00000000-0000-0000-0000-000000000001")
+          FRAGMENT = "pull the turnips"
+
+
+          class Counter:
+              def __init__(self, conn):
+                  self._conn = conn
+                  self.seen = []
+
+              def execute(self, statement, params=None, **kwargs):
+                  self.seen.append(statement)
+                  if params is None:
+                      return self._conn.execute(statement, **kwargs)
+                  return self._conn.execute(statement, params, **kwargs)
+
+              def __getattr__(self, name):
+                  return getattr(self._conn, name)
+
+              def count(self, needle):
+                  return sum(1 for s in self.seen if s is needle)
+
+
+          def seed(conn, run_id, notes_for, count=10):
+              tasks = []
+              for index in range(count):
+                  mutation = domain.create_task(
+                      ACTOR,
+                      CreateTaskArgs(title=f"Gate {index}", notes=notes_for(index)),
+                      conn=conn,
+                  )
+                  domain.write_events(run_id, ACTOR, mutation.events, conn=conn)
+                  tasks.append(mutation.tasks[0])
+              conn.commit()
+              return tasks
+
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+              run_id = runs.create(ACTOR, "d80 gate", "d80-gate-model").id
+              tasks = seed(conn, run_id, lambda i: "" if i == 0 else f"note {i}")
+
+              counting = Counter(conn)
+              result = domain.bulk_update_tasks(
+                  ACTOR,
+                  BulkUpdateTasksArgs(
+                      task_ids=[t.id for t in tasks], append_notes=FRAGMENT
+                  ),
+                  conn=counting,
+              )
+              domain.write_events(run_id, ACTOR, result.events, conn=counting)
+              conn.commit()
+
+              if counting.count(sql.BULK_APPEND_NOTES_GUARDED) != 1:
+                  sys.exit("FAIL ten appends did not use exactly one statement")
+              if counting.count(sql.UPDATE_TASK_GUARDED) != 0:
+                  sys.exit("FAIL a per-task UPDATE survived")
+              if counting.count(sql.INSERT_TASK_EVENT) != 10:
+                  sys.exit("FAIL audit events are not one per task")
+              if len(result.tasks) != 10:
+                  sys.exit(f"FAIL {len(result.tasks)} tasks returned, not 10")
+              for index, task in enumerate(result.tasks):
+                  separator = "" if index == 0 else chr(10)
+                  base = "" if index == 0 else f"note {index}"
+                  expected = base + separator + FRAGMENT
+                  if task.notes != expected:
+                      sys.exit(f"FAIL task {index} notes are {task.notes!r}")
+
+              # Atomic refusal: nine merges fit, the tenth overflows.
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+              run_id = runs.create(ACTOR, "d80 gate", "d80-gate-model").id
+              tasks = seed(
+                  conn,
+                  run_id,
+                  lambda i: "x" * (TASK_NOTES_MAX_CHARS - 3) if i == 7 else "small",
+              )
+              try:
+                  domain.bulk_update_tasks(
+                      ACTOR,
+                      BulkUpdateTasksArgs(
+                          task_ids=[t.id for t in tasks], append_notes=FRAGMENT
+                      ),
+                      conn=conn,
+                  )
+              except AppendNotesLimitError:
+                  conn.rollback()
+              else:
+                  sys.exit("FAIL an overflowing append was accepted")
+
+              rows = conn.execute("SELECT version, notes FROM tasks").fetchall()
+              if any(row["version"] != 1 for row in rows):
+                  sys.exit("FAIL a version moved during a refused append")
+              if any(FRAGMENT in row["notes"] for row in rows):
+                  sys.exit("FAIL a partial append committed")
+
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+
+          print("PASS 10 appends in 1 statement; an overflow commits nothing")
+          PYGATE
+
       - name: Prove one task UPDATE statement covers fifty targets
         working-directory: backend
         env:
@@ -6744,18 +6887,29 @@ jobs:
           if set(definitions) != {name.value for name in ToolName}:
               sys.exit("FAIL the model-facing tool set changed")
 
-          # D-78's boundary must survive a decision that touches bulk update.
-          if "append_notes" in BulkUpdateTasksArgs.model_fields:
-              sys.exit("FAIL bulk update grew an unauthorized append")
+          # D-80. Bulk append exists, on the bulk model only, as its own mode.
+          from app.models import MutableTaskFields
+
+          if "append_notes" not in BulkUpdateTasksArgs.model_fields:
+              sys.exit("FAIL bulk update lost the D-80 append")
+          if "append_notes" in MutableTaskFields.model_fields:
+              sys.exit("FAIL append_notes leaked onto the shared base")
           schema = bulk.parameters_json_schema["properties"]
-          if "append_notes" in schema:
-              sys.exit("FAIL the bulk schema exposes append_notes")
+          if "append_notes" not in schema:
+              sys.exit("FAIL the model cannot see bulk append")
           if schema["task_ids"].get("minItems") != 1:
               sys.exit("FAIL the bulk target list lost its lower bound")
           if schema["task_ids"].get("maxItems") != 50:
               sys.exit("FAIL the bulk target list lost its upper bound")
 
-          print("PASS one barrier, same tool set, bulk still cannot append")
+          # The append-only rule is a cross-field validator, so the schema
+          # cannot carry it and the description must.
+          description = (bulk.description or "").lower()
+          for phrase in ("append_notes", "one call", "cannot be combined"):
+              if phrase not in description:
+                  sys.exit(f"FAIL the bulk description no longer says {phrase!r}")
+
+          print("PASS one barrier, same tool set, bulk append is its own mode")
           PYGATE
 
       - name: Run cumulative non-network backend suite

@@ -3428,3 +3428,78 @@ frontend symptom would need its own adapter-level test.
 
 Unreviewed. The neutral blind review is owed at the final SHA and covers this
 alongside the rest of D-79.
+
+## D-80: atomic bulk note append
+
+**Local role:** `bulk_update_tasks` gains an append mode. When `append_notes` is
+present, `domain._bulk_append_notes` merges the fragment into every locked
+target's notes, validates every merged result, and applies them with one
+`BULK_APPEND_NOTES_GUARDED` statement. `_bulk_append_relation` builds and checks
+the id/version/notes relation. `BulkUpdateTasksArgs` carries the field and an
+append-only validator; two narrow error subtypes carry the two refusals that
+needed different model-facing advice.
+
+**Whole-system role:** This closes the gap that produced the failure it was
+written for: a user asked for one change across ten tasks, the tool surface
+could only express it as ten changes, and a conflict on the sixth left five
+committed. Trellis's claim is that deterministic code owns state and that a
+mutation is one authoritative transaction; ten separate mutations for one
+request is that claim not holding. It also removes the last reason for the model
+to reconstruct notes itself, which is the ownership inversion D-78 existed to
+prevent.
+
+**Inputs and dependencies:** D-78's `merge_appended_notes` and its
+locked-state merge rule, reused rather than reimplemented. D-79's canonical
+lock, coverage check, relation discipline, and `sequential=True`. D-12/D-17
+approval and blast-radius counting. Section 6's fourteen-code table, which the
+two subtypes deliberately do not extend. Pinned `pydantic-ai==2.27.0`, whose
+sync-tool timeout behaviour was probed rather than assumed.
+
+**Outputs and consumers:** `sql.BULK_APPEND_NOTES_GUARDED`,
+`domain._bulk_append_notes`, `domain._bulk_append_relation`,
+`errors.AppendNotesLimitError`, `errors.BulkTargetCoverageError`. The tool
+result shape, event shape, and the fourteen error codes are unchanged, so undo
+and the audit reads see what they saw before.
+
+**Verification:** `ruff` clean; `pytest -m "not network"` 568 passed, 13
+deselected, of which 61 are the D-80 suite. All three inline CI gate scripts
+were extracted from the workflow and executed locally rather than only parsed.
+
+The production scenario is exercised directly: ten tasks with differing notes,
+one `BULK_APPEND_NOTES_GUARDED` statement, ten audit events, D-78's separator
+rule honoured per row. The atomic refusal is exercised with nine merges that fit
+and a tenth that overflows: the mutating statement never runs, no version moves,
+and no fragment appears anywhere.
+
+Mutation audit 20 of 20 killed under the strict definition used throughout this
+PR: mutation observed as applied by a changed digest, intended tests collected
+and run, attributable failure, byte-identical restore. The first run killed 17;
+all three survivors were test gaps rather than code gaps, being the two
+defence-in-depth guards no tool-path test can reach and a prompt assertion that
+matched an example rather than the rule. All three now have tests that reach the
+code under test.
+
+Timeout probe, pinned `pydantic-ai==2.27.0`, recorded because it decided whether
+to build a second idempotency mechanism:
+
+  ```text
+  sync tool,  2.5 s body, 1.0 s tool_timeout -> no timeout surfaced, body
+                                                completed, run continued
+  async tool, 2.5 s body, 1.0 s tool_timeout -> timeout at 1.05 s, body
+                                                cancelled before completing
+  ```
+
+Every Trellis tool is synchronous, so the timeout-retry that could double-apply
+an append is never issued and no fence was added. A regression holds this, so an
+upgrade that changes it fails loudly rather than silently reopening the hazard.
+
+**Limitations and review status:** Append is append-only by decision; appending
+and changing another field is two calls. The three guards on this path that an
+earlier check makes unreachable are tested directly for that reason. The D-79
+lock-order limitation is unchanged and still applies here, since the same lock
+statement is reused. No real-model smoke test has been run for this path yet:
+the routing test drives a deterministic `FunctionModel`, so it proves the
+sequence Trellis executes, not that a live provider chooses it.
+
+Unreviewed. The neutral blind review is owed at the final SHA and must run its
+execution phase in a Vercel Sandbox, per the repository's review contract.

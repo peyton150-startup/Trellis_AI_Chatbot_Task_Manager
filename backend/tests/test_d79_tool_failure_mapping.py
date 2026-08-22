@@ -565,6 +565,8 @@ def test_the_translation_preserves_the_original_cause(db):
 
     caught = {ast.unparse(handler.type) for handler in handlers}
     assert caught == {
+        "AppendNotesLimitError",
+        "BulkTargetCoverageError",
         "VersionConflictError",
         "ExternalDivergenceError",
         "OutOfScopeError",

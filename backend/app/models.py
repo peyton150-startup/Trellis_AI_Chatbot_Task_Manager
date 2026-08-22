@@ -490,6 +490,46 @@ class BulkUpdateTasksArgs(MutableTaskFields):
     # malformed call and now says so.
     task_ids: list[UUID] = Field(min_length=1, max_length=BULK_TASK_IDS_MAX)
 
+    # D-80. Append arrives here and still deliberately not on
+    # `MutableTaskFields`. D-78 kept it off that shared base so bulk could not
+    # inherit an unspecified append, and that reasoning has not been reversed:
+    # the base is still shared, and a field added there would still expose
+    # append semantics to every consumer of it. What changed is that bulk append
+    # now has a specification of its own, so it is declared on this model, for
+    # this tool, and nowhere else.
+    append_notes: AppendedTaskNotes | None = None
+
+    @model_validator(mode="after")
+    def _append_is_its_own_mode(self) -> "BulkUpdateTasksArgs":
+        """Bulk append is append-only: no other field may travel with it.
+
+        A mixed call has no single obvious meaning, and inventing one would mean
+        inventing a precedence rule nobody can read off the schema. Replace then
+        append, or append then replace, give different results, and both are
+        defensible, which is exactly why neither should be guessed.
+
+        There are concrete reasons beyond ambiguity. Append is not idempotent
+        while scalar replacement is convergent, so mixing them puts two
+        different retry stories in one call. Append needs a per-row effective
+        value computed from locked state, while replacement needs one shared
+        value, so they run through different SQL. And the approval preview has
+        to describe one intent, not two.
+
+        A later decision can authorize mixed semantics if a real request needs
+        it. Nothing here forecloses that.
+        """
+        if self.append_notes is None:
+            return self
+
+        others = sorted(self.model_fields_set - {"task_ids", "append_notes"})
+        if others:
+            raise ValueError(
+                "append_notes adds text to every named task and cannot be "
+                f"combined with {', '.join(others)}; send the append by itself, "
+                "or send a separate bulk_update_tasks call for the other fields"
+            )
+        return self
+
     @model_validator(mode="after")
     def _requires_a_structurally_effective_operation(self) -> "BulkUpdateTasksArgs":
         """Refuse a call carrying no operation that can reach the SET list.
@@ -522,7 +562,8 @@ class BulkUpdateTasksArgs(MutableTaskFields):
         Pydantic AI's retry channel rather than reaching the tool body.
         """
         effective = (
-            self.title is not None
+            self.append_notes is not None
+            or self.title is not None
             or self.notes is not None
             or self.priority is not None
             or self.status is not None
