@@ -3476,9 +3476,16 @@ tests were added to close the mutation survivors. Those figures are retained as
 historical evidence for that frozen state and are deliberately not restated as
 current: later commits added tests, so at `0d60e51` the focused D-80 suite
 produces 62 passed and the cumulative non-network suite produces 604 passed, 13
-deselected. Every verification paragraph in this file reports the counts
-measured at its own decision's SHA, not at whatever HEAD happens to be. The
-stable decision gate is `D80 atomic bulk append`. All three inline CI gate
+deselected. For D-79 through D-81, each verification paragraph
+reports the counts measured at that decision's implementation SHA, not at
+whatever HEAD happens to be; later measurements are dated separately. The rule
+behind that, which is not a claim about how every older section of this file
+happens to be written: observed verification evidence belongs to the SHA where
+it was produced, and a later commit may record a newer measurement beside it but
+must not silently reinterpret the old one as evidence about HEAD. That applies
+to benchmark timings, mutation counts, provider evaluations, frontend test
+counts, and CI run populations, not only to pytest totals. The stable decision
+gate is `D80 atomic bulk append`. All three inline CI gate
 scripts were extracted from the workflow and executed locally rather than only
 parsed.
 
