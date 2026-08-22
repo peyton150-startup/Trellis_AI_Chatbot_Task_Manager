@@ -6934,3 +6934,77 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  # D-80 owns atomic bulk note append. Its proofs previously lived only as named
+  # steps inside the D79 job, which runs them but cannot be referenced by
+  # branch protection under a name matching the governing decision. The rule in
+  # CLAUDE.md is a stable `D## <short verification name>` check per decision, so
+  # D-80 gets its own. The statement-count and overflow proof stays in the D79
+  # job as well; duplicating the suite here is cheaper than refactoring a gate
+  # whose evidence is already reviewed.
+  d80-atomic-bulk-append:
+    name: D80 atomic bulk append
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # The suite asserts READ COMMITTED itself, in
+      # test_the_isolation_these_expectations_assume, so a runner whose default
+      # differed fails honestly here rather than asserting the wrong behaviour.
+      - name: Prove bulk note append is atomic
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check tests/test_d80_bulk_append.py
+          pytest tests/test_d80_bulk_append.py -v
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  # D-81 bounds Nemotron reasoning to the current turn and owns the provider
+  # limits. Before this job its 32 tests ran only as an anonymous slice of the
+  # cumulative non-network suite: nothing named D-81 existed in this workflow,
+  # so no branch-protection-eligible check proved its claims. The suite is
+  # self-contained by construction, using an in-process HTTPX MockTransport,
+  # TestModel, settings validation and source inspection, so it needs neither
+  # PostgreSQL nor the frontend.
+  d81-turn-bounded-reasoning:
+    name: D81 turn bounded reasoning
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Prove turn-bounded reasoning and the provider limits Trellis owns
+        working-directory: backend
+        run: |
+          python -m ruff check app/agent.py app/config.py tests/test_d81_turn_bounded_reasoning.py
+          pytest tests/test_d81_turn_bounded_reasoning.py -v

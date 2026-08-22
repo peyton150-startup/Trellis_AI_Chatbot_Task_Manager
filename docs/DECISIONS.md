@@ -4492,6 +4492,13 @@ error code, dependency, or tool. It adds one SQL constant, one model field, two
 error subtypes, and CI assertions replacing the D-79 gate that asserted bulk
 could not append.
 
+**Stable CI check.** `D80 atomic bulk append`. The D-80 proofs previously ran
+only as named steps inside the `D79 set based bulk update` job, which executes
+them but cannot be referenced by branch protection under a name matching this
+decision. The dedicated job runs the same suite; the statement-count and
+overflow proof stays in the D79 job as well. Recorded here per the per-task CI
+gate protocol, and the name is stable once branch protection references it.
+
 ### D-81: turn-bounded Nemotron reasoning, and provider limits Trellis owns
 
 Two things were left to the provider that should not have been.
@@ -4604,3 +4611,11 @@ locking is touched, because those govern stages after a tool has already begun.
 This decision authorizes no migration, table, column, endpoint, status value,
 error code, dependency, or tool. It adds two typed settings, one model profile,
 one history projection, and one prompt section.
+
+**Stable CI check.** `D81 turn bounded reasoning`. Until it was added, nothing in
+the workflow named D-81 and its suite ran only as an anonymous slice of the
+cumulative non-network run, so no branch-protection-eligible check proved this
+decision's claims. The neutral blind review at `c846a14` raised exactly that as
+a MINOR finding. The suite needs neither PostgreSQL nor the frontend, so the job
+is a small independent one. The name is stable once branch protection references
+it.

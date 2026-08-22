@@ -3198,9 +3198,8 @@ assert that its target was found; the script does.
   A refactor making `ALL_TOOLS` narrower than `ToolName` now fails CI rather
   than leaving the header advertising capabilities the browser agent no longer
   has. Mutation M15 is exactly that refactor and is caught.
-- Review history, and why the current SHA is unreviewed. Three neutral blind
-  reviews have run against this branch, each against an immutable SHA, and each
-  found exactly one real defect:
+- Review history. Four neutral blind reviews have run against this branch, each
+  against an immutable SHA:
 
   ```text
   89e3dad   MAJOR  rule 9 still told the model to join notes itself,
@@ -3210,11 +3209,17 @@ assert that its target was found; the script does.
                    than replaces
   a80c9cb   MINOR  a stale expected_version plus an overflowing append
                    refused as VALIDATION_ERROR rather than VERSION_CONFLICT
+  c846a14   PASS WITH MINORS. No BLOCKER, no MAJOR, under a blind read plus
+            sandboxed execution. 2 MINOR: D-81 had no dedicated CI gate, and
+            this file's D-81 verification counts were stale again
   ```
 
   Each fix created a new SHA and voided the review that preceded it, which is
-  the intended loop rather than a sign of churn. The current candidate is
-  unreviewed and a fresh review is owed against it.
+  the intended loop rather than a sign of churn.
+
+  Stale counts in this file have now been found by two separate reviews. That is
+  a recurring failure mode of durable evidence written before the last commit
+  lands, not a one-off, and it argues for recounting rather than recopying.
 
   Worth recording for whoever reviews next: every defect found so far has been
   in the model-facing text or in this file, never in the mechanism. The merge,
@@ -3366,7 +3371,9 @@ below produced concrete evidence for it. The bulk cross-field contract stayed in
 the tool description, where a rule the generated JSON schema cannot express
 belongs.
 
-This work is unreviewed. A neutral blind review is owed at the final SHA.
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
 
 ## D-79 hardening: expected refusals stay inside the Pydantic tool protocol
 
@@ -3426,8 +3433,9 @@ have root-caused that console error, and no AG-UI event-lifecycle regression was
 added: the existing transport tests were left as they are, and proving the
 frontend symptom would need its own adapter-level test.
 
-Unreviewed. The neutral blind review is owed at the final SHA and covers this
-alongside the rest of D-79.
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
 
 ## D-80: atomic bulk note append
 
@@ -3514,8 +3522,10 @@ statement is reused. No real-model smoke test has been run for this path yet:
 the routing test drives a deterministic `FunctionModel`, so it proves the
 sequence Trellis executes, not that a live provider chooses it.
 
-Unreviewed. The neutral blind review is owed at the final SHA and must run its
-execution phase in a Vercel Sandbox, per the repository's review contract.
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
+The dedicated gate is `D80 atomic bulk append`.
 
 ## D-81: turn-bounded Nemotron reasoning
 
@@ -3546,8 +3556,9 @@ asserted rather than assumed. NVIDIA's hosted Chat Completions contract for
 `settings.model_max_tokens`. No change to durable history, the tool surface, the
 approval bridge, idempotency, or any database behaviour.
 
-**Verification:** `ruff` clean; `pytest -m "not network"` 603 passed, 13
-deselected, of which 31 are the D-81 suite. The wire tests serialize a real
+**Verification:** `ruff` clean; `pytest -m "not network"` 604 passed, 13
+deselected, of which 32 are the D-81 suite. The dedicated gate is
+`D81 turn bounded reasoning`. The wire tests serialize a real
 request through the pinned client against an in-process mock transport and
 assert the body:
 
@@ -3614,6 +3625,6 @@ continuation path does not call it; that is a structural assertion, and a
 behavioural equivalent would need a full approval round trip through the
 transport.
 
-Unreviewed. The neutral blind review is owed at the final SHA, and its execution
-phase must run in a fresh Vercel Sandbox pinned to that SHA, per the repository's
-review contract.
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
