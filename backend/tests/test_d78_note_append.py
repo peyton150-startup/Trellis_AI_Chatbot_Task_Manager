@@ -35,6 +35,7 @@ from app.limits import TASK_NOTES_MAX_CHARS
 from app.models import (
     BulkUpdateTasksArgs,
     CreateTaskArgs,
+    MutableTaskFields,
     UpdateTaskArgs,
 )
 
@@ -113,19 +114,26 @@ def _append_through_the_tool(run_id, task, fragment, *, tool_call_id):
 # ------------------------------------------------ what the schema refuses
 
 
-def test_append_is_absent_from_the_bulk_schema():
-    """Bulk append is not authorized, and inheritance is how it would leak.
+def test_append_never_leaks_through_the_shared_base():
+    """The inheritance boundary D-78 drew, which survives D-80 unchanged.
 
-    `UpdateTaskArgs` and `BulkUpdateTasksArgs` share `MutableTaskFields`. A
-    field added to that base would appear on both, and the model would be shown
-    a bulk append this decision never specified: no per-row merge, no per-row
+    D-78 kept `append_notes` off `MutableTaskFields` so that bulk could not
+    inherit an append nobody had specified: no per-row merge, no per-row
     final-size check, no set-based semantics.
+
+    D-80 specified all three and declared the field on `BulkUpdateTasksArgs`
+    itself. That reverses the conclusion, not the reasoning. The base is still
+    shared, so a field added *there* would still hand append semantics to
+    anything else built on it, and this asserts the base is still clean rather
+    than asserting bulk cannot append, which is now false.
     """
     assert "append_notes" in UpdateTaskArgs.model_fields
-    assert "append_notes" not in BulkUpdateTasksArgs.model_fields
+    assert "append_notes" in BulkUpdateTasksArgs.model_fields
+    assert "append_notes" not in MutableTaskFields.model_fields
 
+    # And bulk append remains its own mode rather than a free-floating field.
     with pytest.raises(ValidationError):
-        BulkUpdateTasksArgs(task_ids=[uuid4()], append_notes="nope")
+        BulkUpdateTasksArgs(task_ids=[uuid4()], append_notes="x", priority="high")
 
 
 def test_notes_and_append_notes_together_are_refused():
@@ -347,9 +355,15 @@ def test_the_model_facing_schema_carries_the_append_contract():
     assert "replaces the whole note value" in description
     assert "ONLY the new text" in description
 
-    # The bulk tool must not have inherited an append.
+    # D-80 gave the bulk tool an append of its own, specified rather than
+    # inherited. What must remain true is that the model is told it is a
+    # separate mode, because the schema alone cannot express the append-only
+    # rule: that is a cross-field validator running after parsing.
     bulk = definitions["bulk_update_tasks"]
-    assert "append_notes" not in bulk.parameters_json_schema["properties"]
+    assert "append_notes" in bulk.parameters_json_schema["properties"]
+    bulk_description = bulk.description or ""
+    assert "append_notes" in bulk_description
+    assert "cannot be combined" in bulk_description
 
     # And the fragment keeps its bounds on the way to the model, so an empty
     # append is refused by the schema rather than by a later check.

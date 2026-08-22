@@ -6370,9 +6370,22 @@ jobs:
               sys.exit("FAIL update_task lost append_notes")
           if "append_notes" in MutableTaskFields.model_fields:
               sys.exit("FAIL append_notes is on the shared base and leaks to bulk")
-          if "append_notes" in BulkUpdateTasksArgs.model_fields:
-              sys.exit("FAIL bulk update exposes an unauthorized append")
-          print("PASS append is single-task only")
+          # D-80 gave bulk an append of its own, declared on its own model. The
+          # boundary that survives is the shared base staying clean, checked
+          # above, plus append remaining a mode rather than a loose field.
+          if "append_notes" not in BulkUpdateTasksArgs.model_fields:
+              sys.exit("FAIL bulk update lost the D-80 append")
+          try:
+              BulkUpdateTasksArgs(
+                  task_ids=["00000000-0000-0000-0000-000000000001"],
+                  append_notes="x",
+                  priority="high",
+              )
+          except Exception:
+              pass
+          else:
+              sys.exit("FAIL bulk append can be combined with another field")
+          print("PASS append never travels through the shared base")
           PY
 
           cd ..
@@ -6562,3 +6575,436 @@ jobs:
       - name: Remove CI database resources
         if: always()
         run: docker compose down -v
+
+  d79-set-based-bulk-update:
+    name: D79 set based bulk update
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22.23.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # The concurrency expectations in the D-79 suite are only true at READ
+      # COMMITTED. The pool sets no isolation level, so the server default
+      # decides, and a runner whose default differed would make those tests
+      # assert the wrong behaviour rather than fail honestly.
+      - name: Record the database isolation these expectations assume
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose exec -T postgres \
+            psql -U trellis -d trellis -Atc "SHOW default_transaction_isolation;" \
+            | tee /tmp/isolation.txt
+          grep -qx "read committed" /tmp/isolation.txt
+
+      # The statement-shape change, the two new schema contracts, the array
+      # relation, the audit rows, and the D-78 interaction under real
+      # concurrency.
+      - name: Prove the set-based bulk update
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check app/domain.py app/sql.py app/models.py app/agent.py app/prompts.py tests/test_d79_bulk_update.py tests/test_d79_tool_failure_mapping.py
+          pytest tests/test_d79_bulk_update.py -v
+
+      # The refusals a model can actually provoke must stay inside Pydantic's
+      # tool protocol. An ordinary exception here aborts the whole run.
+      - name: Prove expected refusals do not abort the agent run
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest tests/test_d79_tool_failure_mapping.py -v
+
+      # D-80. The contract is all-or-nothing: the partial edit that started this
+      # is the thing that must not be reachable.
+      - name: Prove bulk note append is atomic
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check tests/test_d80_bulk_append.py
+          pytest tests/test_d80_bulk_append.py -v
+
+      - name: Prove ten appends are one statement and an overflow commits nothing
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYGATE'
+          import sys
+          from uuid import UUID
+
+          sys.path.insert(0, ".")
+          from app import domain, runs, sql
+          from app.db import pool
+          from app.errors import AppendNotesLimitError
+          from app.limits import TASK_NOTES_MAX_CHARS
+          from app.models import BulkUpdateTasksArgs, CreateTaskArgs
+
+          ACTOR = UUID("00000000-0000-0000-0000-000000000001")
+          FRAGMENT = "pull the turnips"
+
+
+          class Counter:
+              def __init__(self, conn):
+                  self._conn = conn
+                  self.seen = []
+
+              def execute(self, statement, params=None, **kwargs):
+                  self.seen.append(statement)
+                  if params is None:
+                      return self._conn.execute(statement, **kwargs)
+                  return self._conn.execute(statement, params, **kwargs)
+
+              def __getattr__(self, name):
+                  return getattr(self._conn, name)
+
+              def count(self, needle):
+                  return sum(1 for s in self.seen if s is needle)
+
+
+          def seed(conn, run_id, notes_for, count=10):
+              tasks = []
+              for index in range(count):
+                  mutation = domain.create_task(
+                      ACTOR,
+                      CreateTaskArgs(title=f"Gate {index}", notes=notes_for(index)),
+                      conn=conn,
+                  )
+                  domain.write_events(run_id, ACTOR, mutation.events, conn=conn)
+                  tasks.append(mutation.tasks[0])
+              conn.commit()
+              return tasks
+
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+              run_id = runs.create(ACTOR, "d80 gate", "d80-gate-model").id
+              tasks = seed(conn, run_id, lambda i: "" if i == 0 else f"note {i}")
+
+              counting = Counter(conn)
+              result = domain.bulk_update_tasks(
+                  ACTOR,
+                  BulkUpdateTasksArgs(
+                      task_ids=[t.id for t in tasks], append_notes=FRAGMENT
+                  ),
+                  conn=counting,
+              )
+              domain.write_events(run_id, ACTOR, result.events, conn=counting)
+              conn.commit()
+
+              if counting.count(sql.BULK_APPEND_NOTES_GUARDED) != 1:
+                  sys.exit("FAIL ten appends did not use exactly one statement")
+              if counting.count(sql.UPDATE_TASK_GUARDED) != 0:
+                  sys.exit("FAIL a per-task UPDATE survived")
+              if counting.count(sql.INSERT_TASK_EVENT) != 10:
+                  sys.exit("FAIL audit events are not one per task")
+              if len(result.tasks) != 10:
+                  sys.exit(f"FAIL {len(result.tasks)} tasks returned, not 10")
+              for index, task in enumerate(result.tasks):
+                  separator = "" if index == 0 else chr(10)
+                  base = "" if index == 0 else f"note {index}"
+                  expected = base + separator + FRAGMENT
+                  if task.notes != expected:
+                      sys.exit(f"FAIL task {index} notes are {task.notes!r}")
+
+              # Atomic refusal: nine merges fit, the tenth overflows.
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+              run_id = runs.create(ACTOR, "d80 gate", "d80-gate-model").id
+              tasks = seed(
+                  conn,
+                  run_id,
+                  lambda i: "x" * (TASK_NOTES_MAX_CHARS - 3) if i == 7 else "small",
+              )
+              try:
+                  domain.bulk_update_tasks(
+                      ACTOR,
+                      BulkUpdateTasksArgs(
+                          task_ids=[t.id for t in tasks], append_notes=FRAGMENT
+                      ),
+                      conn=conn,
+                  )
+              except AppendNotesLimitError:
+                  conn.rollback()
+              else:
+                  sys.exit("FAIL an overflowing append was accepted")
+
+              rows = conn.execute("SELECT version, notes FROM tasks").fetchall()
+              if any(row["version"] != 1 for row in rows):
+                  sys.exit("FAIL a version moved during a refused append")
+              if any(FRAGMENT in row["notes"] for row in rows):
+                  sys.exit("FAIL a partial append committed")
+
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+
+          print("PASS 10 appends in 1 statement; an overflow commits nothing")
+          PYGATE
+
+      - name: Prove one task UPDATE statement covers fifty targets
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYGATE'
+          import sys
+          from uuid import UUID
+
+          sys.path.insert(0, ".")
+          from app import domain, runs, sql
+          from app.db import pool
+          from app.models import BulkUpdateTasksArgs, CreateTaskArgs
+
+          ACTOR = UUID("00000000-0000-0000-0000-000000000001")
+
+
+          class Counter:
+              def __init__(self, conn):
+                  self._conn = conn
+                  self.seen = []
+
+              def execute(self, statement, params=None, **kwargs):
+                  self.seen.append(statement)
+                  if params is None:
+                      return self._conn.execute(statement, **kwargs)
+                  return self._conn.execute(statement, params, **kwargs)
+
+              def __getattr__(self, name):
+                  return getattr(self._conn, name)
+
+              def count(self, needle):
+                  return sum(1 for s in self.seen if s is needle)
+
+
+          with pool.connection() as conn:
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+              run_id = runs.create(ACTOR, "d79 gate", "d79-gate-model").id
+              ids = []
+              for index in range(50):
+                  mutation = domain.create_task(
+                      ACTOR, CreateTaskArgs(title=f"Gate {index:03d}"), conn=conn
+                  )
+                  domain.write_events(run_id, ACTOR, mutation.events, conn=conn)
+                  ids.append(mutation.tasks[0].id)
+              conn.commit()
+
+              counting = Counter(conn)
+              result = domain.bulk_update_tasks(
+                  ACTOR,
+                  BulkUpdateTasksArgs(task_ids=ids, priority="high"),
+                  conn=counting,
+              )
+              domain.write_events(run_id, ACTOR, result.events, conn=counting)
+              conn.commit()
+
+              per_task = counting.count(sql.UPDATE_TASK_GUARDED)
+              set_based = counting.count(sql.BULK_UPDATE_TASKS_GUARDED)
+              events = counting.count(sql.INSERT_TASK_EVENT)
+
+              if per_task != 0:
+                  sys.exit(f"FAIL {per_task} per-task UPDATE statements survived")
+              if set_based != 1:
+                  sys.exit(f"FAIL {set_based} set-based UPDATE statements, not 1")
+              if events != 50:
+                  sys.exit(f"FAIL {events} audit inserts, not 50")
+              if len(result.tasks) != 50:
+                  sys.exit(f"FAIL {len(result.tasks)} tasks returned, not 50")
+
+              conn.execute(sql.TRUNCATE_ALL_TEST_STATE)
+              conn.commit()
+
+          print("PASS 50 targets, 1 task UPDATE, 50 audit inserts")
+          PYGATE
+
+      - name: Prove the bulk tool is a barrier and no tool was added
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYGATE'
+          import sys
+          from uuid import uuid4
+
+          sys.path.insert(0, ".")
+          from pydantic_ai.models.test import TestModel
+
+          from app import agent as agent_module
+          from app.models import BulkUpdateTasksArgs, ToolName
+
+          model = TestModel(call_tools=[])
+          built = agent_module.build_agent(model)
+          built.run_sync(
+              "hello",
+              deps=agent_module.TrellisDeps(actor_id=uuid4(), run_id=uuid4()),
+          )
+          definitions = {
+              tool.name: tool
+              for tool in model.last_model_request_parameters.function_tools
+          }
+
+          bulk = definitions.get(ToolName.BULK_UPDATE_TASKS.value)
+          if bulk is None:
+              sys.exit("FAIL bulk_update_tasks is not registered")
+          if bulk.sequential is not True:
+              sys.exit("FAIL bulk_update_tasks is not a sequential barrier")
+
+          barriers = {n for n, t in definitions.items() if t.sequential}
+          if barriers != {ToolName.BULK_UPDATE_TASKS.value}:
+              sys.exit(f"FAIL unexpected sequential tools: {sorted(barriers)}")
+
+          if set(definitions) != {name.value for name in ToolName}:
+              sys.exit("FAIL the model-facing tool set changed")
+
+          # D-80. Bulk append exists, on the bulk model only, as its own mode.
+          from app.models import MutableTaskFields
+
+          if "append_notes" not in BulkUpdateTasksArgs.model_fields:
+              sys.exit("FAIL bulk update lost the D-80 append")
+          if "append_notes" in MutableTaskFields.model_fields:
+              sys.exit("FAIL append_notes leaked onto the shared base")
+          schema = bulk.parameters_json_schema["properties"]
+          if "append_notes" not in schema:
+              sys.exit("FAIL the model cannot see bulk append")
+          if schema["task_ids"].get("minItems") != 1:
+              sys.exit("FAIL the bulk target list lost its lower bound")
+          if schema["task_ids"].get("maxItems") != 50:
+              sys.exit("FAIL the bulk target list lost its upper bound")
+
+          # The append-only rule is a cross-field validator, so the schema
+          # cannot carry it and the description must.
+          description = (bulk.description or "").lower()
+          for phrase in ("append_notes", "one call", "cannot be combined"):
+              if phrase not in description:
+                  sys.exit(f"FAIL the bulk description no longer says {phrase!r}")
+
+          print("PASS one barrier, same tool set, bulk append is its own mode")
+          PYGATE
+
+      - name: Run cumulative non-network backend suite
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: pytest -m "not network"
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run frontend test suites
+        working-directory: frontend
+        run: |
+          npm run test:ingress
+          npm run test:notes
+          npm run test:transport
+          npm run test:continuity
+          npm run test:tools
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  # D-80 owns atomic bulk note append. Its proofs previously lived only as named
+  # steps inside the D79 job, which runs them but cannot be referenced by
+  # branch protection under a name matching the governing decision. The rule in
+  # CLAUDE.md is a stable `D## <short verification name>` check per decision, so
+  # D-80 gets its own. The statement-count and overflow proof stays in the D79
+  # job as well; duplicating the suite here is cheaper than refactoring a gate
+  # whose evidence is already reviewed.
+  d80-atomic-bulk-append:
+    name: D80 atomic bulk append
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Start PostgreSQL and apply migration
+        run: docker compose up -d --wait
+
+      # The suite asserts READ COMMITTED itself, in
+      # test_the_isolation_these_expectations_assume, so a runner whose default
+      # differed fails honestly here rather than asserting the wrong behaviour.
+      - name: Prove bulk note append is atomic
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://trellis:trellis@localhost:55432/trellis
+        run: |
+          python -m ruff check tests/test_d80_bulk_append.py
+          pytest tests/test_d80_bulk_append.py -v
+
+      - name: Remove CI database resources
+        if: always()
+        run: docker compose down -v
+
+  # D-81 bounds Nemotron reasoning to the current turn and owns the provider
+  # limits. Before this job its 32 tests ran only as an anonymous slice of the
+  # cumulative non-network suite: nothing named D-81 existed in this workflow,
+  # so no branch-protection-eligible check proved its claims. The suite is
+  # self-contained by construction, using an in-process HTTPX MockTransport,
+  # TestModel, settings validation and source inspection, so it needs neither
+  # PostgreSQL nor the frontend.
+  d81-turn-bounded-reasoning:
+    name: D81 turn bounded reasoning
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned backend dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Prove turn-bounded reasoning and the provider limits Trellis owns
+        working-directory: backend
+        run: |
+          python -m ruff check app/agent.py app/config.py tests/test_d81_turn_bounded_reasoning.py
+          pytest tests/test_d81_turn_bounded_reasoning.py -v
