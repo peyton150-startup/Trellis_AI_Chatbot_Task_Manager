@@ -72,7 +72,7 @@ constructs a message list from a request.
 
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from uuid import UUID, uuid4
 
@@ -101,14 +101,17 @@ from pydantic_ai import (
 )
 from pydantic_core import to_jsonable_python
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     TextPart,
+    ThinkingPart,
     UserPromptPart,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.ui.ag_ui import AGUIAdapter, AGUIEventStream
 from starlette.concurrency import run_in_threadpool
@@ -343,6 +346,38 @@ class TrellisDeps:
     effects: RunEffects = field(default_factory=RunEffects)
 
 
+def _model_settings() -> dict:
+    """What every model request carries, instead of provider defaults.
+
+    D-81. Trellis previously sent only a timeout, which left three of NVIDIA's
+    defaults in charge of behaviour it cares about: `reasoning_budget` at 16384,
+    `max_tokens` at 16384, and `temperature` at 1. The first two decide how long
+    the model may think before it can act, and the third makes routing vary run
+    to run for no benefit this application wants.
+
+    `temperature=0` is for low-variance tool routing, not for generation
+    quality. `top_p` is deliberately left alone: NVIDIA advises against tuning
+    both in one request, and one knob is enough to reason about.
+
+    `reasoning_budget` and `chat_template_kwargs` are NVIDIA-specific and travel
+    through `extra_body`, which is the supported passthrough. Thinking is
+    enabled explicitly rather than relied upon: this model reasons by default,
+    but a default is not a contract.
+
+    The budget is capped rather than switched off. The point is a bounded
+    reasoning step, not a model that stops thinking.
+    """
+    return {
+        "timeout": settings.model_timeout_seconds,
+        "temperature": 0.0,
+        "max_tokens": settings.model_max_tokens,
+        "extra_body": {
+            "reasoning_budget": settings.model_reasoning_budget,
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+    }
+
+
 def _runtime_model() -> Model:
     """Construct the configured model against NVIDIA hosted inference."""
     if not settings.nvidia_api_key:
@@ -357,7 +392,28 @@ def _runtime_model() -> Model:
         max_retries=_MODEL_REQUEST_MAX_RETRIES,
     )
     provider = OpenAIProvider(openai_client=client)
-    return OpenAIChatModel(settings.model_id, provider=provider)
+
+    # D-81. An explicit profile rather than generic OpenAI-compatible defaults.
+    #
+    # `openai_chat_thinking_field` names the field NVIDIA actually returns
+    # reasoning in, so the contract is stated rather than autodetected.
+    #
+    # `openai_chat_supports_max_completion_tokens=False` is the one that would
+    # otherwise bite silently: Pydantic AI serialises `ModelSettings.max_tokens`
+    # as `max_completion_tokens` unless the profile says the model does not
+    # support it, and NVIDIA's hosted Chat Completions documents `max_tokens`.
+    # Sent under the wrong name the cap is simply ignored, which looks exactly
+    # like a cap that was never set.
+    #
+    # `openai_chat_send_back_thinking_parts` is deliberately left at its default.
+    # It governs replaying reasoning inside one trajectory, which is the case
+    # NVIDIA wants preserved; the case it wants dropped is the previous user
+    # turn, and that is handled by `_project_prior_turn_history_for_model`.
+    profile = OpenAIModelProfile(
+        openai_chat_thinking_field="reasoning",
+        openai_chat_supports_max_completion_tokens=False,
+    )
+    return OpenAIChatModel(settings.model_id, provider=provider, profile=profile)
 
 
 def build_agent(
@@ -399,7 +455,7 @@ def build_agent(
         runtime_model,
         deps_type=TrellisDeps,
         instructions=prompts.SYSTEM_PROMPT,
-        model_settings={"timeout": settings.model_timeout_seconds},
+        model_settings=_model_settings(),
         retries={"tools": settings.max_tool_retries},
         tool_timeout=settings.tool_timeout_seconds,
         max_concurrency=1,
@@ -672,6 +728,12 @@ async def handle_agui_request(request: Request) -> Response:
     message_history = ModelMessagesTypeAdapter.validate_python(
         created.message_history
     )
+
+    # D-81. A new ordinary user turn, so the predecessor's reasoning is dropped
+    # from what the provider sees. The stored snapshot above keeps it; only this
+    # projection differs. `_handle_continuation` deliberately does not do this,
+    # because a continuation is still the same user turn.
+    message_history = _project_prior_turn_history_for_model(message_history)
 
     deps = TrellisDeps(actor_id=settings.actor_id, run_id=created.id)
     native = adapter.run_stream_native(
@@ -1370,6 +1432,56 @@ def _open_approval(run_id: UUID, requests: DeferredToolRequests) -> None:
         required_reason=requirement.reason.value,
         preview=preview.model_dump(mode="json"),
     )
+
+
+def _project_prior_turn_history_for_model(
+    history: list[ModelMessage],
+) -> list[ModelMessage]:
+    """Drop inherited reasoning before a new user turn reaches the provider.
+
+    D-81. Nemotron separates two cases, and Trellis was collapsing them. Inside
+    one user turn, reasoning followed by a tool call, a tool result, and more
+    reasoning is a single trajectory, and the earlier reasoning is context the
+    model should still see. Across user turns it is not: NVIDIA's guidance is
+    that a new turn should not be handed the previous turn's `reasoning`.
+
+    D-67 makes a successor run inherit its predecessor's canonical history
+    wholesale, which is right for the durable record and wrong as model input,
+    because it carries obsolete `ThinkingPart`s across exactly that boundary.
+
+    So this projects the model's view and nothing else. The predecessor row is
+    untouched, `runs.create_turn` still owns what is stored, and the browser
+    still contributes no history. Only the value handed to `run_stream_native`
+    on a new ordinary turn differs.
+
+    It is deliberately not registered as an agent-wide history processor. Such a
+    processor runs before every model request, including the one after a tool
+    result, so it could not tell inherited reasoning from the reasoning this
+    turn just produced, and it would strip both. The distinction is the point,
+    so the filter is applied once, here, where "a new turn is starting" is known.
+
+    Structural, not textual: parts are matched by type, never by searching for
+    thinking markup. Messages are rebuilt rather than mutated, because the
+    inherited objects are shared with the durable snapshot.
+    """
+    projected: list[ModelMessage] = []
+
+    for message in history:
+        if not isinstance(message, ModelResponse):
+            projected.append(message)
+            continue
+
+        parts = [part for part in message.parts if not isinstance(part, ThinkingPart)]
+        if len(parts) == len(message.parts):
+            projected.append(message)
+            continue
+
+        # A response that was only reasoning has nothing left to say to the
+        # model. Dropping it is honest; inventing empty text would not be.
+        if parts:
+            projected.append(replace(message, parts=parts))
+
+    return projected
 
 
 @contextmanager

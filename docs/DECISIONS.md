@@ -4491,3 +4491,99 @@ This decision authorizes no migration, table, column, endpoint, status value,
 error code, dependency, or tool. It adds one SQL constant, one model field, two
 error subtypes, and CI assertions replacing the D-79 gate that asserted bulk
 could not append.
+
+### D-81: turn-bounded Nemotron reasoning, and provider limits Trellis owns
+
+Two things were left to the provider that should not have been.
+
+**The boundary.** Nemotron separates multi-step from multi-turn. Inside one user
+turn, reasoning followed by a tool call and its result is a single trajectory,
+and the earlier reasoning is context the model should still see. Across user
+turns it is not: a new turn should not be handed the previous turn's reasoning.
+
+D-67 makes a successor run inherit its predecessor's canonical history
+wholesale. That is right for the durable record and wrong as model input,
+because it carries obsolete `ThinkingPart`s across exactly that boundary. The
+deterministic control-history code already said "prior reasoning does not belong
+in a later turn's history", while the ordinary path copied it anyway.
+
+1. **One projection, at one seam.** `_project_prior_turn_history_for_model`
+   removes `ThinkingPart`s from inherited `ModelResponse`s and preserves
+   everything else. It is applied on the ordinary new-turn path only, after the
+   server-owned snapshot has been validated, so the browser still contributes no
+   history and `runs.create_turn` still owns what is stored. The predecessor row
+   is untouched: this changes what the provider is shown, not what was recorded.
+
+2. **The continuation path is deliberately not projected.** An approval
+   continuation is still the same user turn. The reasoning that chose the
+   approval-required action is context for interpreting its result, and stripping
+   it there would discard it at the worst possible moment.
+
+3. **No blanket history processor, and no global replay switch.** An agent-wide
+   processor runs before every model request, including the one after a tool
+   result, so it could not tell inherited reasoning from the reasoning this turn
+   just produced and would strip both. Setting
+   `openai_chat_send_back_thinking_parts=False` has the same defect in a simpler
+   disguise: it would satisfy the turn-boundary requirement and quietly break the
+   multi-step case NVIDIA trains separately. Both are refused, and a test pins
+   that same-turn reasoning still reaches the provider after a tool result.
+
+4. **Structural, not textual.** Parts are matched by type. A message that merely
+   mentions thinking markup is ordinary content and survives. Messages are
+   rebuilt rather than mutated, because the inherited objects are shared with the
+   durable snapshot, and a response left with no parts is dropped rather than
+   filled with invented text.
+
+**The limits.** Trellis sent only `{"timeout": ...}`, which left three NVIDIA
+defaults in charge of behaviour it cares about: `reasoning_budget` 16384,
+`max_tokens` 16384, and `temperature` 1.
+
+5. **Reasoning is bounded, not disabled.** `reasoning_budget` is 6000 per model
+   request, and `chat_template_kwargs.enable_thinking` is sent explicitly rather
+   than relied upon. 6000 is an application ceiling: lower values stay
+   configurable so the budget can be measured downwards later, higher ones are
+   refused at construction rather than clamped, because accepting 8000 and
+   sending 6000 would make the configuration and the wire disagree.
+
+6. **Reasoning cannot consume the whole allowance.** NVIDIA counts reasoning,
+   tool JSON, and visible text against one `max_tokens`. `max_tokens` is 12288,
+   and a cross-field invariant requires at least 4096 of headroom above the
+   reasoning budget, sized against the largest legitimate tool call this system
+   emits, which carries fifty task ids. Without it the failure is a model that
+   reasoned successfully and had no room left to answer.
+
+7. **The cap is sent under the name NVIDIA reads.** Pydantic AI serializes
+   `max_tokens` as `max_completion_tokens` unless the profile says otherwise, and
+   the hosted endpoint documents `max_tokens`. An explicit `OpenAIModelProfile`
+   sets `openai_chat_supports_max_completion_tokens=False` and names
+   `openai_chat_thinking_field="reasoning"`. Under the wrong name the cap is
+   ignored, which is indistinguishable from never setting one, so the wire body
+   is asserted rather than the configuration object.
+
+8. **`temperature=0.0`, and `top_p` untouched.** This is for low-variance tool
+   routing, not generation quality. NVIDIA advises against tuning both in one
+   request. No seed is added: whether one is needed is a question for the eval,
+   not an assumption.
+
+9. **One routing kernel, not a prompt rewrite.** A short "choose only the next
+   authoritative action" section near the top of the prompt. The instruction the
+   model needs first is which authoritative action to take now; planning a later
+   call's arguments before the lookup that supplies them is what produces guessed
+   ids and stale versions.
+
+**Explicitly deferred.** General history compaction. A production trace has shown
+roughly 29k input tokens, so context growth is real, but truncation or
+summarization interacts with task identity, approval continuity, and
+tool-call pairing. Prior-turn reasoning is the one category NVIDIA names, so it
+goes first and the rest waits for measurement.
+
+**Known limitations.** The latency effect is not claimed here. This decision
+replaces three uncontrolled provider defaults with explicit Trellis-owned limits
+and proves them on the wire; whether that changes time-to-first-tool is a paired
+before-and-after measurement against the live provider, reported separately.
+Nothing about downstream concurrency, thread pools, tool timeouts, or PostgreSQL
+locking is touched, because those govern stages after a tool has already begun.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It adds two typed settings, one model profile,
+one history projection, and one prompt section.

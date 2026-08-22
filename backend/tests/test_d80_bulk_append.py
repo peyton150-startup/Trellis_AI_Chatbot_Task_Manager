@@ -843,23 +843,49 @@ def test_a_completed_replay_does_not_append_twice(db):
         assert row["version"] == task.version + 1
 
 
+def test_the_sync_timeout_assumption_still_holds():
+    """The two conditions the no-second-fence decision rests on.
+
+    The conclusion is not "tool_timeout never fires for sync tools". It is
+    narrower: under pinned pydantic-ai 2.27.0, on Pydantic's default AnyIO
+    sync-tool executor path, no timeout or retry surfaces before a synchronous
+    tool finishes. Pydantic wraps tool execution in `anyio.fail_after`, and the
+    default sync executor reaches `anyio.to_thread.run_sync`, whose cancellation
+    waits for the worker.
+
+    Pydantic also offers `Agent.using_thread_executor`, and a
+    `concurrent.futures` future that has already started cannot be cancelled, so
+    a different executor could give a different answer. Trellis installs none.
+    Both halves are asserted here so that a version bump or an executor change
+    fails loudly and reopens the exact-once analysis, rather than silently
+    reintroducing a double append.
+    """
+    import importlib.metadata as metadata
+
+    assert metadata.version("pydantic-ai") == "2.27.0", (
+        "pydantic-ai moved; re-open the D-80 sync timeout and exact-once analysis"
+    )
+
+    from pydantic_ai import _utils
+
+    assert _utils._thread_executor.get() is None, (
+        "a custom thread executor is installed; re-open the D-80 sync timeout "
+        "and exact-once analysis"
+    )
+
+
 def test_a_synchronous_tool_is_not_subject_to_the_framework_timeout(db):
-    """Probed rather than assumed, because it decides whether a fence is needed.
+    """The behavioural half of the same assumption, measured not assumed.
 
     The worry is real in shape: a tool timeout becomes a retry prompt, and a
     worker thread already running does not stop because the awaiting task was
     cancelled, so one logical append could commit twice under two different
     tool_call_ids.
 
-    Measured against the pinned version, that does not happen here, because the
-    timeout does not fire for synchronous tools at all. A sync body outruns its
-    tool_timeout and returns normally, while an async body in the same harness
-    is cancelled on time. Every Trellis tool is synchronous, so the retry that
-    would be needed to double-append is never issued.
-
-    This is a version-pinned observation, not a law, which is why it is a test.
-    If a future upgrade starts enforcing the timeout for sync tools, this fails
-    and the fence question reopens with evidence rather than speculation.
+    On the configuration asserted above that does not happen: a sync body
+    outruns its tool_timeout and returns normally, while an async body in the
+    same harness is cancelled on time. Every Trellis tool is synchronous, so the
+    retry that would be needed to double-append is never issued.
     """
     entered: list[str] = []
     completed: list[str] = []

@@ -3461,8 +3461,10 @@ sync-tool timeout behaviour was probed rather than assumed.
 result shape, event shape, and the fourteen error codes are unchanged, so undo
 and the audit reads see what they saw before.
 
-**Verification:** `ruff` clean; `pytest -m "not network"` 568 passed, 13
-deselected, of which 61 are the D-80 suite. All three inline CI gate scripts
+**Verification:** `ruff` clean; `pytest -m "not network"` 571 passed, 13
+deselected, of which 61 are the D-80 suite. An earlier draft of this note said
+568, which was the count before three tests were added to close the mutation
+survivors; 571 is the figure the command actually produces on this commit. All three inline CI gate scripts
 were extracted from the workflow and executed locally rather than only parsed.
 
 The production scenario is exercised directly: ten tasks with differing notes,
@@ -3479,8 +3481,8 @@ defence-in-depth guards no tool-path test can reach and a prompt assertion that
 matched an example rather than the rule. All three now have tests that reach the
 code under test.
 
-Timeout probe, pinned `pydantic-ai==2.27.0`, recorded because it decided whether
-to build a second idempotency mechanism:
+Timeout probe, recorded because it decided whether to build a second idempotency
+mechanism:
 
   ```text
   sync tool,  2.5 s body, 1.0 s tool_timeout -> no timeout surfaced, body
@@ -3489,9 +3491,20 @@ to build a second idempotency mechanism:
                                                 cancelled before completing
   ```
 
-Every Trellis tool is synchronous, so the timeout-retry that could double-apply
-an append is never issued and no fence was added. A regression holds this, so an
-upgrade that changes it fails loudly rather than silently reopening the hazard.
+State the conclusion with its conditions attached, because it is a property of
+one configuration rather than a law. Under pinned `pydantic-ai==2.27.0`, with
+Trellis on Pydantic's default AnyIO sync-tool executor path, `tool_timeout` does
+not surface a timeout or a retry before a synchronous tool finishes. Pydantic
+wraps tool execution in `anyio.fail_after`, and the default sync executor
+reaches `anyio.to_thread.run_sync`, whose cancellation semantics wait for the
+worker to finish.
+
+That is not the only executor Pydantic offers. `Agent.using_thread_executor`
+installs a custom `Executor`, and a `concurrent.futures` future that has already
+started cannot be cancelled, so a different executor could change the answer.
+Trellis installs none, and the regression asserts both halves: the pinned
+version, and that no custom executor is in force. Either a version bump or an
+executor change fails it and reopens the exact-once analysis with evidence.
 
 **Limitations and review status:** Append is append-only by decision; appending
 and changing another field is two calls. The three guards on this path that an
@@ -3503,3 +3516,67 @@ sequence Trellis executes, not that a live provider chooses it.
 
 Unreviewed. The neutral blind review is owed at the final SHA and must run its
 execution phase in a Vercel Sandbox, per the repository's review contract.
+
+## D-81: turn-bounded Nemotron reasoning
+
+**Local role:** `agent._project_prior_turn_history_for_model` removes inherited
+`ThinkingPart`s from the history handed to the provider on an ordinary new user
+turn. `agent._model_settings` supplies the temperature, token cap, reasoning
+budget, and explicit thinking flag that every model request now carries.
+`_runtime_model` gains an explicit `OpenAIModelProfile`. `config` gains
+`model_reasoning_budget` and `model_max_tokens` with a ceiling and a headroom
+invariant. `prompts` gains one routing kernel.
+
+**Whole-system role:** Trellis measures a model operating a typed API, so what
+the model is shown and how long it may think are part of the measured system,
+not provider trivia. Two things were outside Trellis's control: obsolete
+reasoning crossed user-turn boundaries because D-67 inherits history wholesale,
+and three NVIDIA defaults decided the reasoning and output allowance. Both are
+now Trellis-owned and asserted on the wire.
+
+**Inputs and dependencies:** D-67 canonical history and `runs.create_turn`,
+unchanged. The approval-continuation path, deliberately excluded. Pinned
+`pydantic-ai==2.27.0`, whose profile fields and serialization behaviour are
+asserted rather than assumed. NVIDIA's hosted Chat Completions contract for
+`reasoning_budget`, `max_tokens`, and `chat_template_kwargs`.
+
+**Outputs and consumers:** `_project_prior_turn_history_for_model`,
+`_model_settings`, `MODEL_REASONING_BUDGET_CEILING`,
+`MODEL_OUTPUT_HEADROOM_MIN`, `settings.model_reasoning_budget`,
+`settings.model_max_tokens`. No change to durable history, the tool surface, the
+approval bridge, idempotency, or any database behaviour.
+
+**Verification:** `ruff` clean; `pytest -m "not network"` 603 passed, 13
+deselected, of which 31 are the D-81 suite. The wire tests serialize a real
+request through the pinned client against an in-process mock transport and
+assert the body:
+
+  ```text
+  temperature             0.0
+  max_tokens              12288
+  max_completion_tokens   absent
+  reasoning_budget        6000
+  chat_template_kwargs    {"enable_thinking": true}
+  top_p                   absent
+  ```
+
+The turn-boundary claim is proven at the same boundary rather than on the helper
+alone, with a control test establishing that the client does otherwise send the
+inherited reasoning, so the passing case cannot be a false negative. A separate
+test proves same-turn reasoning still reaches the provider after a tool result,
+which is what fails if someone later replaces the projection with a blanket
+processor or a global replay switch.
+
+**Limitations and review status:** No latency claim is made. The decision
+replaces three uncontrolled provider defaults with explicit limits and proves
+them on the wire; whether that changes time-to-first-tool needs a paired live
+measurement at the pre-D-81 and final SHAs, which is reported separately and is
+not part of CI. General history compaction is deferred deliberately. The
+projection is applied at one seam and a source-level test pins that the
+continuation path does not call it; that is a structural assertion, and a
+behavioural equivalent would need a full approval round trip through the
+transport.
+
+Unreviewed. The neutral blind review is owed at the final SHA, and its execution
+phase must run in a fresh Vercel Sandbox pinned to that SHA, per the repository's
+review contract.
