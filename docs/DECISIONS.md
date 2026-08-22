@@ -4577,10 +4577,27 @@ summarization interacts with task identity, approval continuity, and
 tool-call pairing. Prior-turn reasoning is the one category NVIDIA names, so it
 goes first and the rest waits for measurement.
 
-**Known limitations.** The latency effect is not claimed here. This decision
-replaces three uncontrolled provider defaults with explicit Trellis-owned limits
-and proves them on the wire; whether that changes time-to-first-tool is a paired
-before-and-after measurement against the live provider, reported separately.
+**Measured, and it did not make anything faster.** A paired live evaluation was
+run against the hosted endpoint with the real agent and the real tool surface,
+identical fixtures on both sides, differing only in these settings. Routing was
+correct and identical under both: the live model chose `list_tasks` then one
+`bulk_update_tasks` for a multi-task note append, which is the D-80 route rather
+than one `update_task` per task. Latency did not improve; in that sample the
+patched configuration was slower, median 18748ms against 12716ms, on three
+samples per cell with 5 to 30 second swings and one timeout.
+
+That is too noisy to call a regression and nowhere near enough to call an
+improvement. The claim this decision makes is control, not speed: three provider
+defaults that decided reasoning and output behaviour are now Trellis-owned and
+asserted on the wire. Anyone hoping to reduce time-to-first-tool should read this
+as evidence that the reasoning budget is not by itself the lever.
+
+The provider returned no `reasoning_tokens` on any request, so authoritative
+reasoning usage is unavailable and is not estimated. No response finished with
+`length`.
+
+**Known limitations.** The latency effect is measured above and is negative for
+that sample; no latency benefit is claimed anywhere.
 Nothing about downstream concurrency, thread pools, tool timeouts, or PostgreSQL
 locking is touched, because those govern stages after a tool has already begun.
 

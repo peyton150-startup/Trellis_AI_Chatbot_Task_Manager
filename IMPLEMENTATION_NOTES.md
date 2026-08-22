@@ -3567,11 +3567,48 @@ test proves same-turn reasoning still reaches the provider after a tool result,
 which is what fails if someone later replaces the projection with a blanket
 processor or a global replay switch.
 
-**Limitations and review status:** No latency claim is made. The decision
-replaces three uncontrolled provider defaults with explicit limits and proves
-them on the wire; whether that changes time-to-first-tool needs a paired live
-measurement at the pre-D-81 and final SHAs, which is reported separately and is
-not part of CI. General history compaction is deferred deliberately. The
+**Paired live evaluation, and what it did not show.** Run against
+`nvidia/nemotron-3.5-lightning-30b-a3b` on the hosted endpoint, with the real
+agent, the real eight-tool surface, and a database truncated and reseeded
+identically before every request. The two configurations differed in exactly one
+thing: the baseline sent only a timeout, leaving NVIDIA's reasoning_budget 16384,
+max_tokens 16384 and temperature 1 in charge, while the patched configuration
+sent the D-81 settings.
+
+  ```text
+  scenario                                  baseline   patched   tools chosen
+  show my first 5 tasks                       5593ms   18748ms   list_tasks
+  create a task called Fix the gate          12716ms    5160ms   create_task
+  add a note to the notes of the first 3     19712ms   30762ms   list_tasks then
+                                                                 bulk_update_tasks
+  overall median                             12716ms   18748ms
+  ```
+
+Two results, and they point in different directions.
+
+Routing was correct and identical under both configurations. The live model chose
+`list_tasks` followed by one `bulk_update_tasks` for the multi-task note append,
+which is the D-80 route rather than one `update_task` per task. That is the
+behaviour the routing kernel exists to encourage, observed against a real
+provider rather than a deterministic stand-in.
+
+Latency did not improve. In this sample the patched configuration was slower,
+median 18748ms against 12716ms. Three samples per cell with swings of 5 to 30
+seconds and one request timing out is far too noisy to call a regression, and it
+is nowhere near enough to call an improvement either. The honest statement is
+that the measurement does not support a latency benefit and no such benefit is
+claimed anywhere in this decision. If lower latency is wanted, this is evidence
+that bounding the reasoning budget is not by itself the lever.
+
+The provider did not return `completion_tokens_details.reasoning_tokens` on any
+request, so authoritative reasoning-token usage is unavailable and is not
+estimated. No response finished with `length`; every completed request finished
+with `stop` and produced an actionable result.
+
+**Limitations and review status:** The value delivered here is control and
+predictability, not speed: three provider defaults that decided reasoning and
+output behaviour are now Trellis-owned and asserted on the wire. The latency
+question is measured above and answered in the negative for this sample. General history compaction is deferred deliberately. The
 projection is applied at one seam and a source-level test pins that the
 continuation path does not call it; that is a structural assertion, and a
 behavioural equivalent would need a full approval round trip through the

@@ -47,7 +47,6 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai import models
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -286,12 +285,14 @@ def _capture_request(model_settings, message_history=None, tools=None):
     # transport cannot: every request is answered in process by `handler`, and
     # the key is a placeholder. Lifting it here buys the one thing a mock model
     # cannot give, which is the body the real client actually serializes.
-    profile = OpenAIModelProfile(
-        openai_chat_thinking_field="reasoning",
-        openai_chat_supports_max_completion_tokens=False,
-    )
+    # The production profile, not an equivalent one built here. Mutation testing
+    # found the difference: with a copy, removing a field from `_nvidia_profile`
+    # left every wire test green, because they were proving what a profile
+    # configured this way does rather than what Trellis is configured to do.
     model = OpenAIChatModel(
-        "nvidia/probe", provider=OpenAIProvider(openai_client=client), profile=profile
+        "nvidia/probe",
+        provider=OpenAIProvider(openai_client=client),
+        profile=agent_module._nvidia_profile(),
     )
     agent = Agent(model, model_settings=model_settings)
 
@@ -410,21 +411,36 @@ def test_same_turn_reasoning_is_still_sent_back_after_a_tool_result():
     assert "list_tasks" in rendered
 
 
-def test_the_profile_does_not_disable_thinking_replay():
-    """Recorded as a decision, because the simpler setting is the wrong one.
+def test_the_production_profile_names_the_two_fields_and_no_more():
+    """Read off the profile object itself, so a copy cannot stand in for it.
 
     Turning replay off globally would satisfy the turn-boundary requirement and
-    quietly break the multi-step case NVIDIA trains separately.
+    quietly break the multi-step case NVIDIA trains separately, so its absence
+    from the profile is a decision worth asserting rather than a coincidence.
+    """
+    profile = agent_module._nvidia_profile()
+
+    # In pinned 2.27.0 this is a mapping of exactly the fields that were set,
+    # which makes "and no more" directly assertable.
+    assert profile == {
+        "openai_chat_thinking_field": "reasoning",
+        "openai_chat_supports_max_completion_tokens": False,
+    }
+
+    # Absence is the point for this one: leaving it unset keeps the "auto"
+    # default, which is what preserves same-turn replay.
+    assert "openai_chat_send_back_thinking_parts" not in profile
+
+
+def test_the_runtime_model_uses_that_profile():
+    """The production constructor and the tested profile are the same object.
+
+    Without this, `_nvidia_profile` could be correct and unused.
     """
     import inspect
 
     source = inspect.getsource(agent_module._runtime_model)
-    assert "openai_chat_thinking_field" in source
-    assert "openai_chat_supports_max_completion_tokens" in source
-    assert "openai_chat_send_back_thinking_parts" not in source.replace(
-        "# `openai_chat_send_back_thinking_parts` is deliberately left at its default.",
-        "",
-    )
+    assert "_nvidia_profile()" in source
 
 
 # ------------------------------------------------------- configuration
@@ -478,7 +494,15 @@ def test_reasoning_cannot_be_configured_to_consume_the_whole_allowance():
 
 
 def test_the_headroom_fits_the_largest_tool_call_this_system_can_emit():
-    """Fifty task ids is the biggest legitimate payload, so it has to fit."""
+    """Fifty task ids is the biggest legitimate payload, so it has to fit.
+
+    The floor is asserted as a value, not only as a comparison against today's
+    settings. Shrinking the constant while the current numbers still happen to
+    satisfy it would otherwise pass, and the constant is the thing that protects
+    a future configuration change.
+    """
+    assert MODEL_OUTPUT_HEADROOM_MIN >= 4096
+
     headroom = settings.model_max_tokens - settings.model_reasoning_budget
     assert headroom >= MODEL_OUTPUT_HEADROOM_MIN
     assert headroom >= 4096
@@ -520,5 +544,13 @@ def test_the_routing_kernel_names_the_next_action_not_the_whole_plan():
     assert "next authoritative action" in text
     assert "reason only far enough" in text
     assert "never guess" in text
+
+    # The routes are the kernel's content, not decoration. Losing the bulk
+    # append route sends the model back to one update_task per task, which is
+    # the failure D-80 exists to remove.
+    assert "one bulk_update_tasks call carrying only append_notes" in text
+    assert "-> one bulk_update_tasks call" in text
+    assert "-> resolve_task_reference first" in text
+    assert "-> list_tasks" in text
     # The kernel belongs near the front, before the detailed rules.
     assert text.index("next authoritative action") < len(text) // 3

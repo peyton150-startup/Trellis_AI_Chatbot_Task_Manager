@@ -346,6 +346,36 @@ class TrellisDeps:
     effects: RunEffects = field(default_factory=RunEffects)
 
 
+def _nvidia_profile() -> OpenAIModelProfile:
+    """The provider contract, named so tests can exercise it rather than copy it.
+
+    D-81. This lives in its own function for a reason found by mutation testing:
+    when it was built inline, the wire tests constructed an equivalent profile of
+    their own, so removing either field from production left them green. They
+    were proving that a profile configured this way produces that body, not that
+    Trellis is configured this way.
+
+    `openai_chat_thinking_field` names the field NVIDIA returns reasoning in, so
+    the contract is stated rather than autodetected.
+
+    `openai_chat_supports_max_completion_tokens=False` is the one that would
+    otherwise fail silently. Pydantic AI serialises `ModelSettings.max_tokens` as
+    `max_completion_tokens` unless the profile says the model does not support
+    it, and NVIDIA's hosted Chat Completions documents `max_tokens`. Sent under
+    the wrong name the cap is ignored, which looks exactly like a cap that was
+    never set.
+
+    `openai_chat_send_back_thinking_parts` is deliberately left at its default.
+    It governs replaying reasoning inside one trajectory, which is the case
+    NVIDIA wants preserved; the case it wants dropped is the previous user turn,
+    and that is `_project_prior_turn_history_for_model`.
+    """
+    return OpenAIModelProfile(
+        openai_chat_thinking_field="reasoning",
+        openai_chat_supports_max_completion_tokens=False,
+    )
+
+
 def _model_settings() -> dict:
     """What every model request carries, instead of provider defaults.
 
@@ -392,28 +422,9 @@ def _runtime_model() -> Model:
         max_retries=_MODEL_REQUEST_MAX_RETRIES,
     )
     provider = OpenAIProvider(openai_client=client)
-
-    # D-81. An explicit profile rather than generic OpenAI-compatible defaults.
-    #
-    # `openai_chat_thinking_field` names the field NVIDIA actually returns
-    # reasoning in, so the contract is stated rather than autodetected.
-    #
-    # `openai_chat_supports_max_completion_tokens=False` is the one that would
-    # otherwise bite silently: Pydantic AI serialises `ModelSettings.max_tokens`
-    # as `max_completion_tokens` unless the profile says the model does not
-    # support it, and NVIDIA's hosted Chat Completions documents `max_tokens`.
-    # Sent under the wrong name the cap is simply ignored, which looks exactly
-    # like a cap that was never set.
-    #
-    # `openai_chat_send_back_thinking_parts` is deliberately left at its default.
-    # It governs replaying reasoning inside one trajectory, which is the case
-    # NVIDIA wants preserved; the case it wants dropped is the previous user
-    # turn, and that is handled by `_project_prior_turn_history_for_model`.
-    profile = OpenAIModelProfile(
-        openai_chat_thinking_field="reasoning",
-        openai_chat_supports_max_completion_tokens=False,
+    return OpenAIChatModel(
+        settings.model_id, provider=provider, profile=_nvidia_profile()
     )
-    return OpenAIChatModel(settings.model_id, provider=provider, profile=profile)
 
 
 def build_agent(
