@@ -3469,11 +3469,18 @@ sync-tool timeout behaviour was probed rather than assumed.
 result shape, event shape, and the fourteen error codes are unchanged, so undo
 and the audit reads see what they saw before.
 
-**Verification:** `ruff` clean; `pytest -m "not network"` 571 passed, 13
-deselected, of which 61 are the D-80 suite. An earlier draft of this note said
-568, which was the count before three tests were added to close the mutation
-survivors; 571 is the figure the command actually produces on this commit. All three inline CI gate scripts
-were extracted from the workflow and executed locally rather than only parsed.
+**Verification, at the D-80 implementation SHA:** `ruff` clean;
+`pytest -m "not network"` 571 passed, 13 deselected, of which 61 are the D-80
+suite. An earlier draft of this note said 568, which was the count before three
+tests were added to close the mutation survivors. Those figures are retained as
+historical evidence for that frozen state and are deliberately not restated as
+current: later commits added tests, so at `0d60e51` the focused D-80 suite
+produces 62 passed and the cumulative non-network suite produces 604 passed, 13
+deselected. Every verification paragraph in this file reports the counts
+measured at its own decision's SHA, not at whatever HEAD happens to be. The
+stable decision gate is `D80 atomic bulk append`. All three inline CI gate
+scripts were extracted from the workflow and executed locally rather than only
+parsed.
 
 The production scenario is exercised directly: ten tasks with differing notes,
 one `BULK_APPEND_NOTES_GUARDED` statement, ten audit events, D-78's separator
