@@ -202,6 +202,39 @@ test("exactly one Analytics element is mounted, and it is under <body>", () => {
     mounts[0].index > bodyOpen && mounts[0].index < bodyClose,
     "<Analytics /> must be mounted beneath <body>",
   );
+
+  // Being inside <body> is not the same as rendering. Text position alone
+  // accepts an element that never mounts:
+  //
+  //     {false && <Analytics />}
+  //
+  // which satisfied every other assertion here AND compiled under `next build`,
+  // so the whole D82 job reported green while Trellis sent no page views. That
+  // is the worst failure this gate can have, because nothing anywhere is red.
+  //
+  // Depth is counted from the end of the <body> opening tag, over the
+  // literal-blanked copy, so braces inside comments or strings do not register
+  // and attribute braces on <body> itself are excluded. A child rendered
+  // unconditionally sits at depth zero; `{children}` opens and closes before
+  // reaching this point, so it nets out. Anything still open at the mount means
+  // the element is the value of a JavaScript expression, which is exactly the
+  // conditional-render class this rejects.
+  const bodyTagEnd = structure.indexOf(">", bodyOpen);
+  assert.notEqual(bodyTagEnd, -1, "the <body> opening tag must be closed");
+
+  let depth = 0;
+  for (let index = bodyTagEnd + 1; index < mounts[0].index; index += 1) {
+    if (structure[index] === "{") depth += 1;
+    else if (structure[index] === "}") depth -= 1;
+  }
+
+  assert.equal(
+    depth,
+    0,
+    "<Analytics /> must be mounted unconditionally, not inside a JSX " +
+      "expression; a conditional or constant-false mount compiles and passes " +
+      "every textual check while never rendering",
+  );
 });
 
 test("the root layout was not converted to a client component", () => {
