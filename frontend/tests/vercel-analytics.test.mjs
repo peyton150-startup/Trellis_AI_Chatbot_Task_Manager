@@ -39,14 +39,20 @@ const packageJson = JSON.parse(
 );
 
 /**
- * Remove block comments, line comments, and string/template literals, so that
- * every match below is against code rather than prose. Replaces with spaces to
- * keep offsets stable, which matters for the <body> containment check.
+ * Blank out comments, and optionally the contents of string and template
+ * literals, so that a match is against code rather than prose. Replacements are
+ * spaces of equal length with newlines preserved, so every offset stays valid
+ * for the <body> containment check.
+ *
+ * Two passes exist because the two questions need different inputs. Counting
+ * JSX mounts must not see inside literals, or a template literal containing the
+ * text of a component counts as a mount. Matching the import must still see
+ * inside literals, because the module specifier IS a string.
  */
-function stripCommentsAndStrings(source) {
+function blankOut(source, { literals }) {
   let out = "";
   let index = 0;
-  const blank = (length) => " ".repeat(length);
+  const blank = (text) => text.replace(/[^\n]/g, " ");
 
   while (index < source.length) {
     const two = source.slice(index, index + 2);
@@ -54,9 +60,7 @@ function stripCommentsAndStrings(source) {
     if (two === "/*") {
       const end = source.indexOf("*/", index + 2);
       const stop = end === -1 ? source.length : end + 2;
-      out += blank(stop - index).replace(/ /g, (character, offset) =>
-        source[index + offset] === "\n" ? "\n" : character,
-      );
+      out += blank(source.slice(index, stop));
       index = stop;
       continue;
     }
@@ -64,38 +68,48 @@ function stripCommentsAndStrings(source) {
     if (two === "//") {
       const end = source.indexOf("\n", index);
       const stop = end === -1 ? source.length : end;
-      out += blank(stop - index);
+      out += blank(source.slice(index, stop));
       index = stop;
       continue;
     }
 
-    const character = source[index];
-    if (character === '"' || character === "'" || character === "`") {
+    const quote = source[index];
+    if (quote === '"' || quote === "'" || quote === "`") {
       let cursor = index + 1;
       while (cursor < source.length) {
         if (source[cursor] === "\\") {
           cursor += 2;
           continue;
         }
-        if (source[cursor] === character) break;
+        if (source[cursor] === quote) break;
         cursor += 1;
       }
       const stop = Math.min(cursor + 1, source.length);
-      // Keep the quotes so import matching can still anchor on them, blank the
-      // contents only when the literal is not an import specifier.
-      out += source.slice(index, stop);
+      if (literals === "blank") {
+        // Keep the quote characters, blank what is between them.
+        out += quote + blank(source.slice(index + 1, stop - 1)) + quote;
+      } else {
+        out += source.slice(index, stop);
+      }
       index = stop;
       continue;
     }
 
-    out += character;
+    out += source[index];
     index += 1;
   }
 
   return out;
 }
 
-const code = stripCommentsAndStrings(layoutSource);
+// For JSX structure: literals blanked, so a decoy inside a template literal
+// cannot masquerade as a mount. An earlier version of this file kept literal
+// contents, and a `{`<Analytics />`}` decoy with the real mount deleted passed
+// all four assertions. That is a gate reporting green over a broken contract,
+// which is worse than having no gate.
+const structure = blankOut(layoutSource, { literals: "blank" });
+// For the import: literals kept, because the module specifier is a string.
+const statements = blankOut(layoutSource, { literals: "keep" });
 
 test("Analytics is a production dependency, exact-pinned, at major 2 or later", () => {
   const pinned = packageJson.dependencies?.["@vercel/analytics"];
@@ -109,10 +123,17 @@ test("Analytics is a production dependency, exact-pinned, at major 2 or later", 
   // Only assert the exact-pin convention while the repository still follows it
   // everywhere else. Asserting it unconditionally would turn a deliberate
   // project-wide policy change into a failure in this one unrelated test.
-  const everyDependencyIsPinned = Object.values(packageJson.dependencies).every(
-    (range) => /^\d+\.\d+\.\d+$/.test(range),
-  );
-  if (everyDependencyIsPinned) {
+  //
+  // The exclusion of @vercel/analytics itself is the whole point. An earlier
+  // version tested every dependency including this one, which made the guard
+  // self-defeating: loosening this pin to "2.x" also made the guard false, so
+  // the assertion that exists to catch exactly that mutation was skipped
+  // instead of failing. Found by mutating the pin and watching the gate stay
+  // green.
+  const everyOtherDependencyIsPinned = Object.entries(packageJson.dependencies)
+    .filter(([name]) => name !== "@vercel/analytics")
+    .every(([, range]) => /^\d+\.\d+\.\d+$/.test(range));
+  if (everyOtherDependencyIsPinned) {
     assert.match(
       pinned,
       /^\d+\.\d+\.\d+$/,
@@ -129,10 +150,12 @@ test("Analytics is a production dependency, exact-pinned, at major 2 or later", 
 });
 
 test("Analytics is imported as a named import from the Next.js entry point", () => {
+  // Anchored at line start: an import written inside a string literal is
+  // not a statement and must not count.
   const importPattern =
-    /import\s*\{([^}]*)\}\s*from\s*["']@vercel\/analytics([^"']*)["']/g;
+    /^import\s*\{([^}]*)\}\s*from\s*["']@vercel\/analytics([^"']*)["']/gm;
   const found = [];
-  for (const match of code.matchAll(importPattern)) {
+  for (const match of statements.matchAll(importPattern)) {
     const names = match[1].split(",").map((name) => name.trim());
     if (names.includes("Analytics")) found.push(match[2]);
   }
@@ -151,7 +174,7 @@ test("Analytics is imported as a named import from the Next.js entry point", () 
 });
 
 test("exactly one Analytics element is mounted, and it is under <body>", () => {
-  const mounts = [...code.matchAll(/<Analytics(\s|\/|>)/g)];
+  const mounts = [...structure.matchAll(/<Analytics(\s|\/|>)/g)];
   assert.equal(
     mounts.length,
     1,
@@ -159,8 +182,8 @@ test("exactly one Analytics element is mounted, and it is under <body>", () => {
       "second mount double-counts every page view without erroring",
   );
 
-  const bodyOpen = code.indexOf("<body");
-  const bodyClose = code.indexOf("</body>");
+  const bodyOpen = structure.indexOf("<body");
+  const bodyClose = structure.indexOf("</body>");
   assert.ok(bodyOpen !== -1 && bodyClose !== -1, "the layout must render <body>");
   assert.ok(
     mounts[0].index > bodyOpen && mounts[0].index < bodyClose,

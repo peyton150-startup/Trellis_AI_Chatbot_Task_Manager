@@ -1321,3 +1321,84 @@ def test_a_model_emitted_bulk_call_reaches_the_database(db):
         assert row["priority"] == "high"
         assert row["version"] == task.version + 1
         assert len(_events_for(db, task.id)) == 2
+
+
+def test_the_two_or_more_threshold_is_stated_numerically_on_both_surfaces():
+    """The routing threshold is a number, and words are not a substitute for it.
+
+    The description test above asserts "same", "one" and "update_task". Every
+    one of those survives a silent edit from "two or more" to "five or more",
+    which would change routing without failing anything. The number is the
+    contract, so the number is what gets pinned.
+
+    Both surfaces are checked because the model sees both and they can drift
+    apart. `SYSTEM_PROMPT` is the standing instruction; the tool description is
+    what Pydantic AI actually serialises into the request. A threshold stated in
+    one and contradicted in the other is worse than a threshold stated in
+    neither, because the model gets to pick.
+
+    Deliberately not asserted: that bulk is faster at two targets. It is not
+    claimed to be. Bulk owns all-or-nothing semantics for one logical operation,
+    which is a correctness property and holds at every size.
+    """
+    from app import prompts
+
+    threshold = "two or more"
+
+    prompt = prompts.SYSTEM_PROMPT.lower()
+    assert threshold in prompt, (
+        "SYSTEM_PROMPT no longer states the two-or-more bulk routing threshold; "
+        "a different number here silently re-routes multi-task mutations"
+    )
+
+    description = _definitions()[ToolName.BULK_UPDATE_TASKS.value].description
+    assert threshold in description.lower(), (
+        "the model-visible bulk tool description no longer states the "
+        "two-or-more threshold"
+    )
+
+
+def test_three_targets_proceed_and_four_require_approval(db):
+    """The approval edge is `count > threshold`, so three is allowed and four is not.
+
+    The existing duplicate-reference test proves four references are gated. It
+    cannot prove three are not: a policy that gated everything, or a threshold
+    quietly lowered to two, would pass it just as happily. Both sides of the
+    boundary have to be asserted together or the edge is not pinned at all.
+
+    Three distinct tasks rather than one repeated id, because this is about the
+    threshold itself. Duplicate-reference counting is D-79's separate, and
+    deliberately different, concern.
+    """
+    assert settings.blast_radius_threshold == 3, (
+        "this test pins the 3/4 edge and must be updated if the default moves"
+    )
+
+    run_id = _run()
+    allowed = _tasks(db, run_id, 3)
+
+    result = _bulk_through_the_tool(
+        run_id,
+        [task.id for task in allowed],
+        tool_call_id="call-d79-edge-three",
+        priority="high",
+    )
+    assert len(result) == 3, "three targets must proceed without approval"
+    for task in allowed:
+        assert _row(db, task.id)["priority"] == "high"
+
+    gated = _tasks(db, run_id, 4)
+    before = {task.id: _row(db, task.id)["version"] for task in gated}
+
+    with pytest.raises(ApprovalRequired):
+        _bulk_through_the_tool(
+            run_id,
+            [task.id for task in gated],
+            tool_call_id="call-d79-edge-four",
+            priority="high",
+        )
+
+    for task in gated:
+        assert _row(db, task.id)["version"] == before[task.id], (
+            "a gated bulk call must commit nothing at all, not three of four"
+        )
