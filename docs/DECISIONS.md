@@ -4619,3 +4619,44 @@ decision's claims. The neutral blind review at `c846a14` raised exactly that as
 a MINOR finding. The suite needs neither PostgreSQL nor the frontend, so the job
 is a small independent one. The name is stable once branch protection references
 it.
+
+### D-82: reliable Vercel Web Analytics
+
+The frontend has never reported traffic. This adds the smallest integration that
+does, and nothing else.
+
+**What it observes.** Automatic page views, through Vercel's maintained
+`@vercel/analytics/next` entry point, mounted once at the root layout. No
+`track()`, no custom events, no router listeners, no manual beacons. The
+automatic path is already correct for the App Router, and a first integration
+that also invents an event schema has to defend two things at once.
+
+**Why version 2.** Analytics v2 introduced Resilient Intake, which discovers its
+own collection endpoint rather than depending on one predictable path. That is
+the reason the gate asserts a major of 2 or later rather than pinning behaviour
+to a URL. `next.config.ts` is deliberately unchanged: it rewrites only
+`/api/:path*` to FastAPI, which does not overlap intake, and hardcoding an
+intake path would defeat the mechanism that makes v2 more reliable than v1.
+Pinned exact at `2.0.1`, the current stable release, matching every other
+frontend dependency.
+
+**What it is not.** Browser analytics is observational. It answers questions
+about traffic and navigation. It is not authoritative for run success, tool
+success, mutation success, approvals, or committed state, and nothing may infer
+those from an analytics event. PostgreSQL remains authoritative, exactly as
+before. Trellis already tolerates a committed mutation whose response fails in
+transit, so a browser signal is the wrong place to learn whether work happened.
+
+**What the gate proves, and what it does not.** `D82 vercel analytics` proves
+the dependency resolves, the integration is shaped as specified, and the build
+compiles. It cannot prove a page view reached Vercel. Production intake and
+dashboard ingestion are verified after deployment and are recorded separately;
+until then they are UNVERIFIED rather than passing.
+
+This decision authorizes one production dependency and no backend change. No
+migration, table, column, endpoint, status value, error code, tool, or provider
+setting. No FastAPI middleware, no Pydantic AI instrumentation, no OpenTelemetry;
+those are separate operational-observability surfaces and are not opened here.
+
+**Stable CI check.** `D82 vercel analytics`. Recorded here per the per-task CI
+gate protocol, and the name is stable once branch protection references it.

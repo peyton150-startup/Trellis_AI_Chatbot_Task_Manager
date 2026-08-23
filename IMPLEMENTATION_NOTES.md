@@ -3642,3 +3642,68 @@ transport.
 Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
 HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
 requires its applicable follow-up review.
+
+## D-82: reliable Vercel Web Analytics
+
+**Local role:** Mounts Vercel Web Analytics once at the Next.js root layout so
+the frontend reports page views. Owns one production dependency,
+`@vercel/analytics`, pinned exact at `2.0.1`, and four lines of `app/layout.tsx`.
+
+**Whole-system role:** Trellis could say nothing about whether anyone used the
+frontend. This closes that gap on the traffic question only, and the boundary is
+the point: the browser becomes observable without becoming authoritative. The
+architecture already treats the browser as a presentation layer that reconciles
+against committed PostgreSQL state, and a mutation can commit while its response
+fails in transit, so a browser event is structurally the wrong evidence for
+whether work happened. Analytics answers navigation questions. PostgreSQL keeps
+answering the rest.
+
+**Inputs and dependencies:** The existing Next.js 16.3.1 App Router frontend,
+its exact-pin dependency convention, `moduleResolution: "bundler"` in
+`tsconfig.json` which already resolves the package's `exports` map, and the
+`node --test` harness the other five frontend suites use. No backend contract.
+
+**Outputs and consumers:** Page-view telemetry in the Vercel dashboard, and a
+stable CI gate named `D82 vercel analytics`. No module imports it; nothing in
+the application reads it back. That is deliberate, because a consumer would make
+browser data an input to application behaviour.
+
+**Verification, at the D-82 implementation SHA:** `npm ls @vercel/analytics
+--depth=0` resolves `2.0.1`; the focused contract suite reports 4 passed;
+`npm run build` compiles; the five existing frontend suites pass; backend
+`ruff check .` clean and `pytest -m "not network"` 604 passed, 13 deselected,
+both unchanged because no backend file was touched.
+
+The contract test was mutation-tested, five single-change mutations applied one
+at a time, each run and reverted, restore verified byte-identical:
+
+```text
+M1  import switched to the bare "@vercel/analytics" entry   KILLED
+M2  a second <Analytics /> mounted                          KILLED
+M3  the mount moved outside <body>                          KILLED
+M4  "use client" added to the root layout                   KILLED
+M5  the dependency moved to devDependencies                 KILLED
+```
+
+That mattered, because the first version of this gate was worthless. It parsed
+the layout with the TypeScript compiler API, which reads well and does not work
+here: typescript 7.0.2 exposes only a version string at its stable entry point
+and puts the AST behind `typescript/unstable/ast`. A named gate resting on an
+export the maintainers labelled unstable is a gate that breaks on someone else's
+refactor. The shipped version strips comments and string literals first, then
+matches structure, which defeats the three ways a naive grep lies here: a
+mention inside a comment counting as a mount, a second real mount hiding behind
+a boolean match, and an import written inside a string passing as real.
+
+**Limitations and review status:** A passing gate proves integration, never
+ingestion. Production intake and dashboard appearance are UNVERIFIED and can
+only be checked after deployment against a project with Web Analytics enabled;
+no deterministic test can establish them, and none claims to. The contract test
+reads source text rather than a real AST, for the reason above, so it asserts
+the shape of the code and not the rendered tree. Custom events are deliberately
+absent and would need their own decision, including a privacy schema, since task
+titles, notes, prompts, and tool arguments must never leave as event data.
+
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. D-82 postdates
+that review and its own follow-up review is owed at the final SHA.
