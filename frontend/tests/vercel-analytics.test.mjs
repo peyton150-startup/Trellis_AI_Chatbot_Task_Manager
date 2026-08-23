@@ -150,14 +150,27 @@ test("Analytics is a production dependency, exact-pinned, at major 2 or later", 
 });
 
 test("Analytics is imported as a named import from the Next.js entry point", () => {
-  // Anchored at line start: an import written inside a string literal is
-  // not a statement and must not count.
-  const importPattern =
-    /^import\s*\{([^}]*)\}\s*from\s*["']@vercel\/analytics([^"']*)["']/gm;
+  // Locate import STATEMENTS in the literal-blanked source, so a line inside a
+  // multiline template literal cannot pose as one. Anchoring at line start is
+  // not enough on its own: with the `m` flag, every line of a template literal
+  // begins a line too, and an earlier version of this test accepted
+  //
+  //     const decoy = `
+  //     import { Analytics } from "@vercel/analytics/next";
+  //     `;
+  //
+  // as the real import while the real import was deleted. Blanking preserves
+  // offsets, so the specifier is recovered from the original source at the same
+  // span, which is what makes matching on the blanked copy safe here.
+  const statementPattern = /^import\s*\{([^}]*)\}\s*from\s*["'][^"']*["']/gm;
   const found = [];
-  for (const match of statements.matchAll(importPattern)) {
+  for (const match of structure.matchAll(statementPattern)) {
     const names = match[1].split(",").map((name) => name.trim());
-    if (names.includes("Analytics")) found.push(match[2]);
+    if (!names.includes("Analytics")) continue;
+    const real = layoutSource.slice(match.index, match.index + match[0].length);
+    const specifier = /from\s*["']([^"']*)["']/.exec(real)?.[1] ?? "";
+    if (!specifier.startsWith("@vercel/analytics")) continue;
+    found.push(specifier.slice("@vercel/analytics".length));
   }
 
   assert.equal(
@@ -192,16 +205,20 @@ test("exactly one Analytics element is mounted, and it is under <body>", () => {
 });
 
 test("the root layout was not converted to a client component", () => {
-  // Directives are only directives at the very top of the module, so check the
-  // first non-blank line of the original source rather than searching the file.
-  const firstLine =
-    layoutSource
-      .split("\n")
-      .map((line) => line.trim())
-      .find((line) => line.length > 0) ?? "";
+  // Run against the comment-stripped source, because a comment does not stop a
+  // directive from being a directive. An earlier version took the first
+  // non-blank line of the raw source, so
+  //
+  //     // innocent leading comment
+  //     "use client";
+  //
+  // hid the directive behind the comment and the assertion passed. Comments are
+  // blanked to whitespace here, so leading trivia cannot conceal it. Not
+  // multiline: the prologue is only at the start of the module.
+  const hasUseClientDirective = /^\s*["']use client["']\s*;?/.test(statements);
 
   assert.equal(
-    /^["']use client["'];?$/.test(firstLine),
+    hasUseClientDirective,
     false,
     'the root layout must stay a server component; "@vercel/analytics/next" ' +
       'is the maintained integration and needs no "use client" here',
