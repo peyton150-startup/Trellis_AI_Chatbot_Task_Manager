@@ -3777,9 +3777,17 @@ symbol.
 identity. A local `function Analytics()` shadowing an aliased real import
 satisfied every name-based rule while the fake rendered, and the tsconfig does
 not set `noUnusedLocals`, so the unused real import raised nothing. The gate now
-builds a full `Program` and asks the `TypeChecker` which symbol a JSX tag
-resolves to, requiring it to declare from `@vercel/analytics`. That closes
-aliasing and shadowing as a category rather than as two more names to forbid.
+builds a full `Program`, resolves the symbol that `Analytics` denotes in the
+import declaration itself, resolves the symbol the mounted JSX tag denotes, and
+requires the two to be the same symbol. That closes aliasing and shadowing as a
+category rather than as two more names to forbid.
+
+The first attempt at this was weaker than the sentence describing it. It asked
+whether the resolved declaration's file name contained `@vercel/analytics`,
+which establishes a filename rather than an identity, and would still have
+accepted a mount resolving to the bare package entry, whose path contains that
+text too. That is the same names-versus-identity error the fix was written to
+close, one level down, and it is corrected to exact symbol equality.
 
 Rendering the real component is also not the same as reporting. Vercel supports
 props that silently change where events go, and two of them build cleanly in a
@@ -3792,9 +3800,12 @@ server layout:
 
 Both were green here while production telemetry went nowhere, and the second
 also defeats the Resilient Intake that is D-82's stated reason for requiring v2.
-`beforeSend` returning null discards every event too; it happens to fail the
-build, because a function prop cannot cross from a Server to a Client Component,
-but that is an accident of where the mount lives rather than a defence. D-82
+`beforeSend` returning null discards every event too. Under this repository's
+pinned build it failed, with "Functions cannot be passed directly to Client
+Components", but that is an observed property of this exact configuration rather
+than a universal rule: Vercel documents `beforeSend` inside `app/layout.tsx`.
+Either way, leaning on a neighbouring step to catch it would be leaning on an
+accident. D-82
 authorizes automatic page views and nothing else, so the authorized shape
 carries no configuration: zero attributes, which is also Vercel's documented
 baseline.
@@ -3817,7 +3828,8 @@ mount reachability  constant-false guard, ternary to null, flag guard,
                     function expression wrapper, arrow IIFE wrapper,
                     nested inside a div
 live-code scope     dead decoy function, dead decoy beside a real mount
-binding identity    local component shadowing an aliased real import
+binding identity    local component shadowing an aliased real import,
+                    same-name import from a different package entry
 behaviour config    mode=development, endpoint override, debug prop
 directive           "use client" bare, "use client" behind a comment
 dependency          devDependencies, "2.x", "^2.0.1", v1 major

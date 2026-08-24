@@ -70,23 +70,46 @@ const checker = program.getTypeChecker();
 const sourceFile = program.getSourceFile(layoutPath);
 if (!sourceFile) throw new Error("the root layout could not be loaded into the program");
 
-/** The declaration file a JSX tag's symbol ultimately comes from, or undefined. */
-function declaringFileOf(tagName) {
-  let symbol = checker.getSymbolAtLocation(tagName);
+/** Resolve a node to its underlying symbol, following import aliases. */
+function resolvedSymbolAt(node) {
+  const symbol = checker.getSymbolAtLocation(node);
   if (!symbol) return undefined;
-  if (symbol.flags & ts.SymbolFlags.Alias) {
-    symbol = checker.getAliasedSymbol(symbol);
-  }
-  const declaration = symbol?.getDeclarations()?.[0];
-  return declaration?.getSourceFile().fileName;
+  return symbol.flags & ts.SymbolFlags.Alias
+    ? checker.getAliasedSymbol(symbol)
+    : symbol;
 }
 
-/** True when this JSX node renders the real component from the Vercel package. */
+/**
+ * The symbol that `Analytics`, imported from "@vercel/analytics/next", denotes.
+ *
+ * Resolved from the import declaration itself rather than inferred from a
+ * declaration file path. An earlier version asked whether the resolved file
+ * name contained "@vercel/analytics", which establishes a filename and not an
+ * identity, and so was weaker than the sentence describing it, in exactly the
+ * way the two findings before it were.
+ */
+const expectedAnalyticsSymbol = (() => {
+  let found;
+  walk(sourceFile, (node) => {
+    if (!ts.isImportDeclaration(node)) return;
+    const specifier = node.moduleSpecifier;
+    if (!ts.isStringLiteral(specifier)) return;
+    if (specifier.text !== "@vercel/analytics/next") return;
+    const bindings = node.importClause?.namedBindings;
+    if (!bindings || !ts.isNamedImports(bindings)) return;
+    for (const element of bindings.elements) {
+      const exported = element.propertyName?.text ?? element.name.text;
+      if (exported === "Analytics") found = resolvedSymbolAt(element.name);
+    }
+  });
+  return found;
+})();
+
+/** True when this JSX node resolves to that exact symbol. Identity, not naming. */
 function isVercelAnalytics(node) {
   const opening = openingElementOf(node);
-  if (!opening) return false;
-  const file = declaringFileOf(opening.tagName);
-  return Boolean(file && file.includes("@vercel/analytics"));
+  if (!opening || !expectedAnalyticsSymbol) return false;
+  return resolvedSymbolAt(opening.tagName) === expectedAnalyticsSymbol;
 }
 
 function walk(node, visit) {
@@ -273,10 +296,12 @@ test("exactly one Analytics element is mounted, unconditionally, under <body>", 
   //
   // Both left this gate green while production telemetry went nowhere, and the
   // second also defeats the Resilient Intake that is D-82's stated reason for
-  // requiring v2. `beforeSend` returning null discards every event too; that
-  // one happens to fail the build, because a function prop cannot cross from a
-  // Server to a Client Component, but relying on that is relying on an accident
-  // of where the mount lives.
+  // requiring v2. `beforeSend` returning null discards every event too.
+  // Under this repository's pinned build that one failed, with "Functions
+  // cannot be passed directly to Client Components", but that is an observed
+  // property of this exact configuration rather than a universal rule: Vercel
+  // documents beforeSend inside app/layout.tsx. Leaning on a neighbouring step
+  // to catch it would be leaning on an accident either way.
   //
   // D-82 authorizes automatic page views and nothing else, so the shape it
   // authorizes carries no configuration at all. Zero attributes is the whole
