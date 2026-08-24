@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import tsNamespace from "@typescript/typescript6";
@@ -51,13 +52,42 @@ const packageJson = JSON.parse(
   await readFile(new URL("../package.json", import.meta.url), "utf8"),
 );
 
-const sourceFile = ts.createSourceFile(
-  "layout.tsx",
-  layoutSource,
-  ts.ScriptTarget.Latest,
-  /* setParentNodes */ true,
-  ts.ScriptKind.TSX,
+// A full Program, not a bare SourceFile, because the questions below are about
+// which SYMBOL a JSX tag resolves to, and only a TypeChecker can answer that.
+// Names are not identity: a local `function Analytics()` shadowing an aliased
+// real import satisfies every name-based rule while rendering the fake.
+const layoutPath = fileURLToPath(new URL("../app/layout.tsx", import.meta.url));
+const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+const configPath = ts.findConfigFile(projectRoot, ts.sys.fileExists, "tsconfig.json");
+if (!configPath) throw new Error("frontend/tsconfig.json not found");
+const parsedConfig = ts.parseJsonConfigFileContent(
+  ts.readConfigFile(configPath, ts.sys.readFile).config,
+  ts.sys,
+  projectRoot,
 );
+const program = ts.createProgram([layoutPath], parsedConfig.options);
+const checker = program.getTypeChecker();
+const sourceFile = program.getSourceFile(layoutPath);
+if (!sourceFile) throw new Error("the root layout could not be loaded into the program");
+
+/** The declaration file a JSX tag's symbol ultimately comes from, or undefined. */
+function declaringFileOf(tagName) {
+  let symbol = checker.getSymbolAtLocation(tagName);
+  if (!symbol) return undefined;
+  if (symbol.flags & ts.SymbolFlags.Alias) {
+    symbol = checker.getAliasedSymbol(symbol);
+  }
+  const declaration = symbol?.getDeclarations()?.[0];
+  return declaration?.getSourceFile().fileName;
+}
+
+/** True when this JSX node renders the real component from the Vercel package. */
+function isVercelAnalytics(node) {
+  const opening = openingElementOf(node);
+  if (!opening) return false;
+  const file = declaringFileOf(opening.tagName);
+  return Boolean(file && file.includes("@vercel/analytics"));
+}
 
 function walk(node, visit) {
   visit(node);
@@ -179,17 +209,18 @@ test("exactly one Analytics element is mounted, unconditionally, under <body>", 
       "render tree to scope these assertions to",
   );
 
-  // Scoped to the default export, so unreachable code cannot answer for it.
+  // Scoped to the default export, so unreachable code cannot answer for it, and
+  // identified by resolved symbol, so a local component of the same name cannot.
   const mounts = [];
   walk(rootLayout, (node) => {
-    if (tagNameOf(node) === "Analytics") mounts.push(node);
+    if (isVercelAnalytics(node)) mounts.push(node);
   });
 
   // Nothing outside the render tree may claim to be the mount either. A decoy
   // elsewhere in the file is not a second mount, it is a misleading one.
   let mountsAnywhere = 0;
   walk(sourceFile, (node) => {
-    if (tagNameOf(node) === "Analytics") mountsAnywhere += 1;
+    if (isVercelAnalytics(node)) mountsAnywhere += 1;
   });
   assert.equal(
     mountsAnywhere,
@@ -231,6 +262,35 @@ test("exactly one Analytics element is mounted, unconditionally, under <body>", 
     parent.openingElement.tagName.getText(sourceFile),
     "body",
     "<Analytics /> must be a direct child of <body>",
+  );
+
+  // Rendering the real component is not the same as reporting. Vercel supports
+  // props that silently change where events go or whether they are sent at all,
+  // and two of them pass a build cleanly in a server layout:
+  //
+  //     <Analytics mode="development" />                  logs instead of sending
+  //     <Analytics endpoint="https://example.invalid" />  overrides intake
+  //
+  // Both left this gate green while production telemetry went nowhere, and the
+  // second also defeats the Resilient Intake that is D-82's stated reason for
+  // requiring v2. `beforeSend` returning null discards every event too; that
+  // one happens to fail the build, because a function prop cannot cross from a
+  // Server to a Client Component, but relying on that is relying on an accident
+  // of where the mount lives.
+  //
+  // D-82 authorizes automatic page views and nothing else, so the shape it
+  // authorizes carries no configuration at all. Zero attributes is the whole
+  // rule, and it is Vercel's documented baseline.
+  const opening = openingElementOf(mounts[0]);
+  const attributes = opening.attributes.properties;
+  assert.equal(
+    attributes.length,
+    0,
+    "<Analytics /> must carry no props; D-82 authorizes automatic page views " +
+      "only, and props such as mode, endpoint or beforeSend redirect or " +
+      `discard telemetry while everything still builds. Found: ${attributes
+        .map((attribute) => attribute.name?.getText(sourceFile) ?? "spread")
+        .join(", ")}`,
   );
 });
 

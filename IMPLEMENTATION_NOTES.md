@@ -3755,7 +3755,7 @@ is a direct JSX child of `<body>`, which is Vercel's documented layout. Anything
 wrapped, deferred, or conditional fails by construction rather than by
 enumeration.
 
-**A seventh hole, and the last one.** The AST rewrite fixed which node counts
+**A seventh hole.** The AST rewrite fixed which node counts
 as a mount but not where the gate looked for one. Every structural assertion
 walked the whole `SourceFile`, so an unreferenced top-level function
 
@@ -3773,8 +3773,38 @@ finding in the same review: the import check compared the local binding, so
 `import { track as Analytics }` passed; it now compares the original exported
 symbol.
 
-**Verification, at the successor SHA.** Twenty-two adversarial mutations across
-six semantic classes were exercised. Every one was confirmed applied by a
+**An eighth and a ninth, both semantic rather than syntactic.** Names are not
+identity. A local `function Analytics()` shadowing an aliased real import
+satisfied every name-based rule while the fake rendered, and the tsconfig does
+not set `noUnusedLocals`, so the unused real import raised nothing. The gate now
+builds a full `Program` and asks the `TypeChecker` which symbol a JSX tag
+resolves to, requiring it to declare from `@vercel/analytics`. That closes
+aliasing and shadowing as a category rather than as two more names to forbid.
+
+Rendering the real component is also not the same as reporting. Vercel supports
+props that silently change where events go, and two of them build cleanly in a
+server layout:
+
+```text
+<Analytics mode="development" />                  logs instead of sending
+<Analytics endpoint="https://example.invalid" />  overrides intake
+```
+
+Both were green here while production telemetry went nowhere, and the second
+also defeats the Resilient Intake that is D-82's stated reason for requiring v2.
+`beforeSend` returning null discards every event too; it happens to fail the
+build, because a function prop cannot cross from a Server to a Client Component,
+but that is an accident of where the mount lives rather than a defence. D-82
+authorizes automatic page views and nothing else, so the authorized shape
+carries no configuration: zero attributes, which is also Vercel's documented
+baseline.
+
+**No claim is made that this is the last hole.** Seven previous fixes were each
+correct and each left a further class open, and the count of rejected mutations
+says nothing about the classes nobody thought to try.
+
+**Verification, at the successor SHA.** Twenty-three adversarial mutations across
+eight semantic classes were exercised. Every one was confirmed applied by a
 changed digest, rejected by the gate, and restored byte-identically, with the
 baseline green before and after:
 
@@ -3787,6 +3817,8 @@ mount reachability  constant-false guard, ternary to null, flag guard,
                     function expression wrapper, arrow IIFE wrapper,
                     nested inside a div
 live-code scope     dead decoy function, dead decoy beside a real mount
+binding identity    local component shadowing an aliased real import
+behaviour config    mode=development, endpoint override, debug prop
 directive           "use client" bare, "use client" behind a comment
 dependency          devDependencies, "2.x", "^2.0.1", v1 major
 ```
