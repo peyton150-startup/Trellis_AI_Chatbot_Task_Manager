@@ -1323,13 +1323,20 @@ def test_a_model_emitted_bulk_call_reaches_the_database(db):
         assert len(_events_for(db, task.id)) == 2
 
 
-def test_the_two_or_more_threshold_is_stated_numerically_on_both_surfaces():
-    """The routing threshold is a number, and words are not a substitute for it.
+def test_the_two_or_more_threshold_is_pinned_on_both_model_surfaces():
+    """The routing threshold is pinned as the phrase the model actually reads.
 
     The description test above asserts "same", "one" and "update_task". Every
     one of those survives a silent edit from "two or more" to "five or more",
-    which would change routing without failing anything. The number is the
-    contract, so the number is what gets pinned.
+    which would change routing without failing anything. The threshold is the
+    contract, so the threshold is what gets pinned.
+
+    It pins the word form, which is the form the source uses on both surfaces.
+    An earlier name said "numerically" and claimed more precision than the
+    assertion has: rewriting "two or more" as "2 or more" would fail this test
+    without changing behaviour. That is a false rejection, not a silent bypass,
+    and it is the safer direction to err in, so the name was corrected rather
+    than the assertion widened.
 
     Both surfaces are checked because the model sees both and they can drift
     apart. `SYSTEM_PROMPT` is the standing instruction; the tool description is

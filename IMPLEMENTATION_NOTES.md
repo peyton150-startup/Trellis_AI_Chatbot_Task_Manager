@@ -3707,3 +3707,65 @@ titles, notes, prompts, and tool arguments must never leave as event data.
 Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
 HIGH. Findings and their dispositions are recorded in PR #62. D-82 postdates
 that review and its own follow-up review is owed at the final SHA.
+
+### D-82 post-implementation hardening, at `68614ff` and its successor
+
+The section above is the D-82 implementation record and its counts remain
+correct for the SHA it names. It is not the whole decision: four later commits
+carrying the D-82 label changed what the gate proves, and this section records
+that rather than editing history to look as though it arrived complete.
+
+**What changed after the implementation SHA.** Two boundary tests were added to
+`test_d79_bulk_update.py`, so the backend suite that section calls unchanged did
+subsequently move: 604 to 606, and the D-79 file 63 to 65. The routing threshold
+and the 3-allowed/4-gated approval edge were only asserted in words that survive
+a numeric change; they are now pinned on both model-facing surfaces and on both
+sides of the edge. No production code changed in any of it.
+
+**The contract gate was wrong six times, and every hole was a false green.** The
+M1 to M5 table above was taken against a hand-written lexer, and it read as
+complete while the gate could be satisfied with no Analytics component mounted
+at all:
+
+```text
+1  a mention inside a comment counted as a mount
+2  {`<Analytics />`} in a template literal counted as a mount
+3  an import inside a multiline template literal counted as the real import
+4  "use client" hidden behind a leading comment escaped the check
+5  {false && <Analytics />} passed every assertion AND compiled under
+   next build, so the whole D82 job was green while nothing rendered
+6  <body data-decoy={/<Analytics \/>/.source}> hid a mount in a regular
+   expression literal, whose > was also mistaken for the end of the
+   <body> opening tag
+```
+
+Each fix closed one lexical case and the next arrived. That is the signal the
+approach was wrong, not that the cases were unlucky. The gate now parses a real
+AST via `@typescript/typescript6`, Microsoft's supported side-by-side parser for
+TS7 projects, added as an exact-pinned devDependency. The application still
+compiles with typescript 7.0.2; the parser is test-only. Reachability is decided
+by walking parents to `<body>` and rejecting any conditional, binary, call, or
+arrow expression on the way, rather than by counting braces.
+
+**Verification, at the successor SHA.** Sixteen adversarial mutations across
+five semantic classes were exercised. Every one was confirmed applied by a
+changed digest, rejected by the gate, and restored byte-identically, with the
+baseline green before and after:
+
+```text
+import              bare entry, deleted, multiline template decoy
+mount syntax        duplicated, outside body, template literal decoy,
+                    regular expression literal decoy
+mount reachability  constant-false guard, ternary to null, flag guard
+directive           "use client" bare, "use client" behind a comment
+dependency          devDependencies, "2.x", "^2.0.1", v1 major
+```
+
+Reported as classes rather than a ratio on purpose. Three successive tables here
+read as complete while missing the class that mattered, and a denominator hides
+exactly that.
+
+**Limitations that remain.** The AST removes the lexical arms race; it does not
+prove the component renders at runtime, only that it is mounted unconditionally
+in the source tree. Production intake and dashboard ingestion are still
+UNVERIFIED and still require a deployment to establish.

@@ -2,33 +2,46 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import tsNamespace from "@typescript/typescript6";
+
 /**
  * D-82 contract regression for the Vercel Web Analytics integration.
  *
- * On the parser choice, because the obvious one is not available here. The
- * repository pins typescript 7.0.2, whose only stable export is the version
- * string: the AST lives behind `typescript/unstable/ast`, and the export name
- * is the maintainers saying not to depend on it. A named CI gate that breaks on
- * an upstream refactor of an explicitly unstable API is worse than no gate,
- * and adding a second parser would add a framework this project does not
- * otherwise need. So this reads source text.
+ * This parses the root layout into a real AST. An earlier version of this file
+ * did not, and the history is the argument for why it now does.
  *
- * Naive grep over raw source fails in three specific ways, and all three are
- * handled below by stripping comments and string literals before matching.
- * Without that, a mention of <Analytics /> inside a comment like this one
- * counts as a mount, a second real mount is invisible to a boolean match, and
- * an import written inside a string passes as the real thing.
+ * The repository compiles with typescript 7.0.2, whose only stable export is a
+ * version string: its AST sits behind `typescript/unstable/ast`, and that name
+ * is the maintainers saying not to depend on it. The first attempt at this gate
+ * used it anyway, failed to load, and was replaced with a hand-written lexer
+ * that blanked comments and string literals before matching text.
  *
- * The failures this protects against are all silent. Two mounts double every
- * page view without erroring. Importing from "@vercel/analytics" rather than
- * "@vercel/analytics/next" builds cleanly and then misses App Router
- * navigations. A "use client" directive added to the root layout for unrelated
- * reasons converts the whole tree to a client component, a large regression no
- * analytics assertion would otherwise notice.
+ * That lexer was wrong six times, and each hole was found by attacking the gate
+ * rather than running it. Every one let the gate report green while no
+ * Analytics component rendered at all:
  *
- * What it deliberately does not claim: that the page view reaches Vercel. A
+ *   1. a mention inside a comment counted as a mount
+ *   2. a `{`<Analytics />`}` template literal counted as a mount
+ *   3. an import inside a multiline template literal counted as the real import
+ *   4. `"use client"` hidden behind a leading comment escaped the check
+ *   5. `{false && <Analytics />}` satisfied every textual assertion, and
+ *      compiled under `next build`, while never rendering
+ *   6. `<body data-decoy={/<Analytics \/>/.source}>` hid a mount inside a
+ *      regular-expression literal, which the lexer did not model, and its `>`
+ *      was even mistaken for the end of the <body> opening tag
+ *
+ * Each fix closed one lexical case and the next case arrived. JavaScript has
+ * more of them than a test should own: nested templates, escapes, division
+ * versus regex ambiguity. `@typescript/typescript6` is Microsoft's supported
+ * side-by-side parser for exactly this situation, published so TS7 projects can
+ * still use the TS6 programmatic API. Used here for the test only; the
+ * application still compiles with typescript 7.0.2.
+ *
+ * What it deliberately does not claim: that a page view reaches Vercel. A
  * passing build proves integration, never ingestion. See D-82.
  */
+
+const ts = tsNamespace.default ?? tsNamespace;
 
 const layoutSource = await readFile(
   new URL("../app/layout.tsx", import.meta.url),
@@ -38,78 +51,29 @@ const packageJson = JSON.parse(
   await readFile(new URL("../package.json", import.meta.url), "utf8"),
 );
 
-/**
- * Blank out comments, and optionally the contents of string and template
- * literals, so that a match is against code rather than prose. Replacements are
- * spaces of equal length with newlines preserved, so every offset stays valid
- * for the <body> containment check.
- *
- * Two passes exist because the two questions need different inputs. Counting
- * JSX mounts must not see inside literals, or a template literal containing the
- * text of a component counts as a mount. Matching the import must still see
- * inside literals, because the module specifier IS a string.
- */
-function blankOut(source, { literals }) {
-  let out = "";
-  let index = 0;
-  const blank = (text) => text.replace(/[^\n]/g, " ");
+const sourceFile = ts.createSourceFile(
+  "layout.tsx",
+  layoutSource,
+  ts.ScriptTarget.Latest,
+  /* setParentNodes */ true,
+  ts.ScriptKind.TSX,
+);
 
-  while (index < source.length) {
-    const two = source.slice(index, index + 2);
-
-    if (two === "/*") {
-      const end = source.indexOf("*/", index + 2);
-      const stop = end === -1 ? source.length : end + 2;
-      out += blank(source.slice(index, stop));
-      index = stop;
-      continue;
-    }
-
-    if (two === "//") {
-      const end = source.indexOf("\n", index);
-      const stop = end === -1 ? source.length : end;
-      out += blank(source.slice(index, stop));
-      index = stop;
-      continue;
-    }
-
-    const quote = source[index];
-    if (quote === '"' || quote === "'" || quote === "`") {
-      let cursor = index + 1;
-      while (cursor < source.length) {
-        if (source[cursor] === "\\") {
-          cursor += 2;
-          continue;
-        }
-        if (source[cursor] === quote) break;
-        cursor += 1;
-      }
-      const stop = Math.min(cursor + 1, source.length);
-      if (literals === "blank") {
-        // Keep the quote characters, blank what is between them.
-        out += quote + blank(source.slice(index + 1, stop - 1)) + quote;
-      } else {
-        out += source.slice(index, stop);
-      }
-      index = stop;
-      continue;
-    }
-
-    out += source[index];
-    index += 1;
-  }
-
-  return out;
+function walk(node, visit) {
+  visit(node);
+  ts.forEachChild(node, (child) => walk(child, visit));
 }
 
-// For JSX structure: literals blanked, so a decoy inside a template literal
-// cannot masquerade as a mount. An earlier version of this file kept literal
-// contents, and a `{`<Analytics />`}` decoy with the real mount deleted passed
-// all four assertions. That is a gate reporting green over a broken contract,
-// which is worse than having no gate.
-const structure = blankOut(layoutSource, { literals: "blank" });
-// For the import: literals kept, because the module specifier is a string.
-const statements = blankOut(layoutSource, { literals: "keep" });
+function openingElementOf(node) {
+  if (ts.isJsxSelfClosingElement(node)) return node;
+  if (ts.isJsxElement(node)) return node.openingElement;
+  return undefined;
+}
+
+function tagNameOf(node) {
+  const opening = openingElementOf(node);
+  return opening ? opening.tagName.getText(sourceFile) : undefined;
+}
 
 test("Analytics is a production dependency, exact-pinned, at major 2 or later", () => {
   const pinned = packageJson.dependencies?.["@vercel/analytics"];
@@ -121,15 +85,11 @@ test("Analytics is a production dependency, exact-pinned, at major 2 or later", 
   );
 
   // Only assert the exact-pin convention while the repository still follows it
-  // everywhere else. Asserting it unconditionally would turn a deliberate
-  // project-wide policy change into a failure in this one unrelated test.
-  //
-  // The exclusion of @vercel/analytics itself is the whole point. An earlier
-  // version tested every dependency including this one, which made the guard
-  // self-defeating: loosening this pin to "2.x" also made the guard false, so
-  // the assertion that exists to catch exactly that mutation was skipped
-  // instead of failing. Found by mutating the pin and watching the gate stay
-  // green.
+  // everywhere else, so a deliberate project-wide policy change does not fail
+  // here. The package under test is excluded from that sample on purpose: an
+  // earlier version included it, which made the guard self-defeating, because
+  // loosening this pin to "2.x" also made the guard false and skipped the
+  // assertion written to catch exactly that.
   const everyOtherDependencyIsPinned = Object.entries(packageJson.dependencies)
     .filter(([name]) => name !== "@vercel/analytics")
     .every(([, range]) => /^\d+\.\d+\.\d+$/.test(range));
@@ -150,44 +110,37 @@ test("Analytics is a production dependency, exact-pinned, at major 2 or later", 
 });
 
 test("Analytics is imported as a named import from the Next.js entry point", () => {
-  // Locate import STATEMENTS in the literal-blanked source, so a line inside a
-  // multiline template literal cannot pose as one. Anchoring at line start is
-  // not enough on its own: with the `m` flag, every line of a template literal
-  // begins a line too, and an earlier version of this test accepted
-  //
-  //     const decoy = `
-  //     import { Analytics } from "@vercel/analytics/next";
-  //     `;
-  //
-  // as the real import while the real import was deleted. Blanking preserves
-  // offsets, so the specifier is recovered from the original source at the same
-  // span, which is what makes matching on the blanked copy safe here.
-  const statementPattern = /^import\s*\{([^}]*)\}\s*from\s*["'][^"']*["']/gm;
-  const found = [];
-  for (const match of structure.matchAll(statementPattern)) {
-    const names = match[1].split(",").map((name) => name.trim());
-    if (!names.includes("Analytics")) continue;
-    const real = layoutSource.slice(match.index, match.index + match[0].length);
-    const specifier = /from\s*["']([^"']*)["']/.exec(real)?.[1] ?? "";
-    if (!specifier.startsWith("@vercel/analytics")) continue;
-    found.push(specifier.slice("@vercel/analytics".length));
-  }
+  const imports = [];
+  walk(sourceFile, (node) => {
+    if (!ts.isImportDeclaration(node)) return;
+    const specifier = node.moduleSpecifier;
+    if (!ts.isStringLiteral(specifier)) return;
+    const bindings = node.importClause?.namedBindings;
+    if (!bindings || !ts.isNamedImports(bindings)) return;
+    for (const element of bindings.elements) {
+      if (element.name.text === "Analytics") imports.push(specifier.text);
+    }
+  });
 
   assert.equal(
-    found.length,
+    imports.length,
     1,
-    `the root layout must import Analytics exactly once, found ${found.length}`,
+    `the root layout must import Analytics exactly once, found ${imports.length}`,
   );
   assert.equal(
-    found[0],
-    "/next",
+    imports[0],
+    "@vercel/analytics/next",
     'Analytics must come from "@vercel/analytics/next"; the bare package entry ' +
       "builds cleanly and then misses App Router navigations",
   );
 });
 
-test("exactly one Analytics element is mounted, and it is under <body>", () => {
-  const mounts = [...structure.matchAll(/<Analytics(\s|\/|>)/g)];
+test("exactly one Analytics element is mounted, unconditionally, under <body>", () => {
+  const mounts = [];
+  walk(sourceFile, (node) => {
+    if (tagNameOf(node) === "Analytics") mounts.push(node);
+  });
+
   assert.equal(
     mounts.length,
     1,
@@ -195,63 +148,49 @@ test("exactly one Analytics element is mounted, and it is under <body>", () => {
       "second mount double-counts every page view without erroring",
   );
 
-  const bodyOpen = structure.indexOf("<body");
-  const bodyClose = structure.indexOf("</body>");
-  assert.ok(bodyOpen !== -1 && bodyClose !== -1, "the layout must render <body>");
-  assert.ok(
-    mounts[0].index > bodyOpen && mounts[0].index < bodyClose,
-    "<Analytics /> must be mounted beneath <body>",
-  );
-
-  // Being inside <body> is not the same as rendering. Text position alone
-  // accepts an element that never mounts:
-  //
-  //     {false && <Analytics />}
-  //
-  // which satisfied every other assertion here AND compiled under `next build`,
-  // so the whole D82 job reported green while Trellis sent no page views. That
-  // is the worst failure this gate can have, because nothing anywhere is red.
-  //
-  // Depth is counted from the end of the <body> opening tag, over the
-  // literal-blanked copy, so braces inside comments or strings do not register
-  // and attribute braces on <body> itself are excluded. A child rendered
-  // unconditionally sits at depth zero; `{children}` opens and closes before
-  // reaching this point, so it nets out. Anything still open at the mount means
-  // the element is the value of a JavaScript expression, which is exactly the
-  // conditional-render class this rejects.
-  const bodyTagEnd = structure.indexOf(">", bodyOpen);
-  assert.notEqual(bodyTagEnd, -1, "the <body> opening tag must be closed");
-
-  let depth = 0;
-  for (let index = bodyTagEnd + 1; index < mounts[0].index; index += 1) {
-    if (structure[index] === "{") depth += 1;
-    else if (structure[index] === "}") depth -= 1;
+  // Walk up to <body>, and reject any JavaScript expression on the way. Being
+  // inside <body> is not the same as rendering: a conditional mount compiles
+  // and reads correctly while never appearing. A JSX child sits directly in its
+  // parent element; anything wrapped in a conditional, a logical operator, or a
+  // call is the value of an expression instead, which is what this rejects.
+  let node = mounts[0].parent;
+  let reachedBody = false;
+  while (node) {
+    if (
+      ts.isConditionalExpression(node) ||
+      ts.isBinaryExpression(node) ||
+      ts.isCallExpression(node) ||
+      ts.isArrowFunction(node)
+    ) {
+      assert.fail(
+        "<Analytics /> must be mounted unconditionally; it is inside a " +
+          `${ts.SyntaxKind[node.kind]}, which compiles and passes every ` +
+          "textual check while it may never render",
+      );
+    }
+    if (tagNameOf(node) === "body") {
+      reachedBody = true;
+      break;
+    }
+    node = node.parent;
   }
 
-  assert.equal(
-    depth,
-    0,
-    "<Analytics /> must be mounted unconditionally, not inside a JSX " +
-      "expression; a conditional or constant-false mount compiles and passes " +
-      "every textual check while never rendering",
-  );
+  assert.ok(reachedBody, "<Analytics /> must be mounted beneath <body>");
 });
 
 test("the root layout was not converted to a client component", () => {
-  // Run against the comment-stripped source, because a comment does not stop a
-  // directive from being a directive. An earlier version took the first
-  // non-blank line of the raw source, so
-  //
-  //     // innocent leading comment
-  //     "use client";
-  //
-  // hid the directive behind the comment and the assertion passed. Comments are
-  // blanked to whitespace here, so leading trivia cannot conceal it. Not
-  // multiline: the prologue is only at the start of the module.
-  const hasUseClientDirective = /^\s*["']use client["']\s*;?/.test(statements);
+  // A directive is a string-literal expression statement in the prologue, so
+  // leading comments cannot conceal it and a matching string elsewhere in the
+  // file cannot fake it.
+  const directives = [];
+  for (const statement of sourceFile.statements) {
+    if (!ts.isExpressionStatement(statement)) break;
+    if (!ts.isStringLiteral(statement.expression)) break;
+    directives.push(statement.expression.text);
+  }
 
   assert.equal(
-    hasUseClientDirective,
+    directives.includes("use client"),
     false,
     'the root layout must stay a server component; "@vercel/analytics/next" ' +
       'is the maintained integration and needs no "use client" here',
