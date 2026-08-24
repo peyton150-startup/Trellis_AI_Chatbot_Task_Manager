@@ -3,10 +3,20 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
 load_dotenv()
+
+
+# D-81. The authorized reasoning ceiling. A configuration may ask for less so the
+# budget can be measured downwards later, and may never ask for more.
+MODEL_REASONING_BUDGET_CEILING = 6000
+
+# The generation allowance reserved for tool JSON and visible output after
+# reasoning has taken its share. Sized against the largest tool call this system
+# can legitimately emit, which carries fifty task ids.
+MODEL_OUTPUT_HEADROOM_MIN = 4096
 
 
 class Settings(BaseModel):
@@ -22,6 +32,8 @@ class Settings(BaseModel):
     tool_timeout_seconds: int
     model_timeout_seconds: int
     max_tool_retries: int
+    model_reasoning_budget: int
+    model_max_tokens: int
     approval_ttl_seconds: int
     lease_ttl_seconds: int
 
@@ -46,6 +58,50 @@ class Settings(BaseModel):
     linear_inbox_max_attempts: int
     linear_http_timeout_seconds: int
     linear_worker_poll_seconds: int
+
+    @field_validator("model_reasoning_budget")
+    @classmethod
+    def _reasoning_budget_within_the_authorized_ceiling(cls, value: int) -> int:
+        """D-81. 6000 is an application ceiling, not merely a default.
+
+        NVIDIA's hosted endpoint defaults `reasoning_budget` to 16384, so
+        omitting it leaves a provider default in charge of how long Trellis
+        spends thinking before it can act. This makes the limit Trellis-owned.
+
+        Lower values are allowed so the budget can be measured downwards later.
+        Higher ones are refused outright rather than clamped: silently accepting
+        8000 and sending 6000 would make the configuration and the wire disagree,
+        which is the kind of difference nobody notices until they are reading a
+        latency graph that makes no sense.
+        """
+        if not 1 <= value <= MODEL_REASONING_BUDGET_CEILING:
+            raise ValueError(
+                f"MODEL_REASONING_BUDGET must be between 1 and "
+                f"{MODEL_REASONING_BUDGET_CEILING}, got {value}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _reasoning_leaves_room_to_answer(self) -> "Settings":
+        """Reasoning and output share one generation allowance.
+
+        NVIDIA counts reasoning, tool-call JSON, and visible text against the
+        same `max_tokens`. A configuration where reasoning could consume the
+        whole allowance produces the specific failure of a model that thought
+        successfully and then had no room left to say or do anything, which
+        surfaces as `finish_reason="length"` with no answer.
+
+        The headroom is deliberately generous: the largest legitimate tool call
+        this system can emit carries fifty task ids.
+        """
+        headroom = self.model_max_tokens - self.model_reasoning_budget
+        if headroom < MODEL_OUTPUT_HEADROOM_MIN:
+            raise ValueError(
+                f"MODEL_MAX_TOKENS must exceed MODEL_REASONING_BUDGET by at "
+                f"least {MODEL_OUTPUT_HEADROOM_MIN} so reasoning cannot consume "
+                f"the whole generation allowance; got {headroom}"
+            )
+        return self
 
     @field_validator("trellis_public_origin")
     @classmethod
@@ -115,6 +171,8 @@ settings = Settings(
     tool_timeout_seconds=os.getenv("TOOL_TIMEOUT_SECONDS", "20"),
     model_timeout_seconds=os.getenv("MODEL_TIMEOUT_SECONDS", "45"),
     max_tool_retries=os.getenv("MAX_TOOL_RETRIES", "2"),
+    model_reasoning_budget=os.getenv("MODEL_REASONING_BUDGET", "6000"),
+    model_max_tokens=os.getenv("MODEL_MAX_TOKENS", "12288"),
     approval_ttl_seconds=os.getenv("APPROVAL_TTL_SECONDS", "300"),
     lease_ttl_seconds=os.getenv("LEASE_TTL_SECONDS", "120"),
     trellis_public_origin=os.getenv("TRELLIS_PUBLIC_ORIGIN", ""),

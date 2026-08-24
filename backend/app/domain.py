@@ -43,7 +43,12 @@ from psycopg.types.json import Json
 from pydantic import JsonValue
 
 from . import sql
-from .errors import OutOfScopeError, ValidationFailedError, VersionConflictError
+from .errors import (
+    AppendNotesLimitError,
+    BulkTargetCoverageError,
+    OutOfScopeError,
+    VersionConflictError,
+)
 from .limits import TASK_NOTES_MAX_CHARS
 from .models import (
     BulkUpdateTasksArgs,
@@ -298,8 +303,27 @@ def bulk_update_tasks(
 
     ``BulkUpdateTasksArgs`` has no expected-version field. The locked current
     version becomes each guarded UPDATE's expected version. Duplicate ids still
-    count at the policy layer under D-17, while SQL ``ANY`` semantics mutate one
+    count at the policy layer under D-17, while set membership mutates one
     physical row once.
+
+    D-79 replaced a loop that issued one guarded UPDATE per target with one
+    guarded UPDATE over the whole set. The guards did not change: the same owner
+    predicate and the same per-row version predicate decide every row, and a row
+    whose version moved still matches nothing. What changed is that the
+    expectations travel as a relation rather than as N separate statements.
+
+    State the improvement narrowly, because it is narrow. The number of task
+    UPDATE statements this module issues is constant with the target count,
+    N to 1. PostgreSQL still processes N target rows, and ``write_events``
+    still issues one audit INSERT per physical task, so the work the database
+    does has not become constant and this transaction has not become O(1) in
+    any sense worth claiming.
+
+    The audit rows are deliberately left alone rather than left alone because
+    they must be. PostgreSQL can insert many rows in one INSERT and RETURN
+    information for all of them, so batching them is possible; it is simply not
+    what this decision does, and it would have to prove per-task snapshot
+    fidelity and its own measured benefit first.
     """
     task_ids = _unique_ids(arguments.task_ids)
     if not task_ids:
@@ -308,21 +332,35 @@ def bulk_update_tasks(
     locked = _locked_tasks(owner_id, task_ids, conn=conn)
     _require_all_targets(task_ids, locked)
 
-    updated: list[Task] = []
-    events: list[PendingTaskEvent] = []
-    for task_id in task_ids:
-        before = locked[task_id]
-        row = conn.execute(
-            sql.UPDATE_TASK_GUARDED,
-            _update_parameters(owner_id, task_id, before.version, arguments),
-        ).fetchone()
-        if row is None:
-            raise VersionConflictError()
-        after = _task(row)
-        updated.append(after)
-        events.append(_updated_event(before, after))
+    # D-80. Append is a different execution mode, not a different value passed
+    # to the same statement, so it branches here. Everything above is shared:
+    # the same deduplication, the same canonical lock, the same coverage
+    # requirement. Everything below differs, because append needs a per-target
+    # effective value merged from locked state.
+    if arguments.append_notes is not None:
+        return _bulk_append_notes(owner_id, task_ids, locked, arguments, conn=conn)
 
-    return MutationResult(tasks=tuple(updated), events=tuple(events))
+    update_ids, expected_versions = _expected_relation(task_ids, locked)
+
+    rows = conn.execute(
+        sql.BULK_UPDATE_TASKS_GUARDED,
+        _bulk_update_parameters(owner_id, update_ids, expected_versions, arguments),
+    ).fetchall()
+
+    # RETURNING has no ordering to rely on, so the rows are keyed by id and the
+    # caller-visible order is rebuilt from the request. Coverage is the guard
+    # that replaces the old loop's per-statement `row is None`: anything short
+    # of every expected target means a row moved under the lock, and the caller
+    # transaction rolls back rather than committing a partial set.
+    updated_by_id = {task.id: task for task in (_task(row) for row in rows)}
+    if set(updated_by_id) != set(update_ids):
+        raise VersionConflictError()
+
+    updated = tuple(updated_by_id[task_id] for task_id in task_ids)
+    events = tuple(
+        _updated_event(locked[task_id], updated_by_id[task_id]) for task_id in task_ids
+    )
+    return MutationResult(tasks=updated, events=events)
 
 
 def delete_tasks(
@@ -712,11 +750,201 @@ def _update_parameters(
     # after which an update that never mentioned due_date clears it. Undo is the
     # one caller that legitimately sets every field, because restoring a complete
     # before snapshot is exactly what section 8 asks it to do.
-    fields = arguments.model_fields_set
     return {
         "id": task_id,
         "owner_id": owner_id,
         "expected_version": expected_version,
+        **_mutable_field_parameters(arguments),
+    }
+
+
+def _bulk_append_notes(
+    owner_id: UUID,
+    task_ids: Sequence[UUID],
+    locked: dict[UUID, Task],
+    arguments: BulkUpdateTasksArgs,
+    *,
+    conn: Connection,
+) -> MutationResult:
+    """Append one fragment to every locked target, all of them or none.
+
+    The model sends only its new text, exactly as D-78 established for a single
+    task, and each existing value comes from the row this transaction holds a
+    lock on. Nothing the model read earlier can be stale by the time the merge
+    happens, and a note the model never saw is not overwritten.
+
+    The ordering below is the whole contract. Every merged value is computed and
+    validated for the entire target set *before* the mutating statement runs, so
+    a set where nine merges fit and the tenth overflows commits nothing at all.
+    Merging and updating target by target would leave nine appended notes and a
+    failed run, which is precisely the partial outcome this decision exists to
+    remove, and it is what the per-task loop produced in practice.
+
+    `merge_appended_notes` is reused rather than reimplemented. The separator
+    rule is D-78's and there must be exactly one of it.
+    """
+    relation = _bulk_append_relation(task_ids, locked, arguments.append_notes)
+
+    rows = conn.execute(
+        sql.BULK_APPEND_NOTES_GUARDED,
+        {
+            "owner_id": owner_id,
+            "task_ids": [task_id for task_id, _, _ in relation],
+            "expected_versions": [version for _, version, _ in relation],
+            "effective_notes": [notes for _, _, notes in relation],
+        },
+    ).fetchall()
+
+    updated_by_id = {task.id: task for task in (_task(row) for row in rows)}
+    if set(updated_by_id) != {task_id for task_id, _, _ in relation}:
+        # Same fail-closed rule as the replacement path, but reported as the
+        # bulk-specific subtype: this caller supplied no expected version, so
+        # advice to refresh one and retry would be advice it cannot act on.
+        raise BulkTargetCoverageError()
+
+    updated = tuple(updated_by_id[task_id] for task_id in task_ids)
+    events = tuple(
+        _updated_event(locked[task_id], updated_by_id[task_id]) for task_id in task_ids
+    )
+    return MutationResult(tasks=updated, events=events)
+
+
+def _bulk_append_relation(
+    task_ids: Sequence[UUID],
+    locked: dict[UUID, Task],
+    fragment: str,
+) -> tuple[tuple[UUID, int, str], ...]:
+    """Merge and validate every target before any of them is written.
+
+    Returns one triple per distinct target, built as a single relation for the
+    reason `_expected_relation` records at length: three parallel arrays that
+    are assembled separately can disagree, and `unnest` NULL-pads rather than
+    refusing, so the mistake would surface later wearing the wrong name.
+
+    The size check runs against the merged value rather than the fragment. A
+    legal fragment can still produce an illegal note, and that is exactly the
+    case the schema cannot see.
+    """
+    relation = tuple(
+        (task_id, locked[task_id].version, merge_appended_notes(locked[task_id].notes, fragment))
+        for task_id in task_ids
+    )
+
+    if len(relation) != len(task_ids):
+        raise RuntimeError("bulk append built a relation of the wrong size")
+    if len({task_id for task_id, _, _ in relation}) != len(relation):
+        raise RuntimeError("bulk append built a duplicated expected target")
+    if any(version is None for _, version, _ in relation):
+        raise RuntimeError("bulk append built a null expected version")
+    if any(notes is None for _, _, notes in relation):
+        raise RuntimeError("bulk append built a null effective note")
+
+    # Every target is checked, and the first failure refuses the whole call.
+    # Truncating instead would silently discard the caller's text while still
+    # committing a version increment and an event, recording a mutation that
+    # does not say what happened.
+    for task_id, _, notes in relation:
+        if len(notes) > TASK_NOTES_MAX_CHARS:
+            raise AppendNotesLimitError(
+                f"appending would make one task's notes {len(notes)} characters, "
+                f"over the {TASK_NOTES_MAX_CHARS} limit; no task was changed"
+            )
+
+    return relation
+
+
+def _expected_relation(
+    task_ids: Sequence[UUID],
+    locked: dict[UUID, Task],
+) -> tuple[list[UUID], list[int]]:
+    """Build the id and expected-version arrays the bulk statement joins on.
+
+    One relation, unzipped, rather than two lists assembled side by side. The
+    arrays reach SQL as an expected-version lookup keyed by id, and if they ever
+    disagreed on length or order the statement would still run. `unnest` over
+    two arrays NULL-pads the shorter one rather than rejecting it, and
+    `version = NULL` matches no row, so a dropped expectation fails closed but
+    arrives disguised as a target-coverage conflict, which describes the wrong
+    problem and sends the reader to the wrong place.
+
+    Deriving both arrays from one canonical relation prevents ordinary
+    construction drift here. It does not make drift unwritable, because the two
+    arrays are separate values from the moment this function returns them, and
+    `_bulk_update_parameters` accepts them as independent arguments. So that
+    function reasserts equal cardinality on the values actually crossing into
+    SQL, and this one validates the construction. Two boundaries, two different
+    failures.
+
+    The checks below cover what deriving the arrays together cannot: that
+    nothing upstream handed this function a malformed target set. They are
+    defence in depth and are expected to be unreachable through
+    `bulk_update_tasks`, where `_unique_ids` and `_require_all_targets` have
+    already run. `RuntimeError` rather than a domain error is deliberate: a
+    failure here is a bug in this module, not a refusal the caller can act on.
+    """
+    expected_pairs = tuple((task_id, locked[task_id].version) for task_id in task_ids)
+    update_ids = [task_id for task_id, _ in expected_pairs]
+    expected_versions = [version for _, version in expected_pairs]
+
+    if not (
+        len(expected_pairs)
+        == len(update_ids)
+        == len(expected_versions)
+        == len(task_ids)
+    ):
+        raise RuntimeError("bulk update built an expected relation of the wrong size")
+    if len(set(update_ids)) != len(update_ids):
+        # Trellis must ensure at most one expected source row joins each target
+        # row. PostgreSQL does not reject an UPDATE ... FROM whose join matches
+        # several source rows: it uses one of them, and which one is not
+        # predictable. So the uniqueness is this module's obligation, not
+        # something the database will refuse on our behalf.
+        raise RuntimeError("bulk update built a duplicated expected target")
+    if any(task_id is None for task_id in update_ids):
+        raise RuntimeError("bulk update built a null expected target")
+    if any(version is None for version in expected_versions):
+        raise RuntimeError("bulk update built a null expected version")
+
+    return update_ids, expected_versions
+
+
+def _bulk_update_parameters(
+    owner_id: UUID,
+    task_ids: Sequence[UUID],
+    expected_versions: Sequence[int],
+    arguments: BulkUpdateTasksArgs,
+) -> dict[str, object]:
+    """Bind one bulk statement, sharing the field rules with the single update.
+
+    The SET list is the only thing the two statements have in common that could
+    drift, and drift here is invisible: a bulk call that stopped honouring the
+    omitted-versus-null contract would clear due dates nobody mentioned while
+    every single-task test stayed green. One builder makes that impossible to
+    do by halves.
+
+    This is also the last boundary before the arrays become SQL parameters, and
+    it is the only place that sees the exact values being bound. `unnest` over
+    two arrays NULL-pads the shorter one instead of rejecting it, so unequal
+    lengths would execute and fail closed somewhere else, described as
+    something else. `_expected_relation` validates its own construction; this
+    validates what is actually crossing the boundary, whoever built it.
+    """
+    if len(task_ids) != len(expected_versions):
+        raise RuntimeError("bulk update id/version relation length mismatch")
+
+    return {
+        "owner_id": owner_id,
+        "task_ids": list(task_ids),
+        "expected_versions": list(expected_versions),
+        **_mutable_field_parameters(arguments),
+    }
+
+
+def _mutable_field_parameters(
+    arguments: UpdateTaskArgs | BulkUpdateTasksArgs,
+) -> dict[str, object]:
+    fields = arguments.model_fields_set
+    return {
         "title": arguments.title if "title" in fields else None,
         "notes": arguments.notes if "notes" in fields else None,
         "due_date": arguments.due_date,
@@ -783,7 +1011,13 @@ def _effective_update(
         # Refuse rather than truncate. Truncation would silently discard the
         # caller's text and still commit a version increment and an event,
         # recording a mutation that does not say what happened.
-        raise ValidationFailedError(
+        #
+        # D-80 narrowed the type. This is still a VALIDATION_ERROR with the same
+        # 422, so no code was added, but the single-task and bulk append paths
+        # now raise one recognisable class for the same condition, which is what
+        # lets the model adapter treat this one validation failure as terminal
+        # without treating every validation failure that way.
+        raise AppendNotesLimitError(
             f"appending would make notes {len(merged)} characters, over the "
             f"{TASK_NOTES_MAX_CHARS} limit"
         )

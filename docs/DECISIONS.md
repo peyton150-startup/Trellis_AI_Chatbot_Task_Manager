@@ -4080,3 +4080,583 @@ This decision authorizes no migration, table, column, endpoint, status value,
 error code, dependency, or tool. It changes no policy, approval, idempotency, or
 undo semantics. It does not alter the D-74 ceilings, and it adds no bulk
 capability: `bulk_update_tasks` is untouched.
+
+### D-79: one guarded set-based UPDATE for a whole bulk call
+
+`bulk_update_tasks` presents itself to the model as one operation, and underneath
+it was a loop. It locked the whole target set in one statement, then issued one
+`UPDATE_TASK_GUARDED` per task. Fifty targets meant fifty task UPDATE statements
+plus fifty audit inserts, so the cost of the mutation grew with the size of the
+set the model happened to name, for a request the model expressed once.
+
+D-79 changes the statement shape and the routing that leads to it. It does not
+change what the tool means, what it guards, or how many tools exist.
+
+1. **No new tool.** The model-facing surface is the same eight tools it was
+   before. A `bulk_update_tasks_v2` would have made the model choose between two
+   spellings of one capability, which is a routing problem dressed as a
+   performance fix. What was actually wrong was that a same-patch request over
+   several tasks reads just as naturally as several `update_task` calls, so the
+   tool description and the system prompt now say which one to send: two or more
+   tasks receiving the *same* change is one bulk call; different values per task
+   is not a bulk update at all.
+
+2. **`BULK_UPDATE_TASKS_GUARDED` replaces the loop.** The expected versions
+   travel as a relation, rebuilt inside the statement by `unnest` over two
+   parallel arrays, and one `UPDATE ... FROM` applies them. The guards are
+   unchanged: the same owner predicate and the same per-row
+   `version = expected_version` predicate decide every row, and a row whose
+   version moved still matches nothing and still refuses the whole call.
+
+   State the improvement narrowly. What becomes constant with the target count
+   is the number of task UPDATE statements the application issues, N to 1.
+   PostgreSQL still processes N target rows, and D-79 still issues one audit
+   INSERT per physical task, so this is not an O(1) transaction and the phrase
+   is not used. "Core SQL" in the benchmark below counts application-issued
+   statements only; it excludes PostgreSQL's internal work, per-row processing,
+   trigger execution, and planner and executor cost.
+
+   Structural result, exact and durable:
+
+   ```text
+   50 targets: task UPDATE statements  50 -> 1
+   ```
+
+   Environment-specific results, PostgreSQL 16.12, `read committed`, thirty
+   iterations, fifty targets, loop against set-based:
+
+   ```text
+                          core SQL     median              p95
+   at 1caf13a             101 -> 52    153.21 -> 90.56 ms  217.04 -> 127.82 ms
+   at the hardening SHA   101 -> 52    261.32 -> 153.47 ms 450.29 -> 189.37 ms
+   ```
+
+   Both runs are reported rather than one, because the second is the honest
+   picture. Every absolute figure rose between them, the unchanged loop baseline
+   included. That is consistent with environmental and runtime variability
+   rather than with a cost introduced by the hardening, since the baseline that
+   rose alongside it was not modified at all; the benchmark does not establish
+   the exact cause and none is claimed. What reproduces is the ratio, 1.69x and
+   then 1.70x at fifty targets, and the statement counts, which are identical.
+
+   Read the absolute numbers as belonging to the run that produced them and to
+   nothing else. The durable claim is the statement count; the timing is
+   evidence that it matters on one machine, not a specification. At a single
+   target there is no gain and none is claimed.
+
+3. **Audit rows stay one per task, by choice rather than by necessity.**
+   `write_events` remains an N-insert loop, and each event carries its own exact
+   `before`, the row this transaction locked, and its own exact `after`, the row
+   the statement returned.
+
+   The earlier phrasing here claimed there was nothing to batch without losing
+   that fidelity. That was wrong and is corrected: PostgreSQL can insert several
+   rows in one `INSERT` and can `RETURNING` information for all of them, so
+   distinct per-task snapshots do not inherently require N commands. Batching is
+   therefore deferred, not impossible. A separate optimization would have to
+   prove the exact per-task `before` and `after`, event identity, actor, tool
+   and run correlation, any ordering consumers rely on, trigger behaviour,
+   atomic failure behaviour, and a measured benefit. None of that is in scope
+   here.
+
+4. **The expected relation is guarded at two boundaries.** `unnest` over two
+   arrays does not reject unequal lengths; it NULL-pads the shorter one, and
+   `version = NULL` matches no row. A dropped expectation therefore fails closed
+   but arrives disguised as a target-coverage conflict, which describes the
+   wrong problem.
+
+   Deriving both arrays from one tuple of pairs prevents ordinary construction
+   drift, and `_expected_relation` refuses a malformed set, a duplicated target,
+   or a null member with `RuntimeError`. That is not sufficient on its own: the
+   two arrays are separate values from the moment that function returns, and
+   `_bulk_update_parameters` accepts them as independent arguments, so a later
+   drop or a second caller assembling them itself would pass the construction
+   check. `_bulk_update_parameters` therefore reasserts equal cardinality on the
+   exact values crossing into SQL. Construction is validated where it happens;
+   binding is validated where it happens.
+
+   `UPDATE ... FROM` additionally needs at most one source row per target row,
+   and this is Trellis's obligation rather than a refusal PostgreSQL will make:
+   the database does not reject a join matching several source rows, it uses one
+   of them, and which one is not predictable. That is why the duplicate check is
+   a correctness invariant rather than tidiness.
+
+5. **Returned coverage is checked, and partial success is impossible.**
+   `RETURNING` has no ordering to rely on, so rows are keyed by id and the
+   caller-visible order is replayed from the request. If the returned ids are
+   not exactly the expected ids, the call raises `VERSION_CONFLICT` and the
+   caller's transaction rolls back. This replaces the loop's per-statement
+   `row is None` check.
+
+6. **The canonical lock order stays.** `SELECT_TASKS_BY_IDS_FOR_UPDATE` keeps
+   `ORDER BY id` and `FOR UPDATE`. A set-based UPDATE does not remove the
+   deadlock that two callers naming the same tasks in opposite orders would
+   otherwise produce, and an UPDATE has no result order to specify in its place.
+
+7. **Duplicate ids keep their two different counts.** `[A, A, A, A]` is still
+   four references for the blast radius under D-17 and one physical row for the
+   write. Deduplication happens for the update only, never before policy
+   classification, because moving it earlier would shrink the blast radius below
+   the approval threshold.
+
+8. **Two accidental contracts are closed.** `task_ids` gains `min_length=1`: a
+   call naming no targets used to validate and return an empty success, which
+   reads to the model as a completed bulk update. And a call carrying no
+   structurally effective operation is refused, because `title`, `notes`,
+   `priority`, and `status` reach SQL through `COALESCE`, where an explicit null
+   is indistinguishable from an omission. Such a call used to lock every target,
+   increment every version, and write an event per task in which before and
+   after are identical. `due_date` and `blocked_by` carry a set flag, so naming
+   either of them, including as null, is always an operation, and `notes=""`
+   remains a real clear.
+
+   The term is deliberate. This is a structural test, establishing that the
+   patch contains an operation capable of writing a column. It does not claim
+   the stored value will differ: setting priority to high on an already-high
+   task is structurally effective and stays valid, because the caller asked for
+   a state and the row will be in it. A rule that tried to prove a difference
+   would have to read the rows first, which is a much stronger claim than the
+   one made here.
+
+   `min_length` appears in the JSON schema the model sees. The effective-
+   operation rule cannot, because it is a cross-field validator that runs after
+   parsing, so the model cannot infer it from the schema and will sometimes
+   break it. The tool description therefore states it in words, and an invalid
+   call is corrected through Pydantic AI's documented lifecycle: arguments are
+   validated before the tool runs, a `ValidationError` becomes a
+   `RetryPromptPart` carrying the detail, and the tool body never executes.
+   That lifecycle is proven for both refusals rather than assumed, including
+   that the body was not entered and that a corrected call then commits once.
+
+9. **`bulk_update_tasks` is a Pydantic AI sequential barrier.** `max_concurrency`
+   bounds concurrent agent runs and says nothing about several tool calls
+   arriving in one model response, which the framework schedules concurrently by
+   default and which run on worker threads because Trellis tools are
+   synchronous. This tool holds row locks on a caller-chosen set for its whole
+   transaction, so it must not overlap a sibling call in that response.
+   `sequential=True` is scoped to this one tool. It does not serialize separate
+   HTTP requests, separate `agent.run()` calls, or separate workers; their
+   correctness remains PostgreSQL's, through the canonical lock order and the
+   version predicates.
+
+10. **The isolation level is probed, not assumed.** The pool sets none, so the
+    server default decides, and the D-78 interaction behaves differently at
+    stricter levels. At the probed `read committed` on PostgreSQL 16.12: a bulk
+    update that commits first leaves a concurrent single-task append refused
+    with `VERSION_CONFLICT`, because the append carries a caller-supplied
+    `expected_version`; and an append that commits first survives the bulk
+    update behind it, because the bulk call has no caller expected version and
+    reads each version from the row it locked, which a waiter is handed as the
+    winner left it. Both orderings are proven, and the deterministic gate
+    asserts the isolation level rather than trusting it.
+
+11. **D-78's boundary is untouched.** `append_notes` remains absent from
+    `MutableTaskFields` and therefore from `BulkUpdateTasksArgs`. A set-based
+    statement makes per-row merging look cheaper than it is: it would still need
+    the merged value computed per task and its own final-size check per task,
+    which is exactly the work D-78 declined to specify for bulk.
+
+**Known limitation.** The canonical lock order is pinned by a structural
+assertion on the SQL text, not by a behavioural test. Deleting `ORDER BY id`
+leaves the competing-callers test passing repeatedly, because PostgreSQL reaches
+these rows by primary key and returns them in id order regardless. Forcing the
+planner off that index would close the gap and was rejected: it would make a
+regression test depend on planner settings the application never sets. This is
+recorded rather than hidden behind a test that cannot see the difference.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It adds one SQL constant and one CI gate. It
+changes no approval, idempotency, or undo semantics, it does not alter the D-74
+ceilings, and it adds no bulk append.
+
+### D-79 hardening: expected refusals stay inside the Pydantic tool protocol
+
+Found by a live dependency-chain test during manual verification, not by any
+gate. The model built a blocking chain, reused an `expected_version` it
+remembered from earlier in the same turn, and `update_task` refused it. The
+refusal was correct. Where it ended up was not.
+
+Pydantic AI recognises exactly two application-level outcomes from a tool body.
+`ModelRetry` returns a retry prompt so the model can correct the call, and
+`ToolFailed` returns a definitively failed result the model can adapt to without
+spending retry budget. Anything else is not a tool outcome at all: it leaves the
+protocol and aborts the run. Trellis raised ordinary application exceptions for
+refusals that are a normal part of a model driving a mutating API, so a stale
+version ended the turn and took the response stream with it.
+
+This was reproduced deterministically before it was fixed. Driving the real
+agent with a `FunctionModel` emitting a stale `expected_version` aborted
+`run_sync` on the first model turn with `VersionConflictError`. The same probe
+showed `OutOfScopeError` escaping identically, and showed that an oversized
+`append_notes` did **not** escape, because Pydantic validates it against the
+schema before the tool body runs and returns a retry on its own.
+
+The persisted failed invocation from the original manual session was not
+available: the deterministic test fixtures truncate `tool_invocations` and
+`agent_runs`, so that evidence had already been cleared. The reproduction stands
+in for it and is stronger, because it is repeatable.
+
+1. **The refusals themselves are unchanged.** `domain.update_task` still compares
+   the locked version and still raises. `policy` still raises the same shared
+   refusal for a missing and a foreign task. `UPDATE_TASK_GUARDED` keeps its
+   version predicate. Every deterministic caller, undo included, still reads the
+   Trellis exception contract exactly as before. Weakening the guard to avoid
+   retries would have been the wrong fix for a correct refusal.
+
+2. **The translation lives at the model-facing adapter.** `agent.py` is the one
+   layer that knows its caller is a model, and `_model_facing_refusals` is a
+   context manager applied at all eight tool wrappers rather than at one. Every
+   tool reaches `policy.check`, so every tool can be refused this way, and a
+   translation present on only `update_task` would leave the same aborted stream
+   reachable through the other seven.
+
+3. **Three refusals are translated, and the outcome is chosen per refusal.**
+
+   ```text
+   VERSION_CONFLICT     ModelRetry   the request may still be valid and only the
+                                     token is stale, so the next action is known
+   EXTERNAL_DIVERGENCE  ToolFailed   the disagreement is with Linear, not with
+                                     the arguments, so a retry earns the same
+                                     refusal
+   OUT_OF_SCOPE         ToolFailed   the reference cannot be used, and retrying
+                                     the same identifier cannot change that
+   ```
+
+   Schema validation and approval already have framework paths and are left
+   alone.
+
+4. **Nothing else is translated.** A blanket `except PolicyError` or
+   `except Exception` would convert bugs, outages, and serialization failures
+   into a polite suggestion that the model try again, hiding the failures most
+   worth seeing and inviting a loop on them. A refusal earns a translation only
+   when its next action is known. A test asserts the caught set by parsing the
+   handler, so broadening it is a failing test rather than a silent change.
+
+5. **The out-of-scope message does not enumerate.** A missing task and another
+   actor's task are deliberately the same refusal, and `policy` raises it before
+   the divergence check to keep them indistinguishable. The model-facing text
+   says only that the reference is not available for this operation. Saying "no
+   such task" or "not yours" would make the model an oracle for which task ids
+   exist, undoing that boundary. A test drives both cases and asserts the model
+   was told the identical thing.
+
+6. **No new version travels in the retry.** Handing the current version back in
+   the message would make an exception payload a second source of task state,
+   competing with the resolver, and it would be wrong anyway if the row had been
+   deleted rather than updated. The model is told to resolve the reference again
+   and use what that returns.
+
+7. **The original cause is preserved.** Every translation uses `raise ... from
+   exc`, so logs keep the actual Trellis reason while the model sees only the
+   chosen sentence. Asserted by parsing the handlers rather than by reading them.
+
+8. **One prompt rule was added, narrowly.** The prompt already required
+   `expected_version` to come from the authoritative lookup, but never said when
+   that lookup had to have happened, so a version read earlier in the same turn
+   satisfied it as written, which is exactly what the observed trace did. The
+   rule now states that an expected version is an ephemeral concurrency token
+   rather than a remembered fact. No other prompt text changed.
+
+This hardening authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It changes no policy, approval, idempotency,
+undo, or database semantics, and it makes no frontend change. The observed
+browser symptom, an AG-UI `TEXT_MESSAGE_CONTENT` without a preceding
+`TEXT_MESSAGE_START`, is consistent with a stream aborted mid-message, but this
+decision does not claim to have root-caused that console error, only to have
+removed the failure class that aborted the run.
+
+### D-80: appending one line to many tasks, all of them or none
+
+The request was ordinary: add a line to the notes of the first ten tasks. The
+model did the only thing the tool surface allowed, ten single `update_task`
+calls, and the sixth hit a version conflict. Five tasks were already committed.
+The user was left with a half-applied edit, a failed run, and no single
+operation to point at or undo.
+
+That is not a model failure. `bulk_update_tasks` already means "the same change
+to several tasks", and appending the same line is exactly that. What the tool
+lacked was an execution mode: append needs a different final value per row,
+merged from that row's locked notes, where replacement needs one shared value.
+
+1. **No ninth tool.** The surface stays eight. D-79 established that a second
+   spelling of one capability is a routing problem dressed as a feature, and
+   nothing here changes that. Append is a mode inside the tool that already owns
+   multi-task changes.
+
+2. **`append_notes` is declared on `BulkUpdateTasksArgs`, still not on
+   `MutableTaskFields`.** D-78 kept it off the shared base so bulk could not
+   inherit an append nobody had specified: no per-row merge, no per-row
+   final-size check, no set-based semantics. D-80 specifies all three, so the
+   field is declared on the model that implements it. That reverses D-78's
+   conclusion, not its reasoning: the base is still shared, so a field added
+   there would still hand append semantics to anything else built on it, and the
+   gate still asserts the base is clean.
+
+3. **Append is append-only.** A call carrying `append_notes` may carry no other
+   mutable field. Replace-then-append and append-then-replace produce different
+   results and both are defensible, which is the reason to refuse rather than to
+   invent a precedence rule nobody can read off the schema. There are concrete
+   reasons beyond ambiguity: append is not idempotent while scalar replacement
+   is convergent, so mixing them puts two different retry stories in one call;
+   append needs a per-row effective value and replacement needs one shared
+   value, so they run different SQL; and the approval preview has to describe
+   one intent. A later decision may authorize a mixed mode.
+
+4. **The existing replacement path is untouched.** `BULK_UPDATE_TASKS_GUARDED`
+   is unchanged and still serves every call without `append_notes`. Append gets
+   `BULK_APPEND_NOTES_GUARDED`. Generalizing one statement to serve both would
+   have put a per-row column and a scalar in the same parameter slot and
+   rewritten the D-79 path to gain nothing.
+
+5. **Every value is merged and validated before anything is written.** The
+   ordering is the whole contract:
+
+   ```text
+   distinct targets -> canonical ORDER BY id FOR UPDATE -> full coverage
+   -> merge every row from its locked notes
+   -> validate every merged result
+   -> ONE guarded set-based UPDATE
+   -> exact returned coverage
+   -> one audit event per task -> lease completion -> one commit
+   ```
+
+   A set where nine merges fit and the tenth overflows commits nothing at all.
+   Merging and updating row by row would leave nine appended notes and a failed
+   run, which is the original failure wearing a new hat.
+
+6. **Existing notes come from the locked row, never from the model.** The model
+   sends only its fragment, exactly as D-78 established. `merge_appended_notes`
+   is reused rather than reimplemented, so the separator rule has one
+   definition: one newline, only when one is needed, and no reformatting of what
+   is already there.
+
+7. **Three parallel arrays, guarded like D-79's two.** `unnest` does not reject
+   inputs of unequal length, it NULL-pads the shorter ones, so a short array
+   would execute and fail closed as a coverage miss rather than as the
+   construction bug it is. One relation is built and its cardinality, uniqueness
+   and null-freedom checked before binding. `UPDATE ... FROM` also needs at most
+   one source row per target, and that remains Trellis's obligation because
+   PostgreSQL picks one unpredictably instead of refusing.
+
+8. **Two narrow error subtypes, and no fifteenth code.** `AppendNotesLimitError`
+   subclasses `ValidationFailedError` and keeps `VALIDATION_ERROR`/422;
+   `BulkTargetCoverageError` subclasses `VersionConflictError` and keeps
+   `VERSION_CONFLICT`/409. Neither is added to `ERRORS_BY_CODE`, so section 6's
+   table is still exactly fourteen entries, and the gate asserts that.
+
+   They exist because two refusals needed different model-facing advice than
+   their parents. A merged-note overflow is terminal, not retryable: the only
+   "correction" available to a model is to truncate, summarise, or rewrite text
+   the user asked to store verbatim, which is a silent change to the user's data
+   rather than a fix. And a bulk coverage failure must not repeat the
+   single-task advice to resolve the task and retry with a fresh
+   `current_version`, because a bulk caller supplies no expected version; the
+   server reads each one after locking the row.
+
+9. **The merged-overflow escape was a real gap, reproduced before it was
+   fixed.** Pydantic rejects an oversized *fragment* against the schema before
+   the tool body runs. It cannot see a legal fragment whose merge with locked
+   notes overflows. Driving the real agent with that case aborted `run_sync` on
+   the first model turn, exactly as the D-79 hardening's other escapes did.
+
+10. **The existing approval bridge covers append unchanged.** Ten targets
+    exceeds the blast-radius threshold of three, so the call defers through the
+    same server-owned approval row. `_payload` already dumps set fields, so the
+    fragment is part of the hashed arguments: approving "pull the turnips" does
+    not authorize "pull the carrots", and a different target set is a different
+    hash. `bulk_update_tasks` remains absent from the Linear profile, which has
+    no browser approval-continuation path.
+
+11. **The timeout fence was probed and is not needed.** The worry had a real
+    shape: a tool timeout becomes a retry prompt, and a worker thread already
+    running does not stop when the awaiting task is cancelled, so one logical
+    append could commit twice under two `tool_call_id`s. Measured against pinned
+    `pydantic-ai==2.27.0`, that does not arise, because `tool_timeout` does not
+    fire for synchronous tools at all: a sync body outran a 1.0 s timeout and
+    returned normally, while an async body in the same harness was cancelled on
+    time. Every Trellis tool is synchronous, so the retry that would be required
+    is never issued, and no second idempotency mechanism was built.
+
+    This is a version-pinned observation rather than a law, so it is a test. If
+    an upgrade starts enforcing the timeout for sync tools, that test fails and
+    the question reopens with evidence.
+
+**Known limitations.** Bulk append is append-only, so a caller wanting to append
+and change a priority sends two calls. The lock-order caveat D-79 records is
+unchanged. The three defence-in-depth guards on this path, the owner predicate,
+the returned-coverage check and the relation invariants, are unreachable through
+the tool because an earlier check fires first, so they are tested directly.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It adds one SQL constant, one model field, two
+error subtypes, and CI assertions replacing the D-79 gate that asserted bulk
+could not append.
+
+**Stable CI check.** `D80 atomic bulk append`. The D-80 proofs previously ran
+only as named steps inside the `D79 set based bulk update` job, which executes
+them but cannot be referenced by branch protection under a name matching this
+decision. The dedicated job runs the same suite; the statement-count and
+overflow proof stays in the D79 job as well. Recorded here per the per-task CI
+gate protocol, and the name is stable once branch protection references it.
+
+### D-81: turn-bounded Nemotron reasoning, and provider limits Trellis owns
+
+Two things were left to the provider that should not have been.
+
+**The boundary.** Nemotron separates multi-step from multi-turn. Inside one user
+turn, reasoning followed by a tool call and its result is a single trajectory,
+and the earlier reasoning is context the model should still see. Across user
+turns it is not: a new turn should not be handed the previous turn's reasoning.
+
+D-67 makes a successor run inherit its predecessor's canonical history
+wholesale. That is right for the durable record and wrong as model input,
+because it carries obsolete `ThinkingPart`s across exactly that boundary. The
+deterministic control-history code already said "prior reasoning does not belong
+in a later turn's history", while the ordinary path copied it anyway.
+
+1. **One projection, at one seam.** `_project_prior_turn_history_for_model`
+   removes `ThinkingPart`s from inherited `ModelResponse`s and preserves
+   everything else. It is applied on the ordinary new-turn path only, after the
+   server-owned snapshot has been validated, so the browser still contributes no
+   history and `runs.create_turn` still owns what is stored. The predecessor row
+   is untouched: this changes what the provider is shown, not what was recorded.
+
+2. **The continuation path is deliberately not projected.** An approval
+   continuation is still the same user turn. The reasoning that chose the
+   approval-required action is context for interpreting its result, and stripping
+   it there would discard it at the worst possible moment.
+
+3. **No blanket history processor, and no global replay switch.** An agent-wide
+   processor runs before every model request, including the one after a tool
+   result, so it could not tell inherited reasoning from the reasoning this turn
+   just produced and would strip both. Setting
+   `openai_chat_send_back_thinking_parts=False` has the same defect in a simpler
+   disguise: it would satisfy the turn-boundary requirement and quietly break the
+   multi-step case NVIDIA trains separately. Both are refused, and a test pins
+   that same-turn reasoning still reaches the provider after a tool result.
+
+4. **Structural, not textual.** Parts are matched by type. A message that merely
+   mentions thinking markup is ordinary content and survives. Messages are
+   rebuilt rather than mutated, because the inherited objects are shared with the
+   durable snapshot, and a response left with no parts is dropped rather than
+   filled with invented text.
+
+**The limits.** Trellis sent only `{"timeout": ...}`, which left three NVIDIA
+defaults in charge of behaviour it cares about: `reasoning_budget` 16384,
+`max_tokens` 16384, and `temperature` 1.
+
+5. **Reasoning is bounded, not disabled.** `reasoning_budget` is 6000 per model
+   request, and `chat_template_kwargs.enable_thinking` is sent explicitly rather
+   than relied upon. 6000 is an application ceiling: lower values stay
+   configurable so the budget can be measured downwards later, higher ones are
+   refused at construction rather than clamped, because accepting 8000 and
+   sending 6000 would make the configuration and the wire disagree.
+
+6. **Reasoning cannot consume the whole allowance.** NVIDIA counts reasoning,
+   tool JSON, and visible text against one `max_tokens`. `max_tokens` is 12288,
+   and a cross-field invariant requires at least 4096 of headroom above the
+   reasoning budget, sized against the largest legitimate tool call this system
+   emits, which carries fifty task ids. Without it the failure is a model that
+   reasoned successfully and had no room left to answer.
+
+7. **The cap is sent under the name NVIDIA reads.** Pydantic AI serializes
+   `max_tokens` as `max_completion_tokens` unless the profile says otherwise, and
+   the hosted endpoint documents `max_tokens`. An explicit `OpenAIModelProfile`
+   sets `openai_chat_supports_max_completion_tokens=False` and names
+   `openai_chat_thinking_field="reasoning"`. Under the wrong name the cap is
+   ignored, which is indistinguishable from never setting one, so the wire body
+   is asserted rather than the configuration object.
+
+8. **`temperature=0.0`, and `top_p` untouched.** This is for low-variance tool
+   routing, not generation quality. NVIDIA advises against tuning both in one
+   request. No seed is added: whether one is needed is a question for the eval,
+   not an assumption.
+
+9. **One routing kernel, not a prompt rewrite.** A short "choose only the next
+   authoritative action" section near the top of the prompt. The instruction the
+   model needs first is which authoritative action to take now; planning a later
+   call's arguments before the lookup that supplies them is what produces guessed
+   ids and stale versions.
+
+**Explicitly deferred.** General history compaction. A production trace has shown
+roughly 29k input tokens, so context growth is real, but truncation or
+summarization interacts with task identity, approval continuity, and
+tool-call pairing. Prior-turn reasoning is the one category NVIDIA names, so it
+goes first and the rest waits for measurement.
+
+**Measured, and it did not make anything faster.** A paired live evaluation was
+run against the hosted endpoint with the real agent and the real tool surface,
+identical fixtures on both sides, differing only in these settings. Routing was
+correct and identical under both: the live model chose `list_tasks` then one
+`bulk_update_tasks` for a multi-task note append, which is the D-80 route rather
+than one `update_task` per task. Latency did not improve; in that sample the
+patched configuration was slower, median 18748ms against 12716ms, on three
+samples per cell with 5 to 30 second swings and one timeout.
+
+That is too noisy to call a regression and nowhere near enough to call an
+improvement. The claim this decision makes is control, not speed: three provider
+defaults that decided reasoning and output behaviour are now Trellis-owned and
+asserted on the wire. Anyone hoping to reduce time-to-first-tool should read this
+as evidence that the reasoning budget is not by itself the lever.
+
+The provider returned no `reasoning_tokens` on any request, so authoritative
+reasoning usage is unavailable and is not estimated. No response finished with
+`length`.
+
+**Known limitations.** The latency effect is measured above and is negative for
+that sample; no latency benefit is claimed anywhere.
+Nothing about downstream concurrency, thread pools, tool timeouts, or PostgreSQL
+locking is touched, because those govern stages after a tool has already begun.
+
+This decision authorizes no migration, table, column, endpoint, status value,
+error code, dependency, or tool. It adds two typed settings, one model profile,
+one history projection, and one prompt section.
+
+**Stable CI check.** `D81 turn bounded reasoning`. Until it was added, nothing in
+the workflow named D-81 and its suite ran only as an anonymous slice of the
+cumulative non-network run, so no branch-protection-eligible check proved this
+decision's claims. The neutral blind review at `c846a14` raised exactly that as
+a MINOR finding. The suite needs neither PostgreSQL nor the frontend, so the job
+is a small independent one. The name is stable once branch protection references
+it.
+
+### D-82: reliable Vercel Web Analytics
+
+The frontend has never reported traffic. This adds the smallest integration that
+does, and nothing else.
+
+**What it observes.** Automatic page views, through Vercel's maintained
+`@vercel/analytics/next` entry point, mounted once at the root layout. No
+`track()`, no custom events, no router listeners, no manual beacons. The
+automatic path is already correct for the App Router, and a first integration
+that also invents an event schema has to defend two things at once.
+
+**Why version 2.** Analytics v2 introduced Resilient Intake, which discovers its
+own collection endpoint rather than depending on one predictable path. That is
+the reason the gate asserts a major of 2 or later rather than pinning behaviour
+to a URL. `next.config.ts` is deliberately unchanged: it rewrites only
+`/api/:path*` to FastAPI, which does not overlap intake, and hardcoding an
+intake path would defeat the mechanism that makes v2 more reliable than v1.
+Pinned exact at `2.0.1`, the current stable release, matching every other
+frontend dependency.
+
+**What it is not.** Browser analytics is observational. It answers questions
+about traffic and navigation. It is not authoritative for run success, tool
+success, mutation success, approvals, or committed state, and nothing may infer
+those from an analytics event. PostgreSQL remains authoritative, exactly as
+before. Trellis already tolerates a committed mutation whose response fails in
+transit, so a browser signal is the wrong place to learn whether work happened.
+
+**What the gate proves, and what it does not.** `D82 vercel analytics` proves
+the dependency resolves, the integration is shaped as specified, and the build
+compiles. It cannot prove a page view reached Vercel. Production intake and
+dashboard ingestion are verified after deployment and are recorded separately;
+until then they are UNVERIFIED rather than passing.
+
+This decision authorizes one production dependency and no backend change. No
+migration, table, column, endpoint, status value, error code, tool, or provider
+setting. No FastAPI middleware, no Pydantic AI instrumentation, no OpenTelemetry;
+those are separate operational-observability surfaces and are not opened here.
+
+**Stable CI check.** `D82 vercel analytics`. Recorded here per the per-task CI
+gate protocol, and the name is stable once branch protection references it.

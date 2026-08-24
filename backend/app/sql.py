@@ -230,6 +230,96 @@ UPDATE tasks
 RETURNING *;
 """
 
+# D-79. One guarded UPDATE for every distinct target of one bulk call, in place
+# of the per-task loop that issued UPDATE_TASK_GUARDED once per row. The SET
+# list, the owner predicate, and the version predicate are the same three
+# guards the single-task statement carries; only their arity changes.
+#
+# The expected relation arrives as two parallel arrays and is rebuilt by
+# unnest. That is the part to read carefully. unnest over two arrays does not
+# reject unequal lengths, it pads the shorter one with NULL, and `t.version =
+# NULL` matches no row. A construction bug would therefore fail closed but
+# would surface as a target-coverage conflict, describing the wrong problem.
+# domain checks the arrays are the same length before the statement runs, so
+# the failure is reported where it happens.
+#
+# Trellis must ensure the UPDATE ... FROM join matches at most one source row
+# per target row. PostgreSQL will not refuse a join that matches several: it
+# uses one of them, and which one is not predictable. So this is the caller's
+# obligation. The ids are deduplicated before they reach here, the CTE
+# therefore holds exactly one row per distinct task, and domain asserts it.
+#
+# There is no ORDER BY and none is possible: an UPDATE has no result ordering to
+# specify. The canonical lock order that prevents deadlock is established by
+# SELECT_TASKS_BY_IDS_FOR_UPDATE, which has already run and already holds every
+# row this statement touches. Callers must key RETURNING by id rather than
+# reading its order.
+BULK_UPDATE_TASKS_GUARDED = """
+WITH expected AS (
+  SELECT *
+    FROM unnest(
+           %(task_ids)s::uuid[],
+           %(expected_versions)s::integer[]
+         ) AS x(id, expected_version)
+)
+UPDATE tasks AS t
+   SET title = COALESCE(%(title)s, t.title),
+       notes = COALESCE(%(notes)s, t.notes),
+       due_date = CASE WHEN %(set_due_date)s THEN %(due_date)s ELSE t.due_date END,
+       priority = COALESCE(%(priority)s, t.priority),
+       status = COALESCE(%(status)s, t.status),
+       blocked_by = CASE
+                      WHEN %(set_blocked_by)s THEN %(blocked_by)s
+                      ELSE t.blocked_by
+                    END,
+       version = t.version + 1,
+       updated_at = now()
+  FROM expected AS x
+ WHERE t.id = x.id
+   AND t.owner_id = %(owner_id)s
+   AND t.version = x.expected_version
+RETURNING t.*;
+"""
+
+# D-80. Bulk note append. A separate statement rather than a generalisation of
+# BULK_UPDATE_TASKS_GUARDED, because the two differ in the one way that matters:
+# replacement binds a single shared value for every target, while append binds a
+# different, already-merged value per target. Making one statement serve both
+# would put a per-row column and a scalar in the same parameter slot, and the
+# D-79 path would be rewritten to gain nothing.
+#
+# The merge itself is not here. Every effective value is computed in Python from
+# the notes this transaction already holds a lock on, validated in full, and
+# only then bound. SQL applies what was decided; it does not decide.
+#
+# Three parallel arrays, with the same caution D-79 records for two: unnest does
+# not reject inputs of unequal length, it NULL-pads the shorter ones. A short
+# array would therefore execute and fail closed as a coverage miss rather than
+# as the construction bug it is, so domain builds one relation and checks its
+# cardinality before binding.
+#
+# The guards are D-79's, unchanged: the owner predicate, the per-row version
+# predicate, and RETURNING keyed by id rather than by position.
+BULK_APPEND_NOTES_GUARDED = """
+WITH expected AS (
+  SELECT *
+    FROM unnest(
+           %(task_ids)s::uuid[],
+           %(expected_versions)s::integer[],
+           %(effective_notes)s::text[]
+         ) AS x(id, expected_version, notes)
+)
+UPDATE tasks AS t
+   SET notes = x.notes,
+       version = t.version + 1,
+       updated_at = now()
+  FROM expected AS x
+ WHERE t.id = x.id
+   AND t.owner_id = %(owner_id)s
+   AND t.version = x.expected_version
+RETURNING t.*;
+"""
+
 DELETE_TASKS_BY_IDS = """
 DELETE FROM tasks
  WHERE owner_id = %(owner_id)s

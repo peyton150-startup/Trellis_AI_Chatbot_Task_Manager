@@ -125,7 +125,12 @@ const ThreadRoot: FC<{
     <ThreadPrimitive.Root
       className="aui-root aui-thread-root bg-background @container flex h-full flex-col"
       style={{
-        ["--thread-max-width" as string]: "44rem",
+        // D-79. One cap, widened by 15px. The viewport container below
+        // reads this variable for both the message list and the footer
+        // that holds the composer, so messages and composer widen
+        // together and stay aligned. Still a max-width over w-full, so
+        // narrow screens are unaffected.
+        ["--thread-max-width" as string]: "calc(44rem + 15px)",
         ["--composer-bg" as string]:
           "color-mix(in oklab, var(--color-muted) 30%, var(--color-background))",
         ["--composer-radius" as string]: "1.5rem",

@@ -3198,9 +3198,8 @@ assert that its target was found; the script does.
   A refactor making `ALL_TOOLS` narrower than `ToolName` now fails CI rather
   than leaving the header advertising capabilities the browser agent no longer
   has. Mutation M15 is exactly that refactor and is caught.
-- Review history, and why the current SHA is unreviewed. Three neutral blind
-  reviews have run against this branch, each against an immutable SHA, and each
-  found exactly one real defect:
+- Review history. Four neutral blind reviews have run against this branch, each
+  against an immutable SHA:
 
   ```text
   89e3dad   MAJOR  rule 9 still told the model to join notes itself,
@@ -3210,11 +3209,17 @@ assert that its target was found; the script does.
                    than replaces
   a80c9cb   MINOR  a stale expected_version plus an overflowing append
                    refused as VALIDATION_ERROR rather than VERSION_CONFLICT
+  c846a14   PASS WITH MINORS. No BLOCKER, no MAJOR, under a blind read plus
+            sandboxed execution. 2 MINOR: D-81 had no dedicated CI gate, and
+            this file's D-81 verification counts were stale again
   ```
 
   Each fix created a new SHA and voided the review that preceded it, which is
-  the intended loop rather than a sign of churn. The current candidate is
-  unreviewed and a fresh review is owed against it.
+  the intended loop rather than a sign of churn.
+
+  Stale counts in this file have now been found by two separate reviews. That is
+  a recurring failure mode of durable evidence written before the last commit
+  lands, not a one-off, and it argues for recounting rather than recopying.
 
   Worth recording for whoever reviews next: every defect found so far has been
   in the model-facing text or in this file, never in the mechanism. The merge,
@@ -3225,3 +3230,616 @@ assert that its target was found; the script does.
   D-79 was abandoned. D-79 is a separate session and a separate PR, which lets
   the D-78 versus bulk concurrency tests run against merged D-78 code rather
   than a review-only integration tree.
+
+## D-79: one guarded set-based UPDATE for a whole bulk call
+
+**Local role:** `bulk_update_tasks` replaces its per-task `UPDATE_TASK_GUARDED`
+loop with a single `BULK_UPDATE_TASKS_GUARDED` statement that carries the
+expected versions as a relation. It owns the construction of that relation, the
+check that the returned rows cover every expected target, and the replay of the
+caller-visible order from the request. `BulkUpdateTasksArgs` gains a lower bound
+on `task_ids` and a validator refusing a patch that cannot change anything, and
+the tool is registered as a Pydantic AI sequential barrier.
+
+**Whole-system role:** This is the first decision to change the physical shape of
+a kernel mutation rather than its semantics, so its whole value depends on the
+guards surviving the rewrite unchanged, which is what most of its verification
+is about. It controls three risks. The number of task UPDATE statements the
+application issues for one model request is constant with the number of tasks
+named, N to 1, so a fifty-task request is one task UPDATE rather than fifty.
+That is a statement-count claim, not a claim that the database does constant
+work: PostgreSQL still processes fifty rows and D-79 still writes fifty audit
+inserts. The model is told which of two legitimate
+routings to use, so a same-patch request stops arriving as N single calls, which
+was the real reason the loop was being exercised at scale. And the tool that
+holds locks on a caller-chosen set can no longer overlap a sibling tool call
+scheduled out of the same model response. For the demo it makes bulk operations
+visibly one authoritative transaction, which is the claim the tool always made.
+
+**Inputs and dependencies:** D-12 conditional approval and the tool body order,
+D-17 blast-radius counting over raw ids, D-39/D-41 audit and undo expectations of
+`task_events`, D-74 request ceilings, and D-78, whose single-task append is the
+other side of the concurrency interaction proven here. It depends on PostgreSQL
+`UPDATE ... FROM`, `unnest` over parallel arrays, and `READ COMMITTED` semantics
+for `SELECT ... FOR UPDATE`, and on `pydantic-ai` 2.27.0 exposing `sequential` on
+`Agent.tool`. Both facts are probed rather than assumed: the installed signature
+is checked, and the deterministic gate asserts the isolation level.
+
+**Outputs and consumers:** `sql.BULK_UPDATE_TASKS_GUARDED`,
+`domain._expected_relation`, `domain._bulk_update_parameters`, and
+`domain._mutable_field_parameters`, which the single-task and bulk paths now
+share so their omitted-versus-null handling cannot drift apart. The tool result
+shape, the event shape, and the error vocabulary are unchanged, so every existing
+consumer, including undo and the audit reads, sees exactly what it saw before.
+
+**Verification:** `cd backend && ruff check .` clean;
+`cd backend && pytest -m "not network"` 510 passed, 13 deselected, of which 63
+are the D-79 bulk suite and 11 the model-boundary mapping suite.
+`cd frontend && npm run build` succeeds and all five frontend suites pass
+(2, 4, 9, 8, 6 tests). Both inline CI gate scripts were executed locally, not
+merely parsed.
+
+Mutation audit, 27 of 27 killed across two harnesses, 20 for the set-based
+mutation and 7 for the model-boundary failure mapping. A kill is defined
+strictly, because both halves of the definition have already failed here: the
+mutation must be observed as applied by a changed digest, the intended tests must
+have collected and run, at least one failure must be attributable to the
+mutation, and the source must be byte-identical after restore.
+
+Two things about the audit are worth recording, because both were defects in the
+verification rather than in the code, and both produced a board that looked
+greener than it was.
+
+The first run killed only 13 of 17. All four gaps were test defects: the owner
+predicate, the returned-coverage check, and the pair-length invariant were
+unreachable through the ordinary path because an earlier guard fires first, and
+the blast-radius test called the domain directly while the count it protected
+lives in the tool body. That is why `_expected_relation` was extracted at all.
+
+The second run reported two **false kills**. The harness treated pytest's nonzero
+exit as a kill, and pytest also exits nonzero when it collected nothing, which is
+exactly what two mis-split parametrized test ids produced. Two mutations were
+recorded as caught by tests that never executed. The harness now requires an
+observed failure and a nonzero collection count, and reports `NO TESTS RAN` as
+its own verdict. This is the mirror image of the D-78 failure where a mutation
+silently did not apply: there the mutation was absent, here the test was, and in
+both cases the report was confident and wrong.
+
+Benchmark, PostgreSQL 16.12, `read committed`, 30 iterations per cell, domain
+transaction only, no model latency. Both variants run in one process against the
+same rows with the same surrounding pipeline; only the statement shape differs.
+Measured on the tree that became the hardening commit:
+
+  ```text
+   N   variant     median ms   p95 ms   taskUPD   events   coreSQL
+   1   loop            15.84    22.40         1        1         3
+   1   set             16.69    20.46         1        1         3
+   3   loop            21.69    35.27         3        3         7
+   3   set             22.87    28.26         1        3         5
+  10   loop            71.14    82.83        10       10        21
+  10   set             46.44    60.58         1       10        12
+  25   loop           117.25   174.77        25       25        51
+  25   set             94.90   107.41         1       25        27
+  50   loop           261.32   450.29        50       50       101
+  50   set            153.47   189.37         1       50        52
+  ```
+
+The structural result is the claim and it is exact: at fifty targets, one task
+UPDATE command instead of fifty, and 52 application-issued core SQL statements
+instead of 101. "Core SQL" counts application-issued statements only and excludes
+PostgreSQL's internal work, per-row processing, trigger execution, and planner
+and executor cost.
+
+The absolute timings are higher than the run at `1caf13a` across every cell,
+including the unchanged loop baseline. That is consistent with environmental and
+runtime variability rather than with a cost introduced by the hardening, because
+the baseline that rose alongside the candidate was not modified; the benchmark
+does not establish the exact cause and none is claimed. What reproduces is the
+fifty-target ratio, 1.69x then 1.70x, and the statement counts. Timings belong to
+the run that produced them and are not carried between SHAs.
+
+**Limitations and review status:** Audit inserts remain one per task by decision,
+not by necessity: PostgreSQL can insert several rows in one `INSERT` and
+`RETURNING` information for all of them, so batching is deferred rather than
+impossible, and would need its own decision proving per-task snapshot fidelity,
+event identity, correlation, ordering, trigger and failure behaviour, and a
+measured benefit.
+
+The canonical lock order is pinned only by a structural assertion, because
+deleting `ORDER BY id` leaves the competing-callers test green: PostgreSQL
+reaches these rows by primary key and returns them in id order anyway. That was
+verified deliberately, 3 of 3, rather than assumed. Forcing the planner off the
+index would close it and was rejected, because it would tie a regression test to
+settings the application never configures.
+
+Three guards are defence in depth and unreachable through the tool path, so they
+are tested directly: the owner predicate, the returned-coverage check, and the
+pair-length invariant. The `_bulk_update_parameters` cardinality guard is
+reachable by construction and has its own regression.
+
+The D-78 interaction tests exercise both commit orderings under the asserted
+`read committed` isolation. They do not observe the lock-wait state at a
+particular instant and do not claim to.
+
+The frontend change is presentation only: `--thread-max-width` becomes
+`calc(44rem + 15px)`, verified in a browser at 704 to 719 px with the composer
+tracking the message column and no horizontal overflow at 375, 768, or desktop
+width.
+
+`prompts.py` gained exactly one rule, and only because the model-boundary work
+below produced concrete evidence for it. The bulk cross-field contract stayed in
+the tool description, where a rule the generated JSON schema cannot express
+belongs.
+
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
+
+## D-79 hardening: expected refusals stay inside the Pydantic tool protocol
+
+**Local role:** `agent.py` gains `_model_facing_refusals`, a context manager
+applied at all eight model-facing tool wrappers. It translates exactly three
+Trellis refusals into Pydantic AI tool outcomes and lets everything else
+propagate. `prompts.py` gains one rule stating that an `expected_version` is an
+ephemeral token rather than a remembered fact.
+
+**Whole-system role:** Trellis measures a model operating a typed API, and a
+model driving a mutating API will sometimes send a stale concurrency token or an
+unusable reference. Those refusals are the trust boundary working. Before this,
+they left Pydantic AI's tool protocol entirely and aborted the run, so a correct
+refusal destroyed the turn and the response stream instead of being corrected.
+This makes the refusal legible to the model without weakening it, which is the
+whole premise: deterministic code decides, and the model gets a truthful,
+actionable answer.
+
+**Inputs and dependencies:** Pydantic AI 2.27.0, whose `ModelRetry` and
+`ToolFailed` were both confirmed present in the pinned install rather than
+assumed from documentation. D-27's `EXTERNAL_DIVERGENCE`, D-12's tool body
+order, and the shared out-of-scope refusal whose non-enumeration property this
+must not break.
+
+**Outputs and consumers:** `agent._model_facing_refusals`. No change to
+`domain`, `tools`, `policy`, `errors`, `sql`, the database, or the frontend.
+Direct deterministic callers continue to see `VersionConflictError`,
+`ExternalDivergenceError`, and `OutOfScopeError` unchanged.
+
+**Verification:** `ruff` clean; `pytest -m "not network"` 510 passed, 13
+deselected, of which 11 are the new mapping suite. The defect was reproduced
+deterministically before the fix, with the real agent aborting on the first model
+turn, and the same probe afterwards shows the run reaching a second turn with a
+retry prompt. The full refresh-and-retry loop is driven end to end: stale call,
+refusal, authoritative resolve, corrected call, exactly one commit and one event.
+
+Mutation audit for this mapping, 7 of 7 killed under the same strict definition
+of a kill: removing the version translation, swapping it to `ToolFailed`,
+swapping divergence to `ModelRetry`, swapping out-of-scope to `ModelRetry`,
+letting the out-of-scope message enumerate, broadening the catch to every
+`PolicyError`, and dropping the prompt rule. Digests restored byte-identical.
+
+**Limitations and review status:** The persisted failed invocation from the
+original manual session was gone before it could be inspected, because the
+deterministic fixtures truncate `tool_invocations` and `agent_runs`. The
+deterministic reproduction stands in for it.
+
+Only three refusals are translated. Others still abort the run, which is
+intended for genuinely unexpected failures but means any future refusal whose
+next action is knowable needs its own decision rather than an automatic
+inclusion.
+
+The observed browser symptom, an AG-UI `TEXT_MESSAGE_CONTENT` arriving with no
+preceding `TEXT_MESSAGE_START`, is consistent with a stream aborted mid-message.
+This work removes the failure class that aborted the run but does not claim to
+have root-caused that console error, and no AG-UI event-lifecycle regression was
+added: the existing transport tests were left as they are, and proving the
+frontend symptom would need its own adapter-level test.
+
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
+
+## D-80: atomic bulk note append
+
+**Local role:** `bulk_update_tasks` gains an append mode. When `append_notes` is
+present, `domain._bulk_append_notes` merges the fragment into every locked
+target's notes, validates every merged result, and applies them with one
+`BULK_APPEND_NOTES_GUARDED` statement. `_bulk_append_relation` builds and checks
+the id/version/notes relation. `BulkUpdateTasksArgs` carries the field and an
+append-only validator; two narrow error subtypes carry the two refusals that
+needed different model-facing advice.
+
+**Whole-system role:** This closes the gap that produced the failure it was
+written for: a user asked for one change across ten tasks, the tool surface
+could only express it as ten changes, and a conflict on the sixth left five
+committed. Trellis's claim is that deterministic code owns state and that a
+mutation is one authoritative transaction; ten separate mutations for one
+request is that claim not holding. It also removes the last reason for the model
+to reconstruct notes itself, which is the ownership inversion D-78 existed to
+prevent.
+
+**Inputs and dependencies:** D-78's `merge_appended_notes` and its
+locked-state merge rule, reused rather than reimplemented. D-79's canonical
+lock, coverage check, relation discipline, and `sequential=True`. D-12/D-17
+approval and blast-radius counting. Section 6's fourteen-code table, which the
+two subtypes deliberately do not extend. Pinned `pydantic-ai==2.27.0`, whose
+sync-tool timeout behaviour was probed rather than assumed.
+
+**Outputs and consumers:** `sql.BULK_APPEND_NOTES_GUARDED`,
+`domain._bulk_append_notes`, `domain._bulk_append_relation`,
+`errors.AppendNotesLimitError`, `errors.BulkTargetCoverageError`. The tool
+result shape, event shape, and the fourteen error codes are unchanged, so undo
+and the audit reads see what they saw before.
+
+**Verification, at the D-80 implementation SHA:** `ruff` clean;
+`pytest -m "not network"` 571 passed, 13 deselected, of which 61 are the D-80
+suite. An earlier draft of this note said 568, which was the count before three
+tests were added to close the mutation survivors. Those figures are retained as
+historical evidence for that frozen state and are deliberately not restated as
+current: later commits added tests, so at `0d60e51` the focused D-80 suite
+produces 62 passed and the cumulative non-network suite produces 604 passed, 13
+deselected. For D-79 through D-81, each verification paragraph
+reports the counts measured at that decision's implementation SHA, not at
+whatever HEAD happens to be; later measurements are dated separately. The rule
+behind that, which is not a claim about how every older section of this file
+happens to be written: observed verification evidence belongs to the SHA where
+it was produced, and a later commit may record a newer measurement beside it but
+must not silently reinterpret the old one as evidence about HEAD. That applies
+to benchmark timings, mutation counts, provider evaluations, frontend test
+counts, and CI run populations, not only to pytest totals. The stable decision
+gate is `D80 atomic bulk append`. All three inline CI gate
+scripts were extracted from the workflow and executed locally rather than only
+parsed.
+
+The production scenario is exercised directly: ten tasks with differing notes,
+one `BULK_APPEND_NOTES_GUARDED` statement, ten audit events, D-78's separator
+rule honoured per row. The atomic refusal is exercised with nine merges that fit
+and a tenth that overflows: the mutating statement never runs, no version moves,
+and no fragment appears anywhere.
+
+Mutation audit 20 of 20 killed under the strict definition used throughout this
+PR: mutation observed as applied by a changed digest, intended tests collected
+and run, attributable failure, byte-identical restore. The first run killed 17;
+all three survivors were test gaps rather than code gaps, being the two
+defence-in-depth guards no tool-path test can reach and a prompt assertion that
+matched an example rather than the rule. All three now have tests that reach the
+code under test.
+
+Timeout probe, recorded because it decided whether to build a second idempotency
+mechanism:
+
+  ```text
+  sync tool,  2.5 s body, 1.0 s tool_timeout -> no timeout surfaced, body
+                                                completed, run continued
+  async tool, 2.5 s body, 1.0 s tool_timeout -> timeout at 1.05 s, body
+                                                cancelled before completing
+  ```
+
+State the conclusion with its conditions attached, because it is a property of
+one configuration rather than a law. Under pinned `pydantic-ai==2.27.0`, with
+Trellis on Pydantic's default AnyIO sync-tool executor path, `tool_timeout` does
+not surface a timeout or a retry before a synchronous tool finishes. Pydantic
+wraps tool execution in `anyio.fail_after`, and the default sync executor
+reaches `anyio.to_thread.run_sync`, whose cancellation semantics wait for the
+worker to finish.
+
+That is not the only executor Pydantic offers. `Agent.using_thread_executor`
+installs a custom `Executor`, and a `concurrent.futures` future that has already
+started cannot be cancelled, so a different executor could change the answer.
+Trellis installs none, and the regression asserts both halves: the pinned
+version, and that no custom executor is in force. Either a version bump or an
+executor change fails it and reopens the exact-once analysis with evidence.
+
+**Limitations and review status:** Append is append-only by decision; appending
+and changing another field is two calls. The three guards on this path that an
+earlier check makes unreachable are tested directly for that reason. The D-79
+lock-order limitation is unchanged and still applies here, since the same lock
+statement is reused. No real-model smoke test has been run for this path yet:
+the routing test drives a deterministic `FunctionModel`, so it proves the
+sequence Trellis executes, not that a live provider chooses it.
+
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
+The dedicated gate is `D80 atomic bulk append`.
+
+## D-81: turn-bounded Nemotron reasoning
+
+**Local role:** `agent._project_prior_turn_history_for_model` removes inherited
+`ThinkingPart`s from the history handed to the provider on an ordinary new user
+turn. `agent._model_settings` supplies the temperature, token cap, reasoning
+budget, and explicit thinking flag that every model request now carries.
+`_runtime_model` gains an explicit `OpenAIModelProfile`. `config` gains
+`model_reasoning_budget` and `model_max_tokens` with a ceiling and a headroom
+invariant. `prompts` gains one routing kernel.
+
+**Whole-system role:** Trellis measures a model operating a typed API, so what
+the model is shown and how long it may think are part of the measured system,
+not provider trivia. Two things were outside Trellis's control: obsolete
+reasoning crossed user-turn boundaries because D-67 inherits history wholesale,
+and three NVIDIA defaults decided the reasoning and output allowance. Both are
+now Trellis-owned and asserted on the wire.
+
+**Inputs and dependencies:** D-67 canonical history and `runs.create_turn`,
+unchanged. The approval-continuation path, deliberately excluded. Pinned
+`pydantic-ai==2.27.0`, whose profile fields and serialization behaviour are
+asserted rather than assumed. NVIDIA's hosted Chat Completions contract for
+`reasoning_budget`, `max_tokens`, and `chat_template_kwargs`.
+
+**Outputs and consumers:** `_project_prior_turn_history_for_model`,
+`_model_settings`, `MODEL_REASONING_BUDGET_CEILING`,
+`MODEL_OUTPUT_HEADROOM_MIN`, `settings.model_reasoning_budget`,
+`settings.model_max_tokens`. No change to durable history, the tool surface, the
+approval bridge, idempotency, or any database behaviour.
+
+**Verification:** `ruff` clean; `pytest -m "not network"` 604 passed, 13
+deselected, of which 32 are the D-81 suite. The dedicated gate is
+`D81 turn bounded reasoning`. The wire tests serialize a real
+request through the pinned client against an in-process mock transport and
+assert the body:
+
+  ```text
+  temperature             0.0
+  max_tokens              12288
+  max_completion_tokens   absent
+  reasoning_budget        6000
+  chat_template_kwargs    {"enable_thinking": true}
+  top_p                   absent
+  ```
+
+The turn-boundary claim is proven at the same boundary rather than on the helper
+alone, with a control test establishing that the client does otherwise send the
+inherited reasoning, so the passing case cannot be a false negative. A separate
+test proves same-turn reasoning still reaches the provider after a tool result,
+which is what fails if someone later replaces the projection with a blanket
+processor or a global replay switch.
+
+**Paired live evaluation, and what it did not show.** Run against
+`nvidia/nemotron-3.5-lightning-30b-a3b` on the hosted endpoint, with the real
+agent, the real eight-tool surface, and a database truncated and reseeded
+identically before every request. The two configurations differed in exactly one
+thing: the baseline sent only a timeout, leaving NVIDIA's reasoning_budget 16384,
+max_tokens 16384 and temperature 1 in charge, while the patched configuration
+sent the D-81 settings.
+
+  ```text
+  scenario                                  baseline   patched   tools chosen
+  show my first 5 tasks                       5593ms   18748ms   list_tasks
+  create a task called Fix the gate          12716ms    5160ms   create_task
+  add a note to the notes of the first 3     19712ms   30762ms   list_tasks then
+                                                                 bulk_update_tasks
+  overall median                             12716ms   18748ms
+  ```
+
+Two results, and they point in different directions.
+
+Routing was correct and identical under both configurations. The live model chose
+`list_tasks` followed by one `bulk_update_tasks` for the multi-task note append,
+which is the D-80 route rather than one `update_task` per task. That is the
+behaviour the routing kernel exists to encourage, observed against a real
+provider rather than a deterministic stand-in.
+
+Latency did not improve. In this sample the patched configuration was slower,
+median 18748ms against 12716ms. Three samples per cell with swings of 5 to 30
+seconds and one request timing out is far too noisy to call a regression, and it
+is nowhere near enough to call an improvement either. The honest statement is
+that the measurement does not support a latency benefit and no such benefit is
+claimed anywhere in this decision. If lower latency is wanted, this is evidence
+that bounding the reasoning budget is not by itself the lever.
+
+The provider did not return `completion_tokens_details.reasoning_tokens` on any
+request, so authoritative reasoning-token usage is unavailable and is not
+estimated. No response finished with `length`; every completed request finished
+with `stop` and produced an actionable result.
+
+**Limitations and review status:** The value delivered here is control and
+predictability, not speed: three provider defaults that decided reasoning and
+output behaviour are now Trellis-owned and asserted on the wire. The latency
+question is measured above and answered in the negative for this sample. General history compaction is deferred deliberately. The
+projection is applied at one seam and a source-level test pins that the
+continuation path does not call it; that is a structural assertion, and a
+behavioural equivalent would need a full approval round trip through the
+transport.
+
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. Any successor SHA
+requires its applicable follow-up review.
+
+## D-82: reliable Vercel Web Analytics
+
+**Local role:** Mounts Vercel Web Analytics once at the Next.js root layout so
+the frontend reports page views. Owns one production dependency,
+`@vercel/analytics`, pinned exact at `2.0.1`, and four lines of `app/layout.tsx`.
+
+**Whole-system role:** Trellis could say nothing about whether anyone used the
+frontend. This closes that gap on the traffic question only, and the boundary is
+the point: the browser becomes observable without becoming authoritative. The
+architecture already treats the browser as a presentation layer that reconciles
+against committed PostgreSQL state, and a mutation can commit while its response
+fails in transit, so a browser event is structurally the wrong evidence for
+whether work happened. Analytics answers navigation questions. PostgreSQL keeps
+answering the rest.
+
+**Inputs and dependencies:** The existing Next.js 16.3.1 App Router frontend,
+its exact-pin dependency convention, `moduleResolution: "bundler"` in
+`tsconfig.json` which already resolves the package's `exports` map, and the
+`node --test` harness the other five frontend suites use. No backend contract.
+
+**Outputs and consumers:** Page-view telemetry in the Vercel dashboard, and a
+stable CI gate named `D82 vercel analytics`. No module imports it; nothing in
+the application reads it back. That is deliberate, because a consumer would make
+browser data an input to application behaviour.
+
+**Verification, at the D-82 implementation SHA:** `npm ls @vercel/analytics
+--depth=0` resolves `2.0.1`; the focused contract suite reports 4 passed;
+`npm run build` compiles; the five existing frontend suites pass; backend
+`ruff check .` clean and `pytest -m "not network"` 604 passed, 13 deselected,
+both unchanged because no backend file was touched.
+
+The contract test was mutation-tested, five single-change mutations applied one
+at a time, each run and reverted, restore verified byte-identical:
+
+```text
+M1  import switched to the bare "@vercel/analytics" entry   KILLED
+M2  a second <Analytics /> mounted                          KILLED
+M3  the mount moved outside <body>                          KILLED
+M4  "use client" added to the root layout                   KILLED
+M5  the dependency moved to devDependencies                 KILLED
+```
+
+That mattered, because the first version of this gate was worthless. It parsed
+the layout with the TypeScript compiler API, which reads well and does not work
+here: typescript 7.0.2 exposes only a version string at its stable entry point
+and puts the AST behind `typescript/unstable/ast`. A named gate resting on an
+export the maintainers labelled unstable is a gate that breaks on someone else's
+refactor. The shipped version strips comments and string literals first, then
+matches structure, which defeats the three ways a naive grep lies here: a
+mention inside a comment counting as a mount, a second real mount hiding behind
+a boolean match, and an import written inside a string passing as real.
+
+**Limitations and review status:** A passing gate proves integration, never
+ingestion. Production intake and dashboard appearance are UNVERIFIED and can
+only be checked after deployment against a project with Web Analytics enabled;
+no deterministic test can establish them, and none claims to. The contract test
+reads source text rather than a real AST, for the reason above, so it asserts
+the shape of the code and not the rendered tree. Custom events are deliberately
+absent and would need their own decision, including a privacy schema, since task
+titles, notes, prompts, and tool arguments must never leave as event data.
+
+Neutral blind review completed against `c846a14`: PASS WITH MINORS, confidence
+HIGH. Findings and their dispositions are recorded in PR #62. D-82 postdates
+that review and its own follow-up review is owed at the final SHA.
+
+### D-82 post-implementation hardening, at `68614ff` and its successor
+
+The section above is the D-82 implementation record and its counts remain
+correct for the SHA it names. It is not the whole decision: four later commits
+carrying the D-82 label changed what the gate proves, and this section records
+that rather than editing history to look as though it arrived complete.
+
+**What changed after the implementation SHA.** Two boundary tests were added to
+`test_d79_bulk_update.py`, so the backend suite that section calls unchanged did
+subsequently move: 604 to 606, and the D-79 file 63 to 65. The routing threshold
+and the 3-allowed/4-gated approval edge were only asserted in words that survive
+a numeric change; they are now pinned on both model-facing surfaces and on both
+sides of the edge. No production code changed in any of it.
+
+**The contract gate was wrong six times, and every hole was a false green.** The
+M1 to M5 table above was taken against a hand-written lexer, and it read as
+complete while the gate could be satisfied with no Analytics component mounted
+at all:
+
+```text
+1  a mention inside a comment counted as a mount
+2  {`<Analytics />`} in a template literal counted as a mount
+3  an import inside a multiline template literal counted as the real import
+4  "use client" hidden behind a leading comment escaped the check
+5  {false && <Analytics />} passed every assertion AND compiled under
+   next build, so the whole D82 job was green while nothing rendered
+6  <body data-decoy={/<Analytics \/>/.source}> hid a mount in a regular
+   expression literal, whose > was also mistaken for the end of the
+   <body> opening tag
+```
+
+Each fix closed one lexical case and the next arrived. That is the signal the
+approach was wrong, not that the cases were unlucky. The gate now parses a real
+AST via `@typescript/typescript6`, Microsoft's supported side-by-side parser for
+TS7 projects, added as an exact-pinned devDependency. The application still
+compiles with typescript 7.0.2; the parser is test-only.
+
+Reachability took one more turn to get right. The first AST version rejected
+conditional, binary, call and arrow ancestors, which is a deny-list and so the
+same arms race in a new costume: wrapping the mount in a function expression put
+a real element under `<body>` whose ancestor matched none of the four, and the
+gate passed. Extending the list would have invited `NewExpression` next. The
+assertion is now an allow-list of one shape, that the unique Analytics element
+is a direct JSX child of `<body>`, which is Vercel's documented layout. Anything
+wrapped, deferred, or conditional fails by construction rather than by
+enumeration.
+
+**A seventh hole.** The AST rewrite fixed which node counts
+as a mount but not where the gate looked for one. Every structural assertion
+walked the whole `SourceFile`, so an unreferenced top-level function
+
+```text
+function _DeadDecoy() { return <body><Analytics /></body>; }
+```
+
+satisfied all four assertions with the real mount deleted, and `next build`
+compiled it. Dead code answered a question that was only ever about live code,
+which is the shape a leftover from a refactor takes without anyone intending it.
+The structural assertions are now scoped to the function the module
+default-exports, which is the only thing Next.js renders, and any Analytics
+element outside that render tree fails rather than being ignored. A separate
+finding in the same review: the import check compared the local binding, so
+`import { track as Analytics }` passed; it now compares the original exported
+symbol.
+
+**An eighth and a ninth, both semantic rather than syntactic.** Names are not
+identity. A local `function Analytics()` shadowing an aliased real import
+satisfied every name-based rule while the fake rendered, and the tsconfig does
+not set `noUnusedLocals`, so the unused real import raised nothing. The gate now
+builds a full `Program`, resolves the symbol that `Analytics` denotes in the
+import declaration itself, resolves the symbol the mounted JSX tag denotes, and
+requires the two to be the same symbol. That closes aliasing and shadowing as a
+category rather than as two more names to forbid.
+
+The first attempt at this was weaker than the sentence describing it. It asked
+whether the resolved declaration's file name contained `@vercel/analytics`,
+which establishes a filename rather than an identity, and would still have
+accepted a mount resolving to the bare package entry, whose path contains that
+text too. That is the same names-versus-identity error the fix was written to
+close, one level down, and it is corrected to exact symbol equality.
+
+Rendering the real component is also not the same as reporting. Vercel supports
+props that silently change where events go, and two of them build cleanly in a
+server layout:
+
+```text
+<Analytics mode="development" />                  logs instead of sending
+<Analytics endpoint="https://example.invalid" />  overrides intake
+```
+
+Both were green here while production telemetry went nowhere, and the second
+also defeats the Resilient Intake that is D-82's stated reason for requiring v2.
+`beforeSend` returning null discards every event too. Under this repository's
+pinned build it failed, with "Functions cannot be passed directly to Client
+Components", but that is an observed property of this exact configuration rather
+than a universal rule: Vercel documents `beforeSend` inside `app/layout.tsx`.
+Either way, leaning on a neighbouring step to catch it would be leaning on an
+accident. D-82
+authorizes automatic page views and nothing else, so the authorized shape
+carries no configuration: zero attributes, which is also Vercel's documented
+baseline.
+
+**No claim is made that this is the last hole.** Seven previous fixes were each
+correct and each left a further class open, and the count of rejected mutations
+says nothing about the classes nobody thought to try.
+
+**Verification, at the successor SHA.** Twenty-three adversarial mutations across
+eight semantic classes were exercised. Every one was confirmed applied by a
+changed digest, rejected by the gate, and restored byte-identically, with the
+baseline green before and after:
+
+```text
+import              bare entry, deleted, multiline template decoy,
+                    aliased from another export
+mount syntax        duplicated, outside body, template literal decoy,
+                    regular expression literal decoy
+mount reachability  constant-false guard, ternary to null, flag guard,
+                    function expression wrapper, arrow IIFE wrapper,
+                    nested inside a div
+live-code scope     dead decoy function, dead decoy beside a real mount
+binding identity    local component shadowing an aliased real import,
+                    same-name import from a different package entry
+behaviour config    mode=development, endpoint override, debug prop
+directive           "use client" bare, "use client" behind a comment
+dependency          devDependencies, "2.x", "^2.0.1", v1 major
+```
+
+Reported as classes rather than a ratio on purpose. Three successive tables here
+read as complete while missing the class that mattered, and a denominator hides
+exactly that.
+
+**Limitations that remain.** The AST removes the lexical arms race; it does not
+prove the component renders at runtime, only that it is mounted unconditionally
+in the source tree. Production intake and dashboard ingestion are still
+UNVERIFIED and still require a deployment to establish.

@@ -71,7 +71,8 @@ constructs a message list from a request.
 """
 
 import logging
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from functools import cache
 from uuid import UUID, uuid4
 
@@ -92,27 +93,39 @@ from pydantic_ai import (
     Agent,
     DeferredToolRequests,
     DeferredToolResults,
+    ModelRetry,
     RunContext,
     ToolApproved,
     ToolDenied,
+    ToolFailed,
 )
 from pydantic_core import to_jsonable_python
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     TextPart,
+    ThinkingPart,
     UserPromptPart,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.ui.ag_ui import AGUIAdapter, AGUIEventStream
 from starlette.concurrency import run_in_threadpool
 
 from . import domain, limits, policy, prompts, runs, tools
 from .config import settings
-from .errors import OutOfScopeError, ValidationFailedError
+from .errors import (
+    AppendNotesLimitError,
+    BulkTargetCoverageError,
+    ExternalDivergenceError,
+    OutOfScopeError,
+    ValidationFailedError,
+    VersionConflictError,
+)
 from .models import (
     Approval,
     ApprovalPreview,
@@ -333,6 +346,68 @@ class TrellisDeps:
     effects: RunEffects = field(default_factory=RunEffects)
 
 
+def _nvidia_profile() -> OpenAIModelProfile:
+    """The provider contract, named so tests can exercise it rather than copy it.
+
+    D-81. This lives in its own function for a reason found by mutation testing:
+    when it was built inline, the wire tests constructed an equivalent profile of
+    their own, so removing either field from production left them green. They
+    were proving that a profile configured this way produces that body, not that
+    Trellis is configured this way.
+
+    `openai_chat_thinking_field` names the field NVIDIA returns reasoning in, so
+    the contract is stated rather than autodetected.
+
+    `openai_chat_supports_max_completion_tokens=False` is the one that would
+    otherwise fail silently. Pydantic AI serialises `ModelSettings.max_tokens` as
+    `max_completion_tokens` unless the profile says the model does not support
+    it, and NVIDIA's hosted Chat Completions documents `max_tokens`. Sent under
+    the wrong name the cap is ignored, which looks exactly like a cap that was
+    never set.
+
+    `openai_chat_send_back_thinking_parts` is deliberately left at its default.
+    It governs replaying reasoning inside one trajectory, which is the case
+    NVIDIA wants preserved; the case it wants dropped is the previous user turn,
+    and that is `_project_prior_turn_history_for_model`.
+    """
+    return OpenAIModelProfile(
+        openai_chat_thinking_field="reasoning",
+        openai_chat_supports_max_completion_tokens=False,
+    )
+
+
+def _model_settings() -> dict:
+    """What every model request carries, instead of provider defaults.
+
+    D-81. Trellis previously sent only a timeout, which left three of NVIDIA's
+    defaults in charge of behaviour it cares about: `reasoning_budget` at 16384,
+    `max_tokens` at 16384, and `temperature` at 1. The first two decide how long
+    the model may think before it can act, and the third makes routing vary run
+    to run for no benefit this application wants.
+
+    `temperature=0` is for low-variance tool routing, not for generation
+    quality. `top_p` is deliberately left alone: NVIDIA advises against tuning
+    both in one request, and one knob is enough to reason about.
+
+    `reasoning_budget` and `chat_template_kwargs` are NVIDIA-specific and travel
+    through `extra_body`, which is the supported passthrough. Thinking is
+    enabled explicitly rather than relied upon: this model reasons by default,
+    but a default is not a contract.
+
+    The budget is capped rather than switched off. The point is a bounded
+    reasoning step, not a model that stops thinking.
+    """
+    return {
+        "timeout": settings.model_timeout_seconds,
+        "temperature": 0.0,
+        "max_tokens": settings.model_max_tokens,
+        "extra_body": {
+            "reasoning_budget": settings.model_reasoning_budget,
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+    }
+
+
 def _runtime_model() -> Model:
     """Construct the configured model against NVIDIA hosted inference."""
     if not settings.nvidia_api_key:
@@ -347,7 +422,9 @@ def _runtime_model() -> Model:
         max_retries=_MODEL_REQUEST_MAX_RETRIES,
     )
     provider = OpenAIProvider(openai_client=client)
-    return OpenAIChatModel(settings.model_id, provider=provider)
+    return OpenAIChatModel(
+        settings.model_id, provider=provider, profile=_nvidia_profile()
+    )
 
 
 def build_agent(
@@ -389,7 +466,7 @@ def build_agent(
         runtime_model,
         deps_type=TrellisDeps,
         instructions=prompts.SYSTEM_PROMPT,
-        model_settings={"timeout": settings.model_timeout_seconds},
+        model_settings=_model_settings(),
         retries={"tools": settings.max_tool_retries},
         tool_timeout=settings.tool_timeout_seconds,
         max_concurrency=1,
@@ -427,7 +504,8 @@ def build_agent(
         ctx: RunContext[TrellisDeps], arguments: ListTasksArgs
     ) -> list[domain.TaskSnapshot]:
         """Read the user's current tasks with typed status, date, priority, and limit filters, optionally only tasks whose title is duplicated."""
-        return tools.list_tasks(_tool_context(ctx), arguments)
+        with _model_facing_refusals():
+            return tools.list_tasks(_tool_context(ctx), arguments)
 
     @_tool(ToolName.GET_TASK_HISTORY.value)
     def get_task_history(
@@ -435,7 +513,8 @@ def build_agent(
         arguments: GetTaskHistoryArgs,
     ) -> dict:
         """Read one authoritative page of durable history for a task."""
-        return tools.get_task_history(_tool_context(ctx), arguments)
+        with _model_facing_refusals():
+            return tools.get_task_history(_tool_context(ctx), arguments)
 
     @_tool(ToolName.RESOLVE_TASK_REFERENCE.value)
     def resolve_task_reference(
@@ -443,14 +522,16 @@ def build_agent(
         arguments: ResolveTaskReferenceArgs,
     ) -> dict:
         """Resolve a current or historical task reference without mutation."""
-        return tools.resolve_task_reference(_tool_context(ctx), arguments)
+        with _model_facing_refusals():
+            return tools.resolve_task_reference(_tool_context(ctx), arguments)
 
     @_tool(ToolName.CREATE_TASK.value)
     def create_task(
         ctx: RunContext[TrellisDeps], arguments: CreateTaskArgs
     ) -> list[domain.TaskSnapshot]:
         """Create one task with typed title, notes, due date, priority, and dependency fields."""
-        result = tools.create_task(_tool_context(ctx), arguments)
+        with _model_facing_refusals():
+            result = tools.create_task(_tool_context(ctx), arguments)
         ctx.deps.effects.mutation_committed = True
         return result
 
@@ -471,16 +552,67 @@ def build_agent(
         and do not repeat existing notes inside append_notes. Sending both
         fields in one call is refused.
         """
-        result = tools.update_task(_tool_context(ctx), arguments)
+        with _model_facing_refusals():
+            result = tools.update_task(_tool_context(ctx), arguments)
+
         ctx.deps.effects.mutation_committed = True
         return result
 
-    @_tool(ToolName.BULK_UPDATE_TASKS.value)
+    # `sequential=True` under D-79. `max_concurrency=1` above bounds concurrent
+    # agent runs; it does not stop Pydantic AI from scheduling several tool
+    # calls out of one model response concurrently, and Trellis tools are
+    # synchronous, so those run on worker threads. This tool takes row locks on
+    # a caller-chosen set and holds them for its whole transaction, so it is the
+    # one that must not overlap a sibling call in the same response.
+    #
+    # The scope is exactly that and no wider. Separate HTTP requests, separate
+    # `agent.run()` calls, and separate workers are unaffected: their
+    # correctness is PostgreSQL's, through the canonical lock order and the
+    # version predicates, and it stays PostgreSQL's.
+    @_tool(ToolName.BULK_UPDATE_TASKS.value, sequential=True)
     def bulk_update_tasks(
         ctx: RunContext[TrellisDeps], arguments: BulkUpdateTasksArgs
     ) -> list[domain.TaskSnapshot]:
-        """Apply the same typed changes to a list of task identifiers."""
-        result = tools.bulk_update_tasks(_tool_context(ctx), arguments)
+        """Apply the same typed changes to several tasks in one transaction.
+
+        Prefer this over repeated update_task calls whenever two or more tasks
+        receive the SAME patch: one call, every identifier in task_ids.
+
+            "set A, B and C to high priority"  -> ONE bulk_update_tasks call
+            "set A high and B low"             -> separate update_task calls
+
+        Every named task gets the identical change, so a request that gives
+        different values to different tasks is not a bulk update. There is no
+        expected_version field: the server reads each task's current version
+        under lock.
+
+        Notes can be replaced or appended, and the two are separate modes:
+
+            notes         replaces the whole note value on every named task.
+            append_notes  contains ONLY the new text. The server reads each
+                          task's current notes and appends to them, so different
+                          tasks keep their different existing notes.
+
+        To add the same line to several tasks, send ONE call with every id in
+        task_ids and the new text in append_notes. Do not read the notes and
+        concatenate them yourself, and do not send one update_task per task.
+        append_notes cannot be combined with any other field in the same call;
+        send the append by itself. Either the whole set is appended or none of
+        it is.
+
+        Two rules the schema cannot express, so read them here:
+
+            Send at least one field you are changing. A call with task_ids and
+            nothing else is refused.
+
+            Omit fields you are not changing. Do NOT send them as null: a null
+            title, notes, priority, or status is read as "leave it alone", so a
+            call carrying only those is refused as changing nothing. Null is
+            meaningful for exactly two fields, due_date and blocked_by, where it
+            clears the value.
+        """
+        with _model_facing_refusals():
+            result = tools.bulk_update_tasks(_tool_context(ctx), arguments)
         ctx.deps.effects.mutation_committed = True
         return result
 
@@ -494,7 +626,8 @@ def build_agent(
         ctx: RunContext[TrellisDeps], arguments: DeleteTasksArgs
     ) -> list[domain.TaskSnapshot]:
         """Delete a list of tasks through the required approval path."""
-        result = tools.delete_tasks(_tool_context(ctx), arguments)
+        with _model_facing_refusals():
+            result = tools.delete_tasks(_tool_context(ctx), arguments)
         ctx.deps.effects.mutation_committed = True
         return result
 
@@ -503,7 +636,8 @@ def build_agent(
         ctx: RunContext[TrellisDeps], arguments: ProposePlanArgs
     ) -> list[dict]:
         """Return a summary and ordered steps for display without changing task state."""
-        return tools.propose_plan(_tool_context(ctx), arguments)
+        with _model_facing_refusals():
+            return tools.propose_plan(_tool_context(ctx), arguments)
 
     return agent
 
@@ -605,6 +739,12 @@ async def handle_agui_request(request: Request) -> Response:
     message_history = ModelMessagesTypeAdapter.validate_python(
         created.message_history
     )
+
+    # D-81. A new ordinary user turn, so the predecessor's reasoning is dropped
+    # from what the provider sees. The stored snapshot above keeps it; only this
+    # projection differs. `_handle_continuation` deliberately does not do this,
+    # because a continuation is still the same user turn.
+    message_history = _project_prior_turn_history_for_model(message_history)
 
     deps = TrellisDeps(actor_id=settings.actor_id, run_id=created.id)
     native = adapter.run_stream_native(
@@ -1303,6 +1443,156 @@ def _open_approval(run_id: UUID, requests: DeferredToolRequests) -> None:
         required_reason=requirement.reason.value,
         preview=preview.model_dump(mode="json"),
     )
+
+
+def _project_prior_turn_history_for_model(
+    history: list[ModelMessage],
+) -> list[ModelMessage]:
+    """Drop inherited reasoning before a new user turn reaches the provider.
+
+    D-81. Nemotron separates two cases, and Trellis was collapsing them. Inside
+    one user turn, reasoning followed by a tool call, a tool result, and more
+    reasoning is a single trajectory, and the earlier reasoning is context the
+    model should still see. Across user turns it is not: NVIDIA's guidance is
+    that a new turn should not be handed the previous turn's `reasoning`.
+
+    D-67 makes a successor run inherit its predecessor's canonical history
+    wholesale, which is right for the durable record and wrong as model input,
+    because it carries obsolete `ThinkingPart`s across exactly that boundary.
+
+    So this projects the model's view and nothing else. The predecessor row is
+    untouched, `runs.create_turn` still owns what is stored, and the browser
+    still contributes no history. Only the value handed to `run_stream_native`
+    on a new ordinary turn differs.
+
+    It is deliberately not registered as an agent-wide history processor. Such a
+    processor runs before every model request, including the one after a tool
+    result, so it could not tell inherited reasoning from the reasoning this
+    turn just produced, and it would strip both. The distinction is the point,
+    so the filter is applied once, here, where "a new turn is starting" is known.
+
+    Structural, not textual: parts are matched by type, never by searching for
+    thinking markup. Messages are rebuilt rather than mutated, because the
+    inherited objects are shared with the durable snapshot.
+    """
+    projected: list[ModelMessage] = []
+
+    for message in history:
+        if not isinstance(message, ModelResponse):
+            projected.append(message)
+            continue
+
+        parts = [part for part in message.parts if not isinstance(part, ThinkingPart)]
+        if len(parts) == len(message.parts):
+            projected.append(message)
+            continue
+
+        # A response that was only reasoning has nothing left to say to the
+        # model. Dropping it is honest; inventing empty text would not be.
+        if parts:
+            projected.append(replace(message, parts=parts))
+
+    return projected
+
+
+@contextmanager
+def _model_facing_refusals():
+    """Keep the refusals a model can act on inside Pydantic AI's tool protocol.
+
+    Pydantic AI recognises exactly two application-level outcomes from a tool
+    body. `ModelRetry` returns a retry prompt so the model can correct the call,
+    and `ToolFailed` returns a definitively failed result the model can adapt to
+    without spending retry budget. Anything else is not a tool outcome at all:
+    it leaves the protocol, aborts the run, and takes the response stream with
+    it.
+
+    Trellis raised ordinary application exceptions for refusals that are a
+    normal part of a model driving a mutating API, so a stale `expected_version`
+    ended the turn instead of being corrected. That is what this fixes, and it
+    fixes it here rather than in the domain, because this is the one layer that
+    knows its caller is a model. `domain` and `tools` keep raising exactly what
+    they raised, and every deterministic caller keeps reading that contract.
+
+    Three refusals are translated, and the choice of outcome is the point:
+
+        VERSION_CONFLICT      ModelRetry. The request may still be valid and
+                              only the concurrency token is stale, so the next
+                              action is known: look the task up again.
+
+        EXTERNAL_DIVERGENCE   ToolFailed. The disagreement is with Linear, not
+                              with the arguments, so a corrected retry would
+                              earn the identical refusal.
+
+        OUT_OF_SCOPE          ToolFailed. The reference cannot be used, and
+                              retrying the same identifier cannot change that.
+
+    Everything else propagates unchanged, deliberately. A blanket
+    `except PolicyError` or `except Exception` here would turn bugs, outages,
+    and serialization failures into a polite suggestion to try again, hiding the
+    failures most worth seeing and inviting a loop on them. A refusal earns a
+    translation only when its next action is known.
+    """
+    try:
+        yield
+    except AppendNotesLimitError as exc:
+        # D-80, and it must be caught before VersionConflictError's sibling
+        # handlers for the obvious reason that ordering decides which one wins;
+        # it is unrelated to them, but it is a subclass of ValidationFailedError
+        # and the narrower type has to be named first.
+        #
+        # Terminal rather than retryable. The model cannot correct this without
+        # editing the user's text: truncating, summarising, or dropping part of
+        # it would all "succeed" while storing something the user did not ask
+        # for. An oversized fragment is a different case and Pydantic already
+        # rejects that against the schema before this code runs.
+        raise ToolFailed(
+            "The note text cannot be added because the resulting note would "
+            "exceed the maximum length. Nothing was changed. Do not shorten, "
+            "summarise, or rewrite the user's text to make it fit; tell them the "
+            "note is too long and let them decide."
+        ) from exc
+    except BulkTargetCoverageError as exc:
+        # D-80, and likewise before VersionConflictError, which it subclasses.
+        #
+        # The generic version-conflict advice is wrong here. That advice tells
+        # the caller to resolve the task and retry with a fresh current_version,
+        # which is exactly right for `update_task`, whose caller supplied one.
+        # A bulk call supplies none: the server reads each version after locking
+        # the row. Repeating that advice would ask the model to manufacture a
+        # value it never sent.
+        raise ToolFailed(
+            "The bulk operation could not safely cover its whole target set, so "
+            "no partial change was committed. Do not invent expected versions "
+            "and do not retry blindly. Look up the current tasks again if the "
+            "user still wants this change."
+        ) from exc
+    except VersionConflictError as exc:
+        # No new version travels in this message. Handing one back would make an
+        # exception payload a second source of task state competing with the
+        # resolver, and it would be wrong anyway if the row was deleted rather
+        # than merely updated.
+        raise ModelRetry(
+            "The task changed since this call was prepared, so it was refused "
+            "rather than applied on top of another change. Resolve the task "
+            "reference again now and retry using the current_version that "
+            "lookup returns. Do not reuse a version from earlier in this "
+            "conversation, and do not guess the next version."
+        ) from exc
+    except ExternalDivergenceError as exc:
+        raise ToolFailed(
+            "This task has diverged from its Linear state. Do not retry this "
+            "operation until that divergence has been reconciled."
+        ) from exc
+    except OutOfScopeError as exc:
+        # Deliberately generic. A missing task and another actor's task are the
+        # same refusal by design, and saying which one this is would turn the
+        # model into an oracle for which task ids exist.
+        raise ToolFailed(
+            "That task reference is not available for this operation. Do not "
+            "retry the same identifier blindly. Resolve the user's task "
+            "reference again, or explain that the requested task could not be "
+            "used."
+        ) from exc
 
 
 def _tool_context(ctx: RunContext[TrellisDeps]) -> tools.ToolContext:

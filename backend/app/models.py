@@ -482,7 +482,103 @@ class UpdateTaskArgs(MutableTaskFields):
 class BulkUpdateTasksArgs(MutableTaskFields):
     # One accepted call may not name more than this many targets. It does not
     # bound how many such calls a run may make; that is a separate dimension.
-    task_ids: list[UUID] = Field(max_length=BULK_TASK_IDS_MAX)
+    #
+    # D-79 added the lower bound. Before it, a call naming no targets validated
+    # and returned an empty success, which reads to the model as "the bulk
+    # update worked" when nothing was asked for and nothing happened. There is
+    # no request that legitimately means "change these zero tasks", so it is a
+    # malformed call and now says so.
+    task_ids: list[UUID] = Field(min_length=1, max_length=BULK_TASK_IDS_MAX)
+
+    # D-80. Append arrives here and still deliberately not on
+    # `MutableTaskFields`. D-78 kept it off that shared base so bulk could not
+    # inherit an unspecified append, and that reasoning has not been reversed:
+    # the base is still shared, and a field added there would still expose
+    # append semantics to every consumer of it. What changed is that bulk append
+    # now has a specification of its own, so it is declared on this model, for
+    # this tool, and nowhere else.
+    append_notes: AppendedTaskNotes | None = None
+
+    @model_validator(mode="after")
+    def _append_is_its_own_mode(self) -> "BulkUpdateTasksArgs":
+        """Bulk append is append-only: no other field may travel with it.
+
+        A mixed call has no single obvious meaning, and inventing one would mean
+        inventing a precedence rule nobody can read off the schema. Replace then
+        append, or append then replace, give different results, and both are
+        defensible, which is exactly why neither should be guessed.
+
+        There are concrete reasons beyond ambiguity. Append is not idempotent
+        while scalar replacement is convergent, so mixing them puts two
+        different retry stories in one call. Append needs a per-row effective
+        value computed from locked state, while replacement needs one shared
+        value, so they run through different SQL. And the approval preview has
+        to describe one intent, not two.
+
+        A later decision can authorize mixed semantics if a real request needs
+        it. Nothing here forecloses that.
+        """
+        if self.append_notes is None:
+            return self
+
+        others = sorted(self.model_fields_set - {"task_ids", "append_notes"})
+        if others:
+            raise ValueError(
+                "append_notes adds text to every named task and cannot be "
+                f"combined with {', '.join(others)}; send the append by itself, "
+                "or send a separate bulk_update_tasks call for the other fields"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _requires_a_structurally_effective_operation(self) -> "BulkUpdateTasksArgs":
+        """Refuse a call carrying no operation that can reach the SET list.
+
+        Be exact about the claim. This is a structural test, not a semantic one:
+        it establishes that the patch contains at least one operation capable of
+        writing a column, never that the stored value will end up different.
+        Setting priority to high on a task that is already high is structurally
+        effective and stays valid, as it should, because the caller asked for a
+        state and the row will be in it.
+
+        What it rejects is the patch that cannot write anything at all.
+        `UPDATE_TASK_GUARDED` and its bulk counterpart apply `title`, `notes`,
+        `priority`, and `status` through COALESCE, where an explicit null is
+        indistinguishable from an omission, so a patch of only those nulls
+        reaches the SET list and leaves every column as it found it. `due_date`
+        and `blocked_by` are the two fields whose null is a value, carried by a
+        set flag, so naming either of them is always an operation, including as
+        a clear. `notes=""` is a real clear and stays valid.
+
+        Without this, such a call still locked every target, still incremented
+        every version, and still wrote an event per task in which before and
+        after are identical. That is a version increment and an audit row
+        recording a mutation that did not happen.
+
+        This is a cross-field rule, so it lives after validation rather than in
+        the JSON schema, which means the model cannot infer it from the schema
+        the way it infers the `task_ids` bounds. The tool description carries it
+        in words for that reason, and an invalid call is corrected through
+        Pydantic AI's retry channel rather than reaching the tool body.
+        """
+        effective = (
+            self.append_notes is not None
+            or self.title is not None
+            or self.notes is not None
+            or self.priority is not None
+            or self.status is not None
+            or "due_date" in self.model_fields_set
+            or "blocked_by" in self.model_fields_set
+        )
+        if not effective:
+            raise ValueError(
+                "bulk_update_tasks needs at least one field to change: send a "
+                "value for title, notes, priority, or status, or send due_date "
+                "or blocked_by (null clears them). Omit fields you are not "
+                "changing; a null title, notes, priority, or status is read as "
+                "omitted and changes nothing"
+            )
+        return self
 
 
 class DeleteTasksArgs(TrellisModel):
