@@ -148,34 +148,33 @@ test("exactly one Analytics element is mounted, unconditionally, under <body>", 
       "second mount double-counts every page view without erroring",
   );
 
-  // Walk up to <body>, and reject any JavaScript expression on the way. Being
-  // inside <body> is not the same as rendering: a conditional mount compiles
-  // and reads correctly while never appearing. A JSX child sits directly in its
-  // parent element; anything wrapped in a conditional, a logical operator, or a
-  // call is the value of an expression instead, which is what this rejects.
-  let node = mounts[0].parent;
-  let reachedBody = false;
-  while (node) {
-    if (
-      ts.isConditionalExpression(node) ||
-      ts.isBinaryExpression(node) ||
-      ts.isCallExpression(node) ||
-      ts.isArrowFunction(node)
-    ) {
-      assert.fail(
-        "<Analytics /> must be mounted unconditionally; it is inside a " +
-          `${ts.SyntaxKind[node.kind]}, which compiles and passes every ` +
-          "textual check while it may never render",
-      );
-    }
-    if (tagNameOf(node) === "body") {
-      reachedBody = true;
-      break;
-    }
-    node = node.parent;
-  }
-
-  assert.ok(reachedBody, "<Analytics /> must be mounted beneath <body>");
+  // The element must be a DIRECT JSX child of <body>. This is an allow-list of
+  // one shape, deliberately, and it replaced a deny-list that enumerated
+  // conditional, binary, call and arrow ancestors. The deny-list was the arms
+  // race in a new costume: wrapping the mount in a function expression,
+  //
+  //     {function Hidden() { return <Analytics />; }}
+  //
+  // put a real Analytics element under <body> whose ancestor was in none of
+  // those four kinds, and the gate passed. Extending the list would have
+  // invited NewExpression next.
+  //
+  // Asking instead what the production layout actually is ends it. Vercel's
+  // documented shape is <Analytics /> as an ordinary child of <body>, so
+  // anything else, conditional or wrapped or deferred, fails by construction
+  // rather than by enumeration.
+  const parent = mounts[0].parent;
+  assert.ok(
+    parent && ts.isJsxElement(parent),
+    "<Analytics /> must be a direct child of a JSX element, not the value of " +
+      "an expression; a wrapped or conditional mount compiles and passes every " +
+      "other check while it may never render",
+  );
+  assert.equal(
+    parent.openingElement.tagName.getText(sourceFile),
+    "body",
+    "<Analytics /> must be a direct child of <body>",
+  );
 });
 
 test("the root layout was not converted to a client component", () => {

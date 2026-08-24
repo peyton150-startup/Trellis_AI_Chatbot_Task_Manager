@@ -3743,11 +3743,19 @@ Each fix closed one lexical case and the next arrived. That is the signal the
 approach was wrong, not that the cases were unlucky. The gate now parses a real
 AST via `@typescript/typescript6`, Microsoft's supported side-by-side parser for
 TS7 projects, added as an exact-pinned devDependency. The application still
-compiles with typescript 7.0.2; the parser is test-only. Reachability is decided
-by walking parents to `<body>` and rejecting any conditional, binary, call, or
-arrow expression on the way, rather than by counting braces.
+compiles with typescript 7.0.2; the parser is test-only.
 
-**Verification, at the successor SHA.** Sixteen adversarial mutations across
+Reachability took one more turn to get right. The first AST version rejected
+conditional, binary, call and arrow ancestors, which is a deny-list and so the
+same arms race in a new costume: wrapping the mount in a function expression put
+a real element under `<body>` whose ancestor matched none of the four, and the
+gate passed. Extending the list would have invited `NewExpression` next. The
+assertion is now an allow-list of one shape, that the unique Analytics element
+is a direct JSX child of `<body>`, which is Vercel's documented layout. Anything
+wrapped, deferred, or conditional fails by construction rather than by
+enumeration.
+
+**Verification, at the successor SHA.** Nineteen adversarial mutations across
 five semantic classes were exercised. Every one was confirmed applied by a
 changed digest, rejected by the gate, and restored byte-identically, with the
 baseline green before and after:
@@ -3756,7 +3764,9 @@ baseline green before and after:
 import              bare entry, deleted, multiline template decoy
 mount syntax        duplicated, outside body, template literal decoy,
                     regular expression literal decoy
-mount reachability  constant-false guard, ternary to null, flag guard
+mount reachability  constant-false guard, ternary to null, flag guard,
+                    function expression wrapper, arrow IIFE wrapper,
+                    nested inside a div
 directive           "use client" bare, "use client" behind a comment
 dependency          devDependencies, "2.x", "^2.0.1", v1 major
 ```
