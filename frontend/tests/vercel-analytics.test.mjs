@@ -64,6 +64,39 @@ function walk(node, visit) {
   ts.forEachChild(node, (child) => walk(child, visit));
 }
 
+/**
+ * The function this module default-exports, which is the only code Next.js
+ * renders as the root layout.
+ *
+ * Scoping to it is not a detail. Every structural assertion below used to walk
+ * the whole SourceFile, and an unreferenced top-level function containing
+ *
+ *     function _DeadDecoy() { return <body><Analytics /></body>; }
+ *
+ * satisfied all four of them, with the real mount deleted, while `next build`
+ * compiled cleanly. Dead code answered a question that was only ever about live
+ * code. A leftover after a refactor produces exactly that shape without anyone
+ * intending it.
+ */
+function defaultExportedFunction() {
+  for (const statement of sourceFile.statements) {
+    const modifiers = ts.canHaveModifiers?.(statement)
+      ? (ts.getModifiers?.(statement) ?? statement.modifiers ?? [])
+      : (statement.modifiers ?? []);
+    const kinds = modifiers.map((modifier) => modifier.kind);
+    if (
+      ts.isFunctionDeclaration(statement) &&
+      kinds.includes(ts.SyntaxKind.ExportKeyword) &&
+      kinds.includes(ts.SyntaxKind.DefaultKeyword)
+    ) {
+      return statement;
+    }
+  }
+  return undefined;
+}
+
+const rootLayout = defaultExportedFunction();
+
 function openingElementOf(node) {
   if (ts.isJsxSelfClosingElement(node)) return node;
   if (ts.isJsxElement(node)) return node.openingElement;
@@ -118,7 +151,11 @@ test("Analytics is imported as a named import from the Next.js entry point", () 
     const bindings = node.importClause?.namedBindings;
     if (!bindings || !ts.isNamedImports(bindings)) return;
     for (const element of bindings.elements) {
-      if (element.name.text === "Analytics") imports.push(specifier.text);
+      // The original exported symbol, not the local binding. Comparing the
+      // local name accepts `import { track as Analytics }`, which binds a
+      // different export and only fails later, if at all, in the type check.
+      const exported = element.propertyName?.text ?? element.name.text;
+      if (exported === "Analytics") imports.push(specifier.text);
     }
   });
 
@@ -136,10 +173,30 @@ test("Analytics is imported as a named import from the Next.js entry point", () 
 });
 
 test("exactly one Analytics element is mounted, unconditionally, under <body>", () => {
+  assert.ok(
+    rootLayout,
+    "the root layout must default-export a function; without it there is no " +
+      "render tree to scope these assertions to",
+  );
+
+  // Scoped to the default export, so unreachable code cannot answer for it.
   const mounts = [];
-  walk(sourceFile, (node) => {
+  walk(rootLayout, (node) => {
     if (tagNameOf(node) === "Analytics") mounts.push(node);
   });
+
+  // Nothing outside the render tree may claim to be the mount either. A decoy
+  // elsewhere in the file is not a second mount, it is a misleading one.
+  let mountsAnywhere = 0;
+  walk(sourceFile, (node) => {
+    if (tagNameOf(node) === "Analytics") mountsAnywhere += 1;
+  });
+  assert.equal(
+    mountsAnywhere,
+    mounts.length,
+    "an Analytics element exists outside the default-exported root layout; " +
+      "dead or unreachable code must not carry the mount",
+  );
 
   assert.equal(
     mounts.length,

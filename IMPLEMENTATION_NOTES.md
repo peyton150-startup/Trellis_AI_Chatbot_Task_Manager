@@ -3755,18 +3755,38 @@ is a direct JSX child of `<body>`, which is Vercel's documented layout. Anything
 wrapped, deferred, or conditional fails by construction rather than by
 enumeration.
 
-**Verification, at the successor SHA.** Nineteen adversarial mutations across
-five semantic classes were exercised. Every one was confirmed applied by a
+**A seventh hole, and the last one.** The AST rewrite fixed which node counts
+as a mount but not where the gate looked for one. Every structural assertion
+walked the whole `SourceFile`, so an unreferenced top-level function
+
+```text
+function _DeadDecoy() { return <body><Analytics /></body>; }
+```
+
+satisfied all four assertions with the real mount deleted, and `next build`
+compiled it. Dead code answered a question that was only ever about live code,
+which is the shape a leftover from a refactor takes without anyone intending it.
+The structural assertions are now scoped to the function the module
+default-exports, which is the only thing Next.js renders, and any Analytics
+element outside that render tree fails rather than being ignored. A separate
+finding in the same review: the import check compared the local binding, so
+`import { track as Analytics }` passed; it now compares the original exported
+symbol.
+
+**Verification, at the successor SHA.** Twenty-two adversarial mutations across
+six semantic classes were exercised. Every one was confirmed applied by a
 changed digest, rejected by the gate, and restored byte-identically, with the
 baseline green before and after:
 
 ```text
-import              bare entry, deleted, multiline template decoy
+import              bare entry, deleted, multiline template decoy,
+                    aliased from another export
 mount syntax        duplicated, outside body, template literal decoy,
                     regular expression literal decoy
 mount reachability  constant-false guard, ternary to null, flag guard,
                     function expression wrapper, arrow IIFE wrapper,
                     nested inside a div
+live-code scope     dead decoy function, dead decoy beside a real mount
 directive           "use client" bare, "use client" behind a comment
 dependency          devDependencies, "2.x", "^2.0.1", v1 major
 ```
