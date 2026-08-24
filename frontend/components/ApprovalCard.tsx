@@ -19,7 +19,7 @@
  */
 
 import type { ApprovalDecision, PendingApproval } from "@/lib/useRun";
-import type { Task } from "@/lib/types";
+import { affectedTasks } from "@/lib/approvalPreview";
 import { Button } from "@/components/ui/button";
 
 interface ApprovalCardProps {
@@ -54,9 +54,6 @@ const CONSEQUENCES: Record<string, (count: number) => string> = {
       : `This action will change these ${count} tasks.`,
 };
 
-function affectedTasks(card: PendingApproval): Task[] {
-  return card.preview.deletes ?? card.preview.updates ?? [];
-}
 
 export function ApprovalCard({
   card,

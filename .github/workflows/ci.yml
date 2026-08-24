@@ -4917,6 +4917,8 @@ jobs:
             exit 1
           fi
 
+          node --test tests/approval-card-preview.test.mjs
+
           echo "PASS one authoritative approval surface, decision persisted before continuation"
 
       - name: Run non-network backend suite
