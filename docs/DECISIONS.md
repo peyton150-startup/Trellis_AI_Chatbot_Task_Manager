@@ -4660,3 +4660,23 @@ those are separate operational-observability surfaces and are not opened here.
 
 **Stable CI check.** `D82 vercel analytics`. Recorded here per the per-task CI
 gate protocol, and the name is stable once branch protection references it.
+
+### D-81 follow-up: reasoning ceiling tightened to 3500
+
+On 2026-08-24 the current application contract was tightened from the original
+D-81 ceiling of 6000 to 3500 reasoning tokens per model request. The original
+D-81 text remains unchanged because it is historical evidence for the SHA where
+6000 was implemented and measured; this paragraph records the successor state.
+
+3500 is both the default and the hard application ceiling. Lower positive values
+remain configurable and values above 3500 are refused rather than silently
+clamped. `max_tokens` remains 12288 and `MODEL_OUTPUT_HEADROOM_MIN` remains
+4096, so the default configuration leaves 8788 tokens of generation headroom
+after the reasoning budget.
+
+Reasoning remains explicitly enabled through `chat_template_kwargs.enable_thinking`.
+The turn-boundary projection, model profile, tool surface, approval semantics,
+database behaviour, and timeout policy are unchanged.
+
+No latency or model-quality improvement is claimed for 3500 yet. Provider
+behaviour at 3500 requires a separate live measurement before such a claim.

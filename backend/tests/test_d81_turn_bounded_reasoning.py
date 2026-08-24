@@ -20,7 +20,7 @@ just produced.
 
 The second is a set of limits. Trellis sent only a timeout, leaving NVIDIA's
 `reasoning_budget` of 16384, `max_tokens` of 16384, and `temperature` of 1 in
-charge. Reasoning stays enabled and is now bounded at 6000 per model request,
+charge. Reasoning stays enabled and is now bounded at 3500 per model request,
 with enough total allowance left that a fifty-id tool call still fits.
 
 These tests are ordered as the change reads: what the projection does, where it
@@ -316,7 +316,7 @@ def test_the_outgoing_request_carries_the_limits_trellis_owns():
 
     assert body["temperature"] == 0.0
     assert body["max_tokens"] == settings.model_max_tokens == 12288
-    assert body["reasoning_budget"] == settings.model_reasoning_budget == 6000
+    assert body["reasoning_budget"] == settings.model_reasoning_budget == 3500
     assert body["chat_template_kwargs"] == {"enable_thinking": True}
 
 
@@ -447,15 +447,15 @@ def test_the_runtime_model_uses_that_profile():
 
 
 def test_the_reasoning_ceiling_is_an_application_limit():
-    assert MODEL_REASONING_BUDGET_CEILING == 6000
-    assert settings.model_reasoning_budget == 6000
+    assert MODEL_REASONING_BUDGET_CEILING == 3500
+    assert settings.model_reasoning_budget == 3500
 
 
-@pytest.mark.parametrize("value", [6001, 16384, 0, -1])
+@pytest.mark.parametrize("value", [3501, 6000, 16384, 0, -1])
 def test_a_budget_outside_the_ceiling_is_refused(value):
     """Refused rather than clamped.
 
-    Accepting 8000 and sending 6000 would make the configuration and the wire
+    Accepting 6000 and sending 3500 would make the configuration and the wire
     disagree, which nobody notices until they are reading a latency graph that
     makes no sense.
     """
@@ -464,7 +464,7 @@ def test_a_budget_outside_the_ceiling_is_refused(value):
         Settings(**{**base, "model_reasoning_budget": value})
 
 
-@pytest.mark.parametrize("value", [1, 2000, 4000, 6000])
+@pytest.mark.parametrize("value", [1, 2000, 3000, 3500])
 def test_a_budget_below_the_ceiling_is_allowed(value):
     """Lower budgets stay configurable so the cap can be measured downwards."""
     base = settings.model_dump()

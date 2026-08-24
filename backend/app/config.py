@@ -11,7 +11,7 @@ load_dotenv()
 
 # D-81. The authorized reasoning ceiling. A configuration may ask for less so the
 # budget can be measured downwards later, and may never ask for more.
-MODEL_REASONING_BUDGET_CEILING = 6000
+MODEL_REASONING_BUDGET_CEILING = 3500
 
 # The generation allowance reserved for tool JSON and visible output after
 # reasoning has taken its share. Sized against the largest tool call this system
@@ -62,7 +62,7 @@ class Settings(BaseModel):
     @field_validator("model_reasoning_budget")
     @classmethod
     def _reasoning_budget_within_the_authorized_ceiling(cls, value: int) -> int:
-        """D-81. 6000 is an application ceiling, not merely a default.
+        """D-81. 3500 is an application ceiling, not merely a default.
 
         NVIDIA's hosted endpoint defaults `reasoning_budget` to 16384, so
         omitting it leaves a provider default in charge of how long Trellis
@@ -70,7 +70,7 @@ class Settings(BaseModel):
 
         Lower values are allowed so the budget can be measured downwards later.
         Higher ones are refused outright rather than clamped: silently accepting
-        8000 and sending 6000 would make the configuration and the wire disagree,
+        6000 and sending 3500 would make the configuration and the wire disagree,
         which is the kind of difference nobody notices until they are reading a
         latency graph that makes no sense.
         """
@@ -171,7 +171,7 @@ settings = Settings(
     tool_timeout_seconds=os.getenv("TOOL_TIMEOUT_SECONDS", "20"),
     model_timeout_seconds=os.getenv("MODEL_TIMEOUT_SECONDS", "45"),
     max_tool_retries=os.getenv("MAX_TOOL_RETRIES", "2"),
-    model_reasoning_budget=os.getenv("MODEL_REASONING_BUDGET", "6000"),
+    model_reasoning_budget=os.getenv("MODEL_REASONING_BUDGET", "3500"),
     model_max_tokens=os.getenv("MODEL_MAX_TOKENS", "12288"),
     approval_ttl_seconds=os.getenv("APPROVAL_TTL_SECONDS", "300"),
     lease_ttl_seconds=os.getenv("LEASE_TTL_SECONDS", "120"),

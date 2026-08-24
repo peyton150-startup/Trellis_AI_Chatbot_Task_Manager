@@ -3843,3 +3843,53 @@ exactly that.
 prove the component renders at runtime, only that it is mounted unconditionally
 in the source tree. Production intake and dashboard ingestion are still
 UNVERIFIED and still require a deployment to establish.
+
+## 2026-08-24 follow-up: 3500 reasoning ceiling and approval preview
+
+Two narrow current-state corrections were made without reopening the surrounding
+backend architecture.
+
+**D-81 ceiling.** `MODEL_REASONING_BUDGET_CEILING` and the default
+`MODEL_REASONING_BUDGET` are now 3500. The request path still sends the setting
+directly as `extra_body.reasoning_budget`; values above 3500 fail validation
+instead of being accepted and clamped.
+
+`max_tokens` remains 12288, leaving 8788 tokens above the default reasoning
+budget against the unchanged 4096 minimum headroom invariant. The historical
+D-81 section remains evidence for the original 6000-token implementation and
+has deliberately not been rewritten.
+
+**Approval preview.** The approval card previously selected affected tasks with
+`preview.deletes ?? preview.updates ?? []`. Because the serialized preview
+contains an empty `deletes` array for a bulk update, that empty array is
+non-nullish and won before the populated `updates` collection was considered.
+A thirteen-task bulk approval therefore rendered as affecting zero tasks even
+though the authoritative backend preview contained all thirteen snapshots.
+
+The frontend now selects the preview collection from the authoritative tool
+identity. `delete_tasks` selects `preview.deletes`; `bulk_update_tasks` selects
+`preview.updates`; an unknown tool returns an empty collection rather than
+guessing.
+
+Backend approval generation, policy checks, hashes, stored previews, and mutation
+behaviour are unchanged. The exact empty-deletes plus thirteen-updates regression
+is now wired into the existing T16 approval CI job.
+
+**Local verification before commit:**
+
+- backend Ruff: PASS
+- D-81 focused: 33 passed
+- approval bridge: 7 passed
+- backend non-network: 607 passed, 13 deselected
+- frontend existing plus new suites: 37 passed
+- approval thirteen-task regression: PASS
+- Next.js production build: PASS
+- git diff --check: PASS
+
+The backend runs emitted one `DeprecationWarning` from `pydantic_graph._utils`
+about the current event loop. It did not fail a test and is not treated as
+evidence about either change.
+
+These are local working-tree results, not GitHub CI results. The new T16
+approval regression is present in the workflow, but its CI result remains
+UNVERIFIED until GitHub Actions runs against the committed SHA.
